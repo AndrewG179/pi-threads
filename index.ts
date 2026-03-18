@@ -209,10 +209,10 @@ function renderColumnsInRows(
 		// Render each column
 		const columns: string[][] = rowItems.map((item) => item(colWidth));
 
-		// Pad to same height
+		// Pad to same height with full-width spaces (so background fills)
 		const maxHeight = Math.max(...columns.map((c) => c.length));
 		for (const col of columns) {
-			while (col.length < maxHeight) col.push("");
+			while (col.length < maxHeight) col.push(" ".repeat(colWidth));
 		}
 
 		// Zip lines
@@ -229,7 +229,7 @@ function renderColumnsInRows(
 
 		// Add spacing between rows of columns
 		if (rowStart + MAX_COLUMNS < items.length) {
-			output.push("");
+			output.push(" ".repeat(width));
 		}
 	}
 
