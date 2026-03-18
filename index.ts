@@ -480,7 +480,7 @@ function buildEpisode(messages: Message[]): string {
 				const args = part.arguments as Record<string, unknown>;
 				switch (part.name) {
 					case "bash": {
-						const cmd = (args.command as string) || "";
+						const cmd = ((args.command as string) || "").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
 						const preview = cmd.length > 120 ? cmd.slice(0, 120) + "..." : cmd;
 						toolCalls.push(`$ ${preview}`);
 						break;
@@ -547,7 +547,7 @@ function formatToolCall(
 	};
 	switch (toolName) {
 		case "bash": {
-			const cmd = (args.command as string) || "...";
+			const cmd = ((args.command as string) || "...").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
 			const preview = cmd.length > 80 ? cmd.slice(0, 80) + "..." : cmd;
 			return fg("muted", "$ ") + fg("toolOutput", preview);
 		}
