@@ -7,52 +7,15 @@ import {
 	type PiActorResult,
 	type PiActorSnapshot,
 } from "./pi-actor";
-import { type RunEvent, type RunTerminationReason, type RunState } from "../run/state-machine";
-
-function createAbortError(): Error {
-	const error = new Error("Run was aborted while waiting for thread turn");
-	error.name = "AbortError";
-	return error;
-}
+import { type RunEvent, type RunState, type RunTerminationReason } from "../run/state-machine";
 
 function isAbortError(error: unknown): boolean {
 	if (error instanceof Error && error.name === "AbortError") return true;
-	if (!(error instanceof Error)) return false;
-	return /abort/i.test(error.message);
-}
-
-function waitForPromiseWithSignal(waitFor: Promise<void>, signal?: AbortSignal): Promise<void> {
-	if (!signal) return waitFor;
-	if (signal.aborted) return Promise.reject(createAbortError());
-
-	return new Promise<void>((resolve, reject) => {
-		const onAbort = () => {
-			cleanup();
-			reject(createAbortError());
-		};
-
-		const cleanup = () => {
-			signal.removeEventListener("abort", onAbort);
-		};
-
-		signal.addEventListener("abort", onAbort, { once: true });
-
-		waitFor.then(
-			() => {
-				cleanup();
-				resolve();
-			},
-			(error) => {
-				cleanup();
-				reject(error);
-			},
-		);
-	});
+	return error instanceof Error && /abort/i.test(error.message);
 }
 
 function toErrorMessage(error: unknown): string {
-	if (error instanceof Error) return error.message;
-	return String(error);
+	return error instanceof Error ? error.message : String(error);
 }
 
 function createCancelledResult(
@@ -71,15 +34,7 @@ function createCancelledResult(
 		},
 		messages: [],
 		stderr: "",
-		usage: {
-			input: EMPTY_PI_ACTOR_USAGE_STATS.input,
-			output: EMPTY_PI_ACTOR_USAGE_STATS.output,
-			cacheRead: EMPTY_PI_ACTOR_USAGE_STATS.cacheRead,
-			cacheWrite: EMPTY_PI_ACTOR_USAGE_STATS.cacheWrite,
-			cost: EMPTY_PI_ACTOR_USAGE_STATS.cost,
-			contextTokens: EMPTY_PI_ACTOR_USAGE_STATS.contextTokens,
-			turns: EMPTY_PI_ACTOR_USAGE_STATS.turns,
-		},
+		usage: { ...EMPTY_PI_ACTOR_USAGE_STATS },
 		model: request.model,
 		stopReason: reason === "abort" ? "aborted" : "error",
 		errorMessage,
@@ -99,108 +54,40 @@ export interface ThreadHandle {
 	getSnapshot(): PiActorSnapshot;
 }
 
-class SupervisedInvocation implements ThreadHandle {
-	readonly runId: string;
-	readonly thread: string;
-	readonly result: Promise<PiActorResult>;
+function createSupervisedInvocation(params: {
+	request: PiActorInvocationRequest;
+	runtime: PiActorRuntime;
+	waitForTurn: Promise<void>;
+	releaseTurn: () => void;
+	onSettled: () => void;
+	externalSignal?: AbortSignal;
+}): ThreadHandle {
+	const { request, runtime, waitForTurn, releaseTurn, onSettled, externalSignal } = params;
+	const listeners = new Set<(event: PiActorEvent) => void>();
+	let runtimeHandle: PiActorHandle | null = null;
+	let state: RunState = { tag: "queued" };
+	let startedAt = Date.now();
+	let pid: number | undefined;
+	let requestedTerminationReason: RunTerminationReason | undefined;
 
-	private readonly request: PiActorInvocationRequest;
-	private readonly runtime: PiActorRuntime;
-	private readonly waitForTurn: Promise<void>;
-	private readonly releaseTurn: () => void;
-	private readonly onSettled: () => void;
-	private readonly externalSignal: AbortSignal | undefined;
-	private readonly waitAbortController = new AbortController();
-	private readonly listeners = new Set<(event: PiActorEvent) => void>();
+	let cancelQueuedWait: ((reason: RunTerminationReason) => void) | null = null;
+	const queuedCancellation = new Promise<RunTerminationReason>((resolve) => {
+		cancelQueuedWait = resolve;
+	});
 
-	private runtimeHandle: PiActorHandle | null = null;
-	private state: RunState = { tag: "queued" };
-	private startedAt = Date.now();
-	private pid: number | undefined;
-	private requestedTerminationReason: RunTerminationReason | undefined;
-	private removeExternalAbortListener: (() => void) | null = null;
-
-	constructor(params: {
-		request: PiActorInvocationRequest;
-		runtime: PiActorRuntime;
-		waitForTurn: Promise<void>;
-		releaseTurn: () => void;
-		onSettled: () => void;
-		externalSignal?: AbortSignal;
-	}) {
-		this.request = params.request;
-		this.runtime = params.runtime;
-		this.waitForTurn = params.waitForTurn;
-		this.releaseTurn = params.releaseTurn;
-		this.onSettled = params.onSettled;
-		this.externalSignal = params.externalSignal;
-		this.runId = params.request.runId;
-		this.thread = params.request.thread;
-
-		if (this.externalSignal) {
-			const onAbort = () => {
-				void this.cancel("abort");
-			};
-			if (this.externalSignal.aborted) onAbort();
-			else this.externalSignal.addEventListener("abort", onAbort, { once: true });
-			this.removeExternalAbortListener = () => {
-				this.externalSignal?.removeEventListener("abort", onAbort);
-			};
-		}
-
-		this.result = this.execute();
-	}
-
-	subscribe(listener: (event: PiActorEvent) => void): () => void {
-		this.listeners.add(listener);
-		return () => {
-			this.listeners.delete(listener);
-		};
-	}
-
-	getSnapshot(): PiActorSnapshot {
-		if (this.runtimeHandle) {
-			const runtimeSnapshot = this.runtimeHandle.getSnapshot();
-			this.state = runtimeSnapshot.state;
-			this.pid = runtimeSnapshot.pid;
-			this.startedAt = runtimeSnapshot.startedAt;
-		}
-
-		return {
-			runId: this.runId,
-			thread: this.thread,
-			pid: this.pid,
-			startedAt: this.startedAt,
-			state: this.state,
-		};
-	}
-
-	async cancel(reason: RunTerminationReason = "abort"): Promise<void> {
-		if (!this.requestedTerminationReason) {
-			this.requestedTerminationReason = reason;
-		}
-
-		if (this.runtimeHandle) {
-			await this.runtimeHandle.cancel(this.requestedTerminationReason);
-			return;
-		}
-
-		this.waitAbortController.abort();
-	}
-
-	private emit(event: PiActorEvent): void {
-		for (const listener of this.listeners) {
+	const emit = (event: PiActorEvent) => {
+		for (const listener of listeners) {
 			try {
 				listener(event);
 			} catch {
 				/* ignore listener errors */
 			}
 		}
-	}
+	};
 
-	private moveToExited(reason: RunTerminationReason): void {
-		if (this.state.tag === "exited") return;
-		const previous = this.state;
+	const moveToExited = (reason: RunTerminationReason) => {
+		if (state.tag === "exited") return;
+		const previous = state;
 		const event: RunEvent = { type: "exited", exitCode: null, signal: null };
 		const next: RunState = {
 			tag: "exited",
@@ -208,58 +95,112 @@ class SupervisedInvocation implements ThreadHandle {
 			signal: null,
 			requestedTerminationReason: reason,
 		};
-		this.state = next;
-		this.emit({ type: "state", previous, event, next });
+		state = next;
+		emit({ type: "state", previous, event, next });
+	};
+
+	let removeExternalAbortListener: (() => void) | undefined;
+	if (externalSignal) {
+		const onAbort = () => {
+			void cancel("abort");
+		};
+		if (externalSignal.aborted) onAbort();
+		else externalSignal.addEventListener("abort", onAbort, { once: true });
+		removeExternalAbortListener = () => externalSignal.removeEventListener("abort", onAbort);
 	}
 
-	private async execute(): Promise<PiActorResult> {
-		let unsubscribeForward: (() => void) | null = null;
+	const result = (async (): Promise<PiActorResult> => {
+		let unsubscribeRuntime: (() => void) | undefined;
 		try {
-			await waitForPromiseWithSignal(this.waitForTurn, this.waitAbortController.signal);
+			const queuedReason = await Promise.race([
+				waitForTurn.then(() => undefined as RunTerminationReason | undefined),
+				queuedCancellation.then((reason) => reason),
+			]);
 
-			if (this.requestedTerminationReason) {
-				this.moveToExited(this.requestedTerminationReason);
-				return createCancelledResult(this.request, this.requestedTerminationReason);
+			if (queuedReason) {
+				moveToExited(queuedReason);
+				return createCancelledResult(request, queuedReason);
 			}
 
-			this.runtimeHandle = this.runtime.invoke(this.request, { signal: this.externalSignal });
-			const runtimeSnapshot = this.runtimeHandle.getSnapshot();
-			this.state = runtimeSnapshot.state;
-			this.pid = runtimeSnapshot.pid;
-			this.startedAt = runtimeSnapshot.startedAt;
+			runtimeHandle = runtime.invoke(request, { signal: externalSignal });
+			const runtimeSnapshot = runtimeHandle.getSnapshot();
+			state = runtimeSnapshot.state;
+			pid = runtimeSnapshot.pid;
+			startedAt = runtimeSnapshot.startedAt;
 
-			unsubscribeForward = this.runtimeHandle.subscribe((event) => {
+			unsubscribeRuntime = runtimeHandle.subscribe((event) => {
 				if (event.type === "state") {
-					this.state = event.next;
+					state = event.next;
 					if ("pid" in event.next && typeof event.next.pid === "number") {
-						this.pid = event.next.pid;
+						pid = event.next.pid;
 					}
 				}
-				this.emit(event);
+				emit(event);
 			});
 
-			if (this.requestedTerminationReason) {
-				await this.runtimeHandle.cancel(this.requestedTerminationReason);
+			if (requestedTerminationReason) {
+				await runtimeHandle.cancel(requestedTerminationReason);
 			}
 
-			const result = await this.runtimeHandle.result;
-			this.state = result.finalState;
-			if (result.finalState.pid !== undefined && result.finalState.pid !== null) {
-				this.pid = result.finalState.pid;
+			const runtimeResult = await runtimeHandle.result;
+			state = runtimeResult.finalState;
+			if (typeof runtimeResult.finalState.pid === "number") {
+				pid = runtimeResult.finalState.pid;
 			}
-			return result;
+			return runtimeResult;
 		} catch (error) {
-			const reason = this.requestedTerminationReason
-				?? (this.externalSignal?.aborted || isAbortError(error) ? "abort" : "error");
-			this.moveToExited(reason);
-			return createCancelledResult(this.request, reason, toErrorMessage(error));
+			const reason = requestedTerminationReason
+				?? (externalSignal?.aborted || isAbortError(error) ? "abort" : "error");
+			moveToExited(reason);
+			return createCancelledResult(request, reason, toErrorMessage(error));
 		} finally {
-			unsubscribeForward?.();
-			this.removeExternalAbortListener?.();
-			this.releaseTurn();
-			this.onSettled();
+			unsubscribeRuntime?.();
+			removeExternalAbortListener?.();
+			releaseTurn();
+			onSettled();
 		}
-	}
+	})();
+
+	const cancel = async (reason: RunTerminationReason = "abort"): Promise<void> => {
+		requestedTerminationReason ??= reason;
+		if (runtimeHandle) {
+			await runtimeHandle.cancel(requestedTerminationReason);
+			return;
+		}
+
+		cancelQueuedWait?.(requestedTerminationReason);
+		cancelQueuedWait = null;
+	};
+
+	const getSnapshot = (): PiActorSnapshot => {
+		if (runtimeHandle) {
+			const runtimeSnapshot = runtimeHandle.getSnapshot();
+			state = runtimeSnapshot.state;
+			pid = runtimeSnapshot.pid;
+			startedAt = runtimeSnapshot.startedAt;
+		}
+		return {
+			runId: request.runId,
+			thread: request.thread,
+			pid,
+			startedAt,
+			state,
+		};
+	};
+
+	return {
+		runId: request.runId,
+		thread: request.thread,
+		result,
+		cancel,
+		subscribe(listener: (event: PiActorEvent) => void): () => void {
+			listeners.add(listener);
+			return () => {
+				listeners.delete(listener);
+			};
+		},
+		getSnapshot,
+	};
 }
 
 /**
@@ -268,7 +209,7 @@ class SupervisedInvocation implements ThreadHandle {
  */
 export class ThreadSupervisor {
 	private readonly threadQueues = new Map<string, Promise<void>>();
-	private readonly activeInvocations = new Map<string, SupervisedInvocation>();
+	private readonly activeInvocations = new Map<string, ThreadHandle>();
 
 	constructor(private readonly runtime: PiActorRuntime) {}
 
@@ -281,14 +222,13 @@ export class ThreadSupervisor {
 		const waitForTurn = previous.catch(() => undefined);
 
 		let releaseTurn!: () => void;
-		const currentTurn = new Promise<void>((resolve) => {
+		const turnGate = new Promise<void>((resolve) => {
 			releaseTurn = resolve;
 		});
-
-		const queueTail = waitForTurn.then(() => currentTurn);
+		const queueTail = waitForTurn.then(() => turnGate);
 		this.threadQueues.set(request.thread, queueTail);
 
-		const invocation = new SupervisedInvocation({
+		const invocation = createSupervisedInvocation({
 			request,
 			runtime: this.runtime,
 			waitForTurn,
@@ -309,9 +249,7 @@ export class ThreadSupervisor {
 	}
 
 	inspect(runId: string): PiActorSnapshot | undefined {
-		const invocation = this.activeInvocations.get(runId);
-		if (!invocation) return undefined;
-		return invocation.getSnapshot();
+		return this.activeInvocations.get(runId)?.getSnapshot();
 	}
 
 	listActive(): PiActorSnapshot[] {

@@ -343,24 +343,13 @@ async function runThreadAction(
 		}
 	});
 
-	let runtimeResult;
-	try {
-		runtimeResult = await handle.result;
-	} finally {
+	const runtimeResult = await handle.result.finally(() => {
 		unsubscribe();
-	}
+	});
 
 	result.messages = runtimeResult.messages as Message[];
 	result.stderr = runtimeResult.stderr;
-	result.usage = {
-		input: runtimeResult.usage.input,
-		output: runtimeResult.usage.output,
-		cacheRead: runtimeResult.usage.cacheRead,
-		cacheWrite: runtimeResult.usage.cacheWrite,
-		cost: runtimeResult.usage.cost,
-		contextTokens: runtimeResult.usage.contextTokens,
-		turns: runtimeResult.usage.turns,
-	};
+	result.usage = { ...runtimeResult.usage };
 	result.model = runtimeResult.model ?? result.model;
 	result.stopReason = runtimeResult.stopReason;
 	result.errorMessage = runtimeResult.errorMessage;

@@ -49,84 +49,19 @@ export interface RunExitedEvent {
 
 export type RunEvent = RunStartedEvent | RunTerminationRequestedEvent | RunExitedEvent;
 
-export type StartedRunEvent = RunStartedEvent;
-export type TerminationRequestedRunEvent = RunTerminationRequestedEvent;
-export type ExitedRunEvent = RunExitedEvent;
-
-export type RunEventByStateTag = {
-	queued: RunStartedEvent;
-	running: RunTerminationRequestedEvent | RunExitedEvent;
-	terminating: RunExitedEvent;
-	exited: never;
-};
-
-export type RunEventForState<TState extends RunState> = RunEventByStateTag[TState["tag"]];
-
-export type NextRunState<
-	TState extends RunState,
-	TEvent extends RunEventForState<TState>,
-> = TState extends QueuedRunState
-	? TEvent extends RunStartedEvent
-		? RunningRunState
-		: never
-	: TState extends RunningRunState
-		? TEvent extends RunTerminationRequestedEvent
-			? TerminatingRunState
-			: TEvent extends RunExitedEvent
-				? ExitedRunState
-				: never
-		: TState extends TerminatingRunState
-			? TEvent extends RunExitedEvent
-				? ExitedRunState
-				: never
-			: never;
-
 export const INITIAL_RUN_STATE: QueuedRunState = { tag: "queued" };
 
-export function isTerminalRunState(state: RunState): state is ExitedRunState {
-	return state.tag === "exited";
-}
-
-export function canTransition<TState extends RunState>(
-	state: TState,
-	event: RunEvent,
-): event is RunEventForState<TState> {
-	switch (state.tag) {
-		case "queued":
-			return event.type === "started";
-		case "running":
-			return event.type === "terminationRequested" || event.type === "exited";
-		case "terminating":
-			return event.type === "exited";
-		case "exited":
-			return false;
-	}
-}
-
-function invalidTransition<TState extends RunState>(state: TState, _event: RunEvent): TState {
-	return state;
-}
-
-export function transitionRunState<
-	TState extends RunState,
-	TEvent extends RunEventForState<TState>,
->(state: TState, event: TEvent): NextRunState<TState, TEvent>;
+export function transitionRunState(state: QueuedRunState, event: RunStartedEvent): RunningRunState;
+export function transitionRunState(state: RunningRunState, event: RunTerminationRequestedEvent): TerminatingRunState;
+export function transitionRunState(state: RunningRunState, event: RunExitedEvent): ExitedRunState;
+export function transitionRunState(state: TerminatingRunState, event: RunExitedEvent): ExitedRunState;
 export function transitionRunState(state: RunState, event: RunEvent): RunState {
 	switch (state.tag) {
-		case "queued": {
-			if (event.type !== "started") return invalidTransition(state, event);
-			return {
-				tag: "running",
-				pid: event.pid,
-			};
-		}
-		case "running": {
+		case "queued":
+			return event.type === "started" ? { tag: "running", pid: event.pid } : state;
+		case "running":
 			if (event.type === "terminationRequested") {
-				return {
-					tag: "terminating",
-					pid: state.pid,
-					reason: event.reason,
-				};
+				return { tag: "terminating", pid: state.pid, reason: event.reason };
 			}
 			if (event.type === "exited") {
 				return {
@@ -136,19 +71,18 @@ export function transitionRunState(state: RunState, event: RunEvent): RunState {
 					signal: event.signal,
 				};
 			}
-			return invalidTransition(state, event);
-		}
-		case "terminating": {
-			if (event.type !== "exited") return invalidTransition(state, event);
-			return {
-				tag: "exited",
-				pid: state.pid,
-				exitCode: event.exitCode,
-				signal: event.signal,
-				requestedTerminationReason: state.reason,
-			};
-		}
+			return state;
+		case "terminating":
+			return event.type === "exited"
+				? {
+						tag: "exited",
+						pid: state.pid,
+						exitCode: event.exitCode,
+						signal: event.signal,
+						requestedTerminationReason: state.reason,
+					}
+				: state;
 		case "exited":
-			return invalidTransition(state, event);
+			return state;
 	}
 }

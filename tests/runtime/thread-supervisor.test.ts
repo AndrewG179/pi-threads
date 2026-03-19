@@ -136,6 +136,56 @@ test("ThreadSupervisor serializes same-thread invocations while allowing differe
 	}
 });
 
+test("ThreadSupervisor cancels queued same-thread runs without starting a child", async () => {
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "thread-supervisor-queued-cancel-"));
+	const markerFilePath = path.join(tmpDir, "markers.log");
+	const delayMs = 400;
+
+	const runtime = new PiActorRuntime({
+		command: process.execPath,
+		buildArgs: (request) => ["-e", WINDOW_WORKER_SCRIPT, markerFilePath, request.runId, String(delayMs)],
+	});
+	const supervisor = new ThreadSupervisor(runtime);
+
+	try {
+		const runningHandle = supervisor.invoke({
+			runId: "queued-cancel-running",
+			thread: "same-thread",
+			cwd: tmpDir,
+			action: "noop",
+		});
+		const queuedHandle = supervisor.invoke({
+			runId: "queued-cancel-target",
+			thread: "same-thread",
+			cwd: tmpDir,
+			action: "noop",
+		});
+
+		await waitFor(() => supervisor.inspect("queued-cancel-running")?.state.tag === "running");
+
+		const cancelStart = Date.now();
+		const cancelled = await supervisor.cancel("queued-cancel-target", "abort");
+		const queuedResult = await queuedHandle.result;
+		const cancelDurationMs = Date.now() - cancelStart;
+
+		assert.equal(cancelled, true);
+		assert.equal(cancelDurationMs < delayMs, true, `queued cancel should not wait ${delayMs}ms for prior run`);
+		assert.equal(queuedResult.stopReason, "aborted");
+		assert.equal(queuedResult.finalState.tag, "exited");
+		assert.equal(queuedResult.finalState.requestedTerminationReason, "abort");
+		assert.equal(queuedResult.messages.length, 0);
+
+		const runningResult = await runningHandle.result;
+		assert.equal(runningResult.finalState.tag, "exited");
+
+		const windows = parseWindows(markerFilePath);
+		assert.equal(windows.has("queued-cancel-running"), true);
+		assert.equal(windows.has("queued-cancel-target"), false);
+	} finally {
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
 test("ThreadSupervisor returns handle events and supports cancellation + inspection", async () => {
 	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "thread-supervisor-cancel-"));
 

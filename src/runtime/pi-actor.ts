@@ -17,12 +17,7 @@ import { terminateProcess } from "./termination";
 const THREADS_DIR = ".pi/threads";
 const DEFAULT_PI_COMMAND = "pi";
 
-interface TempFile {
-	dir: string;
-	filePath: string;
-}
-
-type MessageWithRuntimeFields = EpisodeMessage & {
+type RuntimeMessage = EpisodeMessage & {
 	model?: string;
 	stopReason?: string;
 	errorMessage?: string;
@@ -32,21 +27,24 @@ type MessageWithRuntimeFields = EpisodeMessage & {
 		cacheRead?: number;
 		cacheWrite?: number;
 		totalTokens?: number;
-		cost?: {
-			total?: number;
-		};
+		cost?: { total?: number };
 	};
 };
 
-interface StreamEvent {
+type StreamEvent = {
 	type?: string;
-	message?: MessageWithRuntimeFields;
-}
+	message?: RuntimeMessage;
+};
 
-interface ExitSnapshot {
+type PromptFile = {
+	dir: string;
+	filePath: string;
+};
+
+type ExitSnapshot = {
 	exitCode: number | null;
-	exitSignal: NodeJS.Signals | null;
-}
+	signal: NodeJS.Signals | null;
+};
 
 export interface PiActorUsageStats {
 	input: number;
@@ -108,20 +106,9 @@ export interface PiActorResult {
 }
 
 export type PiActorEvent =
-	| {
-			type: "state";
-			previous: RunState;
-			event: RunEvent;
-			next: RunState;
-	  }
-	| {
-			type: "message";
-			message: EpisodeMessage;
-	  }
-	| {
-			type: "stderr";
-			chunk: string;
-	  };
+	| { type: "state"; previous: RunState; event: RunEvent; next: RunState }
+	| { type: "message"; message: EpisodeMessage }
+	| { type: "stderr"; chunk: string };
 
 export interface PiActorSnapshot {
 	runId: string;
@@ -140,45 +127,65 @@ export interface PiActorHandle {
 	getSnapshot(): PiActorSnapshot;
 }
 
-function parseNumeric(value: unknown): number {
+function toNumber(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
-function copyUsageStats(): PiActorUsageStats {
-	return {
-		input: EMPTY_PI_ACTOR_USAGE_STATS.input,
-		output: EMPTY_PI_ACTOR_USAGE_STATS.output,
-		cacheRead: EMPTY_PI_ACTOR_USAGE_STATS.cacheRead,
-		cacheWrite: EMPTY_PI_ACTOR_USAGE_STATS.cacheWrite,
-		cost: EMPTY_PI_ACTOR_USAGE_STATS.cost,
-		contextTokens: EMPTY_PI_ACTOR_USAGE_STATS.contextTokens,
-		turns: EMPTY_PI_ACTOR_USAGE_STATS.turns,
-	};
+function isAbortError(error: unknown): boolean {
+	if (error instanceof Error && error.name === "AbortError") return true;
+	return error instanceof Error && /abort/i.test(error.message);
 }
 
-function maybeTrackAssistantMessage(message: MessageWithRuntimeFields, usage: PiActorUsageStats): void {
-	if (message.role !== "assistant") return;
-
-	usage.turns += 1;
-	if (message.usage) {
-		usage.input += parseNumeric(message.usage.input);
-		usage.output += parseNumeric(message.usage.output);
-		usage.cacheRead += parseNumeric(message.usage.cacheRead);
-		usage.cacheWrite += parseNumeric(message.usage.cacheWrite);
-		usage.cost += parseNumeric(message.usage.cost?.total);
-		const contextTokens = parseNumeric(message.usage.totalTokens);
-		if (contextTokens > 0) usage.contextTokens = contextTokens;
-	}
+function toErrorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }
 
-function writePromptFile(content: string): TempFile {
+function getExitSnapshot(child: ChildProcess): ExitSnapshot | null {
+	if (child.exitCode === null && child.signalCode === null) return null;
+	return { exitCode: child.exitCode, signal: child.signalCode };
+}
+
+function waitForExit(child: ChildProcess): Promise<ExitSnapshot> {
+	const exited = getExitSnapshot(child);
+	if (exited) return Promise.resolve(exited);
+
+	return new Promise<ExitSnapshot>((resolve, reject) => {
+		const onExit = (exitCode: number | null, signal: NodeJS.Signals | null) => {
+			cleanup();
+			resolve({ exitCode, signal });
+		};
+		const onError = (error: Error) => {
+			cleanup();
+			reject(error);
+		};
+		const cleanup = () => {
+			child.off("exit", onExit);
+			child.off("error", onError);
+		};
+		child.once("exit", onExit);
+		child.once("error", onError);
+	});
+}
+
+function waitForClose(child: ChildProcess): Promise<void> {
+	return new Promise<void>((resolve) => child.once("close", () => resolve()));
+}
+
+function makeSessionPath(cwd: string, thread: string): string {
+	const safe = thread.replace(/[^\w.-]+/g, "_");
+	const dir = path.join(cwd, THREADS_DIR);
+	if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+	return path.join(dir, `${safe}.jsonl`);
+}
+
+function writePromptFile(content: string): PromptFile {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-thread-worker-"));
 	const filePath = path.join(dir, "worker.md");
 	fs.writeFileSync(filePath, content, { encoding: "utf-8", mode: 0o600 });
 	return { dir, filePath };
 }
 
-function cleanupPromptFile(temp: TempFile | null): void {
+function cleanupPromptFile(temp: PromptFile | null): void {
 	if (!temp) return;
 	try {
 		fs.unlinkSync(temp.filePath);
@@ -192,15 +199,6 @@ function cleanupPromptFile(temp: TempFile | null): void {
 	}
 }
 
-function makeSessionPath(cwd: string, thread: string): string {
-	const safe = thread.replace(/[^\w.-]+/g, "_");
-	const dir = path.join(cwd, THREADS_DIR);
-	if (!fs.existsSync(dir)) {
-		fs.mkdirSync(dir, { recursive: true });
-	}
-	return path.join(dir, `${safe}.jsonl`);
-}
-
 function defaultArgsBuilder(request: PiActorInvocationRequest, context: PiActorArgsContext): string[] {
 	const args = [
 		"--mode",
@@ -212,15 +210,15 @@ function defaultArgsBuilder(request: PiActorInvocationRequest, context: PiActorA
 		"--session",
 		context.sessionPath,
 	];
-
 	if (request.model) args.push("--model", request.model);
 	if (context.systemPromptFile) args.push("--append-system-prompt", context.systemPromptFile);
 	args.push(request.action);
 	return args;
 }
 
-function ensureExitedState(state: RunState, exitCode: number | null, signal: NodeJS.Signals | null): ExitedRunState {
+function asExitedState(state: RunState, exitCode: number | null, signal: NodeJS.Signals | null): ExitedRunState {
 	if (state.tag === "exited") return state;
+	if (state.tag === "running") return { tag: "exited", pid: state.pid, exitCode, signal };
 	if (state.tag === "terminating") {
 		return {
 			tag: "exited",
@@ -230,343 +228,248 @@ function ensureExitedState(state: RunState, exitCode: number | null, signal: Nod
 			requestedTerminationReason: state.reason,
 		};
 	}
-	if (state.tag === "running") {
-		return {
-			tag: "exited",
-			pid: state.pid,
-			exitCode,
-			signal,
-		};
-	}
-	return {
-		tag: "exited",
-		exitCode,
-		signal,
-	};
+	return { tag: "exited", exitCode, signal };
 }
 
-function getExitSnapshot(child: ChildProcess): ExitSnapshot | null {
-	if (child.exitCode === null && child.signalCode === null) return null;
-	return {
-		exitCode: child.exitCode,
-		exitSignal: child.signalCode,
-	};
-}
+function createInvocation(params: {
+	request: PiActorInvocationRequest;
+	signal?: AbortSignal;
+	command: string;
+	argsBuilder: PiActorArgsBuilder;
+	sigtermGraceMs: number;
+}): PiActorHandle {
+	const { request, signal, command, argsBuilder, sigtermGraceMs } = params;
+	const listeners = new Set<(event: PiActorEvent) => void>();
+	const messages: RuntimeMessage[] = [];
+	const usage: PiActorUsageStats = { ...EMPTY_PI_ACTOR_USAGE_STATS };
 
-function waitForProcessExit(child: ChildProcess): Promise<ExitSnapshot> {
-	const exited = getExitSnapshot(child);
-	if (exited) return Promise.resolve(exited);
+	let child: ChildProcess | null = null;
+	let state: RunState = INITIAL_RUN_STATE;
+	let startedAt = Date.now();
+	let stderr = "";
+	let model: string | undefined;
+	let stopReason: string | undefined;
+	let errorMessage: string | undefined;
+	let requestedTerminationReason: RunTerminationReason | undefined;
+	let terminationPromise: Promise<void> | null = null;
 
-	return new Promise<ExitSnapshot>((resolve, reject) => {
-		const onError = (error: Error) => {
-			cleanup();
-			reject(error);
-		};
-
-		const onExit = (exitCode: number | null, exitSignal: NodeJS.Signals | null) => {
-			cleanup();
-			resolve({ exitCode, exitSignal });
-		};
-
-		const cleanup = () => {
-			child.off("error", onError);
-			child.off("exit", onExit);
-		};
-
-		child.once("error", onError);
-		child.once("exit", onExit);
-	});
-}
-
-function isAbortError(error: unknown): boolean {
-	if (error instanceof Error && error.name === "AbortError") return true;
-	if (!(error instanceof Error)) return false;
-	return /abort/i.test(error.message);
-}
-
-function toErrorMessage(error: unknown): string {
-	if (error instanceof Error) return error.message;
-	return String(error);
-}
-
-class RuntimeInvocation implements PiActorHandle {
-	readonly runId: string;
-	readonly thread: string;
-	readonly result: Promise<PiActorResult>;
-
-	private readonly request: PiActorInvocationRequest;
-	private readonly signal: AbortSignal | undefined;
-	private readonly command: string;
-	private readonly argsBuilder: PiActorArgsBuilder;
-	private readonly sigtermGraceMs: number;
-	private readonly listeners = new Set<(event: PiActorEvent) => void>();
-
-	private child: ChildProcess | null = null;
-	private state: RunState = INITIAL_RUN_STATE;
-	private startedAt = Date.now();
-	private readonly messages: MessageWithRuntimeFields[] = [];
-	private readonly usage = copyUsageStats();
-	private stderr = "";
-	private model: string | undefined;
-	private stopReason: string | undefined;
-	private errorMessage: string | undefined;
-	private terminationPromise: Promise<void> | null = null;
-	private requestedTerminationReason: RunTerminationReason | undefined;
-
-	constructor(params: {
-		request: PiActorInvocationRequest;
-		signal?: AbortSignal;
-		command: string;
-		argsBuilder: PiActorArgsBuilder;
-		sigtermGraceMs: number;
-	}) {
-		this.request = params.request;
-		this.signal = params.signal;
-		this.command = params.command;
-		this.argsBuilder = params.argsBuilder;
-		this.sigtermGraceMs = params.sigtermGraceMs;
-		this.runId = params.request.runId;
-		this.thread = params.request.thread;
-
-		this.result = this.execute();
-	}
-
-	subscribe(listener: (event: PiActorEvent) => void): () => void {
-		this.listeners.add(listener);
-		return () => {
-			this.listeners.delete(listener);
-		};
-	}
-
-	getSnapshot(): PiActorSnapshot {
-		return {
-			runId: this.runId,
-			thread: this.thread,
-			pid: this.child?.pid ?? undefined,
-			startedAt: this.startedAt,
-			state: this.state,
-		};
-	}
-
-	async cancel(reason: RunTerminationReason = "abort"): Promise<void> {
-		if (!this.requestedTerminationReason) {
-			this.requestedTerminationReason = reason;
-		}
-
-		if (this.state.tag === "exited") return;
-		if (!this.terminationPromise) {
-			this.terminationPromise = this.requestTermination(this.requestedTerminationReason);
-		}
-		await this.terminationPromise;
-	}
-
-	private emit(event: PiActorEvent): void {
-		for (const listener of this.listeners) {
+	const emit = (event: PiActorEvent) => {
+		for (const listener of listeners) {
 			try {
 				listener(event);
 			} catch {
 				/* ignore listener errors */
 			}
 		}
-	}
+	};
 
-	private applyEvent(event: RunEvent): void {
-		const previous = this.state;
-		let next = this.state;
+	const applyStateEvent = (event: RunEvent) => {
+		const previous = state;
+		let next = state;
 
-		switch (event.type) {
-			case "started":
-				if (this.state.tag === "queued") {
-					next = transitionRunState(this.state, event);
+		if (state.tag === "queued" && event.type === "started") {
+			next = transitionRunState(state, event);
+		} else if (state.tag === "running" && event.type === "terminationRequested") {
+			next = transitionRunState(state, event);
+		} else if (state.tag === "running" && event.type === "exited") {
+			next = transitionRunState(state, event);
+		} else if (state.tag === "terminating" && event.type === "exited") {
+			next = transitionRunState(state, event);
+		} else if (event.type === "exited") {
+			next = asExitedState(state, event.exitCode, event.signal);
+		}
+
+		if (next === state) return;
+		state = next;
+		emit({ type: "state", previous, event, next });
+	};
+
+	const handleMessage = (message: RuntimeMessage) => {
+		messages.push(message);
+		if (message.role === "assistant") {
+			usage.turns += 1;
+			if (message.usage) {
+				usage.input += toNumber(message.usage.input);
+				usage.output += toNumber(message.usage.output);
+				usage.cacheRead += toNumber(message.usage.cacheRead);
+				usage.cacheWrite += toNumber(message.usage.cacheWrite);
+				usage.cost += toNumber(message.usage.cost?.total);
+				const tokens = toNumber(message.usage.totalTokens);
+				if (tokens > 0) usage.contextTokens = tokens;
+			}
+		}
+
+		if (!model && typeof message.model === "string") model = message.model;
+		if (typeof message.stopReason === "string") stopReason = message.stopReason;
+		if (typeof message.errorMessage === "string") errorMessage = message.errorMessage;
+		emit({ type: "message", message });
+	};
+
+	const wireOutput = (proc: ChildProcess): (() => void) => {
+		let stdoutBuffer = "";
+
+		if (proc.stdout) {
+			proc.stdout.on("data", (chunk: Buffer | string) => {
+				stdoutBuffer += chunk.toString();
+				const lines = stdoutBuffer.split("\n");
+				stdoutBuffer = lines.pop() || "";
+				for (const line of lines) {
+					if (!line.trim()) continue;
+					let event: StreamEvent;
+					try {
+						event = JSON.parse(line) as StreamEvent;
+					} catch {
+						continue;
+					}
+					if ((event.type === "message_end" || event.type === "tool_result_end") && event.message) {
+						handleMessage(event.message);
+					}
 				}
-				break;
-			case "terminationRequested":
-				if (this.state.tag === "running") {
-					next = transitionRunState(this.state, event);
+			});
+		}
+
+		if (proc.stderr) {
+			proc.stderr.on("data", (chunk: Buffer | string) => {
+				const text = chunk.toString();
+				stderr += text;
+				emit({ type: "stderr", chunk: text });
+			});
+		}
+
+		return () => {
+			if (!stdoutBuffer.trim()) return;
+			try {
+				const event = JSON.parse(stdoutBuffer) as StreamEvent;
+				if ((event.type === "message_end" || event.type === "tool_result_end") && event.message) {
+					handleMessage(event.message);
 				}
-				break;
-			case "exited":
-				if (this.state.tag === "running" || this.state.tag === "terminating") {
-					next = transitionRunState(this.state, event);
-				} else {
-					next = ensureExitedState(this.state, event.exitCode, event.signal);
-				}
-				break;
+			} catch {
+				/* ignore trailing non-json */
+			}
+			stdoutBuffer = "";
+		};
+	};
+
+	const requestTermination = async (reason: RunTerminationReason): Promise<void> => {
+		if (!child || getExitSnapshot(child)) return;
+		if (typeof child.pid === "number") applyStateEvent({ type: "started", pid: child.pid });
+		applyStateEvent({ type: "terminationRequested", reason });
+		await terminateProcess(child, { sigtermGraceMs });
+	};
+
+	const cancel = async (reason: RunTerminationReason = "abort"): Promise<void> => {
+		requestedTerminationReason ??= reason;
+		if (state.tag === "exited") return;
+		if (!child) return;
+		if (!terminationPromise) {
+			terminationPromise = requestTermination(requestedTerminationReason);
 		}
+		await terminationPromise;
+	};
 
-		this.state = next;
-		this.emit({ type: "state", previous, event, next });
-	}
-
-	private processStdoutLine(line: string): void {
-		if (!line.trim()) return;
-
-		let event: StreamEvent;
-		try {
-			event = JSON.parse(line) as StreamEvent;
-		} catch {
-			return;
-		}
-
-		if ((event.type !== "message_end" && event.type !== "tool_result_end") || !event.message) return;
-
-		this.messages.push(event.message);
-		maybeTrackAssistantMessage(event.message, this.usage);
-		if (!this.model && typeof event.message.model === "string") {
-			this.model = event.message.model;
-		}
-		if (typeof event.message.stopReason === "string") {
-			this.stopReason = event.message.stopReason;
-		}
-		if (typeof event.message.errorMessage === "string") {
-			this.errorMessage = event.message.errorMessage;
-		}
-
-		this.emit({ type: "message", message: event.message });
-	}
-
-	private async requestTermination(reason: RunTerminationReason): Promise<void> {
-		if (!this.child) return;
-		if (this.child.exitCode !== null || this.child.signalCode !== null) return;
-
-		if (this.state.tag === "queued" && typeof this.child.pid === "number") {
-			this.applyEvent({ type: "started", pid: this.child.pid });
-		}
-		if (this.state.tag === "running") {
-			this.applyEvent({ type: "terminationRequested", reason });
-		}
-
-		await terminateProcess(this.child, { sigtermGraceMs: this.sigtermGraceMs });
-	}
-
-	private async execute(): Promise<PiActorResult> {
-		let promptFile: TempFile | null = null;
+	const result = (async (): Promise<PiActorResult> => {
+		let promptFile: PromptFile | null = null;
 		let removeAbortListener: (() => void) | undefined;
-		let closePromise: Promise<void> | null = null;
 		let finalExitCode: number | null = null;
 		let finalSignal: NodeJS.Signals | null = null;
 
 		try {
-			const sessionPath = this.request.sessionPath ?? makeSessionPath(this.request.cwd, this.request.thread);
-			if (this.request.systemPrompt) {
-				promptFile = writePromptFile(this.request.systemPrompt);
-			}
+			const sessionPath = request.sessionPath ?? makeSessionPath(request.cwd, request.thread);
+			if (request.systemPrompt) promptFile = writePromptFile(request.systemPrompt);
 
-			const args = this.argsBuilder(this.request, {
+			const args = argsBuilder(request, {
 				sessionPath,
 				systemPromptFile: promptFile?.filePath,
 			});
-
-			this.child = spawn(this.command, args, {
-				cwd: this.request.cwd,
+			child = spawn(command, args, {
+				cwd: request.cwd,
 				env: process.env,
 				stdio: "pipe",
 				shell: false,
 			});
+			startedAt = Date.now();
 
-			this.startedAt = Date.now();
-			if (typeof this.child.pid === "number") {
-				this.applyEvent({ type: "started", pid: this.child.pid });
-			}
+			if (typeof child.pid === "number") applyStateEvent({ type: "started", pid: child.pid });
+			if (requestedTerminationReason) void cancel(requestedTerminationReason);
 
-			if (this.requestedTerminationReason) {
-				void this.cancel(this.requestedTerminationReason);
-			}
-
-			if (this.signal) {
+			if (signal) {
 				const onAbort = () => {
-					void this.cancel("abort");
+					void cancel("abort");
 				};
-				if (this.signal.aborted) onAbort();
-				else this.signal.addEventListener("abort", onAbort, { once: true });
-				removeAbortListener = () => {
-					this.signal?.removeEventListener("abort", onAbort);
-				};
+				if (signal.aborted) onAbort();
+				else signal.addEventListener("abort", onAbort, { once: true });
+				removeAbortListener = () => signal.removeEventListener("abort", onAbort);
 			}
 
-			let stdoutBuffer = "";
-			if (this.child.stdout) {
-				this.child.stdout.on("data", (chunk: Buffer | string) => {
-					stdoutBuffer += chunk.toString();
-					const lines = stdoutBuffer.split("\n");
-					stdoutBuffer = lines.pop() || "";
-					for (const line of lines) {
-						this.processStdoutLine(line);
-					}
-				});
-
-				const flushStdoutBuffer = () => {
-					if (!stdoutBuffer.trim()) return;
-					this.processStdoutLine(stdoutBuffer);
-					stdoutBuffer = "";
-				};
-
-				this.child.stdout.on("end", flushStdoutBuffer);
-				this.child.stdout.on("close", flushStdoutBuffer);
-			}
-
-			if (this.child.stderr) {
-				this.child.stderr.on("data", (chunk: Buffer | string) => {
-					const text = chunk.toString();
-					this.stderr += text;
-					this.emit({ type: "stderr", chunk: text });
-				});
-			}
-
-			closePromise = new Promise<void>((resolve) => {
-				this.child?.once("close", () => resolve());
+			const flushStdout = wireOutput(child);
+			const closePromise = waitForClose(child).then(() => {
+				flushStdout();
 			});
 
-			const exitSnapshot = await waitForProcessExit(this.child);
-			finalExitCode = exitSnapshot.exitCode;
-			finalSignal = exitSnapshot.exitSignal;
-			this.applyEvent({ type: "exited", exitCode: finalExitCode, signal: finalSignal });
-			if (closePromise) await closePromise;
+			const exited = await waitForExit(child);
+			finalExitCode = exited.exitCode;
+			finalSignal = exited.signal;
+			applyStateEvent({ type: "exited", exitCode: finalExitCode, signal: finalSignal });
+			await closePromise;
 
-			if (!this.stopReason && finalExitCode !== null && finalExitCode !== 0) {
-				this.stopReason = "error";
+			if (!stopReason && finalExitCode !== null && finalExitCode !== 0) {
+				stopReason = "error";
 			}
 		} catch (error) {
-			if (!this.errorMessage) {
-				this.errorMessage = toErrorMessage(error);
-			}
+			errorMessage ??= toErrorMessage(error);
+			stopReason ??= signal?.aborted || isAbortError(error) ? "aborted" : "error";
 
-			if (!this.stopReason) {
-				this.stopReason = this.signal?.aborted || isAbortError(error) ? "aborted" : "error";
-			}
-
-			const childExit = this.child ? getExitSnapshot(this.child) : null;
-			if (childExit) {
-				finalExitCode = childExit.exitCode;
-				finalSignal = childExit.exitSignal;
-				this.applyEvent({ type: "exited", exitCode: finalExitCode, signal: finalSignal });
-			} else if (this.requestedTerminationReason === "abort") {
-				this.applyEvent({ type: "exited", exitCode: null, signal: null });
+			const exited = child ? getExitSnapshot(child) : null;
+			if (exited) {
+				finalExitCode = exited.exitCode;
+				finalSignal = exited.signal;
+				applyStateEvent({ type: "exited", exitCode: finalExitCode, signal: finalSignal });
+			} else if (requestedTerminationReason === "abort") {
+				applyStateEvent({ type: "exited", exitCode: null, signal: null });
 			}
 		} finally {
 			removeAbortListener?.();
 			cleanupPromptFile(promptFile);
 		}
 
-		const finalState = ensureExitedState(this.state, finalExitCode, finalSignal);
-		this.state = finalState;
-
-		if (!this.stopReason && finalState.requestedTerminationReason === "abort") {
-			this.stopReason = "aborted";
+		const finalState = asExitedState(state, finalExitCode, finalSignal);
+		state = finalState;
+		if (!stopReason && finalState.requestedTerminationReason === "abort") {
+			stopReason = "aborted";
 		}
 
 		return {
-			runId: this.request.runId,
-			thread: this.request.thread,
+			runId: request.runId,
+			thread: request.thread,
 			finalState,
-			messages: this.messages,
-			stderr: this.stderr,
-			usage: this.usage,
-			model: this.model ?? this.request.model,
-			stopReason: this.stopReason,
-			errorMessage: this.errorMessage,
+			messages,
+			stderr,
+			usage,
+			model: model ?? request.model,
+			stopReason,
+			errorMessage,
 		};
-	}
+	})();
+
+	return {
+		runId: request.runId,
+		thread: request.thread,
+		result,
+		cancel,
+		subscribe(listener: (event: PiActorEvent) => void): () => void {
+			listeners.add(listener);
+			return () => listeners.delete(listener);
+		},
+		getSnapshot(): PiActorSnapshot {
+			return {
+				runId: request.runId,
+				thread: request.thread,
+				pid: child?.pid,
+				startedAt,
+				state,
+			};
+		},
+	};
 }
 
 export class PiActorRuntime {
@@ -581,7 +484,7 @@ export class PiActorRuntime {
 	}
 
 	invoke(request: PiActorInvocationRequest, options: PiActorInvokeOptions = {}): PiActorHandle {
-		return new RuntimeInvocation({
+		return createInvocation({
 			request,
 			signal: options.signal,
 			command: this.command,
