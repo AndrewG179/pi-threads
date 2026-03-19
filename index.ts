@@ -13,7 +13,6 @@
  * fails outside their scope, they stop and report back.
  */
 
-import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -22,6 +21,9 @@ import type { Message } from "@mariozechner/pi-ai";
 import { type ExtensionAPI, getMarkdownTheme } from "@mariozechner/pi-coding-agent";
 import { Container, Markdown, Spacer, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
+
+import { PiRunBackend } from "./src/backends/pi-run-backend";
+import { buildEpisode as buildThreadEpisode } from "./src/episode/builder";
 
 // ─── Constants ───
 
@@ -39,7 +41,7 @@ Execute the instructions given to you. You are the hands, not the brain.
 4. **If you fail, report clearly.** Don't try alternative approaches. Describe what went wrong and what state things are in now.
 5. **Be thorough within scope.** Complete all parts of your instructions.`;
 
-
+const runBackend = new PiRunBackend();
 
 const ORCHESTRATOR_PROMPT = `
 # Thread-Based Execution Model
@@ -147,29 +149,6 @@ function ensureThreadsDir(cwd: string): void {
 	}
 }
 
-function writeTempFile(prefix: string, content: string): { dir: string; filePath: string } {
-	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-thread-${prefix}-`));
-	const filePath = path.join(tmpDir, `${prefix}.md`);
-	fs.writeFileSync(filePath, content, { encoding: "utf-8", mode: 0o600 });
-	return { dir: tmpDir, filePath };
-}
-
-function cleanupTemp(dir: string | null, file: string | null): void {
-	if (file)
-		try {
-			fs.unlinkSync(file);
-		} catch {
-			/* ignore */
-		}
-	if (dir)
-		try {
-			fs.rmdirSync(dir);
-		} catch {
-			/* ignore */
-		}
-}
-
-
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
 	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
@@ -275,86 +254,6 @@ function formatUsage(usage: UsageStats, model?: string): string {
 
 // ─── Thread Execution ───
 
-/**
- * Run a pi process against a thread session. Used for both the action
- * and the episode extraction (same session = cached context).
- */
-async function runPiOnThread(
-	cwd: string,
-	sessionPath: string,
-	message: string,
-	model: string | undefined,
-	systemPromptFile: string | undefined,
-	signal: AbortSignal | undefined,
-	onMessage?: (msg: Message) => void,
-): Promise<{ exitCode: number; messages: Message[]; stderr: string }> {
-	const args: string[] = ["--mode", "json", "-p", "--no-extensions", "--no-skills", "--no-prompt-templates"];
-	args.push("--session", sessionPath);
-	if (model) args.push("--model", model);
-	if (systemPromptFile) args.push("--append-system-prompt", systemPromptFile);
-	args.push(message);
-
-	const messages: Message[] = [];
-	let stderr = "";
-	let wasAborted = false;
-
-	const exitCode = await new Promise<number>((resolve) => {
-		const proc = spawn("pi", args, { cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] });
-		let buffer = "";
-
-		const processLine = (line: string) => {
-			if (!line.trim()) return;
-			let event: any;
-			try {
-				event = JSON.parse(line);
-			} catch {
-				return;
-			}
-			if (event.type === "message_end" && event.message) {
-				messages.push(event.message as Message);
-				onMessage?.(event.message as Message);
-			}
-			if (event.type === "tool_result_end" && event.message) {
-				messages.push(event.message as Message);
-				onMessage?.(event.message as Message);
-			}
-		};
-
-		proc.stdout.on("data", (data: Buffer) => {
-			buffer += data.toString();
-			const lines = buffer.split("\n");
-			buffer = lines.pop() || "";
-			for (const line of lines) processLine(line);
-		});
-
-		proc.stderr.on("data", (data: Buffer) => {
-			stderr += data.toString();
-		});
-
-		proc.on("close", (code: number | null) => {
-			if (buffer.trim()) processLine(buffer);
-			resolve(code ?? 0);
-		});
-
-		proc.on("error", () => resolve(1));
-
-		if (signal) {
-			const killProc = () => {
-				wasAborted = true;
-				proc.kill("SIGTERM");
-				setTimeout(() => {
-					if (!proc.killed) proc.kill("SIGKILL");
-				}, 5000);
-			};
-			if (signal.aborted) killProc();
-			else signal.addEventListener("abort", killProc, { once: true });
-		}
-	});
-
-	if (wasAborted) throw new Error("Thread was aborted");
-	return { exitCode, messages, stderr };
-}
-
 async function runThreadAction(
 	cwd: string,
 	threadName: string,
@@ -417,32 +316,54 @@ async function runThreadAction(
 		}
 	};
 
-	// Write thread worker prompt to temp file
-	const promptTmp = writeTempFile("worker", THREAD_WORKER_PROMPT);
+	const runId = `${threadName}:${episodeNumber}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
 
-	try {
-		// Single process: thread executes the action AND produces the episode
-		// inline (delimited by ---EPISODE--- markers). No second process needed.
-		const actionResult = await runPiOnThread(
+	const backendResult = await runBackend.run(
+		{
+			runId,
 			cwd,
-			sessionPath,
 			action,
+			sessionKey: threadName,
 			model,
-			promptTmp.filePath,
+			systemPrompt: THREAD_WORKER_PROMPT,
+		},
+		{
 			signal,
-			(msg) => {
-				result.messages.push(msg);
-				trackUsage(msg);
-				emitUpdate();
+			observer: {
+				onMessage: (message) => {
+					const threadedMessage = message as Message;
+					result.messages.push(threadedMessage);
+					trackUsage(threadedMessage);
+					emitUpdate();
+				},
+				onStderr: (chunk) => {
+					result.stderr += chunk;
+				},
 			},
-		);
-		result.exitCode = actionResult.exitCode;
-		result.stderr = actionResult.stderr;
+		},
+	);
 
-		return result;
-	} finally {
-		cleanupTemp(promptTmp.dir, promptTmp.filePath);
+	result.messages = backendResult.messages as Message[];
+	result.stderr = backendResult.stderr;
+	result.usage = {
+		input: backendResult.usage.input,
+		output: backendResult.usage.output,
+		cacheRead: backendResult.usage.cacheRead,
+		cacheWrite: backendResult.usage.cacheWrite,
+		cost: backendResult.usage.cost,
+		contextTokens: backendResult.usage.contextTokens,
+		turns: backendResult.usage.turns,
+	};
+	result.model = backendResult.model ?? result.model;
+	result.stopReason = backendResult.stopReason;
+	result.errorMessage = backendResult.errorMessage;
+	result.exitCode = backendResult.finalState.exitCode ?? (backendResult.finalState.signal ? 1 : 0);
+
+	if (!result.stopReason && backendResult.finalState.requestedTerminationReason === "abort") {
+		result.stopReason = "aborted";
 	}
+
+	return result;
 }
 
 // ─── Episode Generation ───
@@ -458,81 +379,6 @@ function getFinalOutput(messages: Message[]): string {
 	}
 	return "";
 }
-
-/**
- * Build a transcript from thread messages for the episode generator.
- * Includes tool calls AND their results so the episode has actual data.
- */
-/**
- * Build the episode directly from thread output — no extra model call.
- * Returns: tool call history + last assistant message.
- * The orchestrator sees exactly what the thread did and said.
- */
-function buildEpisode(messages: Message[]): string {
-	const parts: string[] = [];
-
-	// Part 1: Tool call history — compact summary of what the thread did
-	const toolCalls: string[] = [];
-	for (const msg of messages) {
-		if (msg.role !== "assistant") continue;
-		for (const part of msg.content) {
-			if (part.type === "toolCall") {
-				const args = part.arguments as Record<string, unknown>;
-				switch (part.name) {
-					case "bash": {
-						const cmd = ((args.command as string) || "").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
-						const preview = cmd.length > 120 ? cmd.slice(0, 120) + "..." : cmd;
-						toolCalls.push(`$ ${preview}`);
-						break;
-					}
-					case "read": {
-						const p = (args.file_path || args.path || "") as string;
-						const offset = args.offset as number | undefined;
-						const limit = args.limit as number | undefined;
-						let entry = `read ${p}`;
-						if (offset || limit) entry += `:${offset || 1}${limit ? `-${(offset || 1) + limit - 1}` : ""}`;
-						toolCalls.push(entry);
-						break;
-					}
-					case "write": {
-						const p = (args.file_path || args.path || "") as string;
-						const content = (args.content || "") as string;
-						const lines = content.split("\n").length;
-						toolCalls.push(`write ${p} (${lines} lines)`);
-						break;
-					}
-					case "edit": {
-						const p = (args.file_path || args.path || "") as string;
-						toolCalls.push(`edit ${p}`);
-						break;
-					}
-					default: {
-						const s = JSON.stringify(args);
-						toolCalls.push(`${part.name} ${s.length > 80 ? s.slice(0, 80) + "..." : s}`);
-					}
-				}
-			}
-		}
-	}
-
-	if (toolCalls.length > 0) {
-		parts.push("TOOL CALLS:");
-		for (const tc of toolCalls) {
-			parts.push(`  ${tc}`);
-		}
-		parts.push("");
-	}
-
-	// Part 2: Last assistant message — the thread's final response
-	const lastMessage = getFinalOutput(messages);
-	if (lastMessage.trim()) {
-		parts.push("THREAD RESPONSE:");
-		parts.push(lastMessage);
-	}
-
-	return parts.join("\n") || "(no output)";
-}
-
 
 // ─── Rendering Helpers ───
 
@@ -728,8 +574,8 @@ export default function (pi: ExtensionAPI) {
 					episodeNumber,
 				);
 
-				// Build episode directly — tool call history + last message, no extra model call
-				const episode = buildEpisode(result.messages);
+				// Build episode from normalized messages (tool calls + tool results + assistant response)
+				const episode = buildThreadEpisode(result.messages as Parameters<typeof buildThreadEpisode>[0]);
 				episodeCounts.set(task.thread, episodeNumber);
 
 				const item: SingleDispatchResult = { thread: task.thread, action: task.action, episode, episodeNumber, result };
@@ -761,11 +607,12 @@ export default function (pi: ExtensionAPI) {
 		// ─── Rendering ───
 
 		renderCall(args, theme) {
-			if (args.tasks && args.tasks.length > 0) {
+			const tasks = args.tasks;
+			if (tasks && tasks.length > 0) {
 				return {
 					render(width: number): string[] {
 						return renderColumnsInRows(
-							args.tasks.map((t: { thread: string; action: string }) => (colWidth: number) => {
+							tasks.map((t: { thread: string; action: string }) => (colWidth: number) => {
 								const header = theme.fg("accent", theme.bold(`[${t.thread}]`));
 								const actionLines = wrapText(t.action, colWidth - 1);
 								return [header, ...actionLines.map((l: string) => theme.fg("dim", l))];

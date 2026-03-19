@@ -14,15 +14,18 @@ test("terminateActorProcess force-kills a SIGTERM-ignoring child", async () => {
 process.on("SIGTERM", () => {
   // Intentionally ignore SIGTERM.
 });
+process.stdout.write("ready\\n");
 setInterval(() => {}, 1000);
 `,
 		],
-		{ stdio: "ignore" },
+		{ stdio: ["ignore", "pipe", "ignore"] },
 	);
 
 	const exitPromise = once(child, "exit") as Promise<[number | null, NodeJS.Signals | null]>;
+	const readyPromise = once(child.stdout as NodeJS.ReadableStream, "data");
 
 	try {
+		await readyPromise;
 		const result = await terminateActorProcess(child, { sigtermGraceMs: 50 });
 		const [exitCode, signal] = await exitPromise;
 
