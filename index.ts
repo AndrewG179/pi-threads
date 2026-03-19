@@ -22,8 +22,9 @@ import { type ExtensionAPI, getMarkdownTheme } from "@mariozechner/pi-coding-age
 import { Container, Markdown, Spacer, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 
-import { PiRunBackend } from "./src/backends/pi-run-backend";
 import { buildEpisode as buildThreadEpisode } from "./src/episode/builder";
+import { PiActorRuntime } from "./src/runtime/pi-actor";
+import { ThreadSupervisor } from "./src/runtime/thread-supervisor";
 
 // ─── Constants ───
 
@@ -41,7 +42,8 @@ Execute the instructions given to you. You are the hands, not the brain.
 4. **If you fail, report clearly.** Don't try alternative approaches. Describe what went wrong and what state things are in now.
 5. **Be thorough within scope.** Complete all parts of your instructions.`;
 
-const runBackend = new PiRunBackend();
+const piActorRuntime = new PiActorRuntime();
+const threadSupervisor = new ThreadSupervisor(piActorRuntime);
 
 const ORCHESTRATOR_PROMPT = `
 # Thread-Based Execution Model
@@ -280,86 +282,91 @@ async function runThreadAction(
 	};
 
 	const trackUsage = (msg: Message) => {
-		if (msg.role === "assistant") {
-			result.usage.turns++;
-			const usage = msg.usage;
-			if (usage) {
-				result.usage.input += usage.input || 0;
-				result.usage.output += usage.output || 0;
-				result.usage.cacheRead += usage.cacheRead || 0;
-				result.usage.cacheWrite += usage.cacheWrite || 0;
-				result.usage.cost += usage.cost?.total || 0;
-				result.usage.contextTokens = usage.totalTokens || 0;
-			}
-			if (!result.model && msg.model) result.model = msg.model;
-			if (msg.stopReason) result.stopReason = msg.stopReason;
-			if (msg.errorMessage) result.errorMessage = msg.errorMessage;
+		if (msg.role !== "assistant") return;
+
+		result.usage.turns++;
+		const usage = msg.usage;
+		if (usage) {
+			result.usage.input += usage.input || 0;
+			result.usage.output += usage.output || 0;
+			result.usage.cacheRead += usage.cacheRead || 0;
+			result.usage.cacheWrite += usage.cacheWrite || 0;
+			result.usage.cost += usage.cost?.total || 0;
+			result.usage.contextTokens = usage.totalTokens || 0;
 		}
+		if (!result.model && msg.model) result.model = msg.model;
+		if (msg.stopReason) result.stopReason = msg.stopReason;
+		if (msg.errorMessage) result.errorMessage = msg.errorMessage;
 	};
 
 	const emitUpdate = () => {
-		if (onUpdate) {
-			const lastText = getFinalOutput(result.messages);
-			onUpdate({
-				content: [{ type: "text", text: lastText || "(running...)" }],
-				details: {
-					mode: "single",
-					items: [{
-						thread: threadName,
-						action,
-						episode: "(running...)",
-						episodeNumber,
-						result,
-					}],
-				},
-			});
-		}
+		if (!onUpdate) return;
+		const lastText = getFinalOutput(result.messages);
+		onUpdate({
+			content: [{ type: "text", text: lastText || "(running...)" }],
+			details: {
+				mode: "single",
+				items: [{
+					thread: threadName,
+					action,
+					episode: "(running...)",
+					episodeNumber,
+					result,
+				}],
+			},
+		});
 	};
 
 	const runId = `${threadName}:${episodeNumber}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
-
-	const backendResult = await runBackend.run(
+	const handle = threadSupervisor.invoke(
 		{
 			runId,
+			thread: threadName,
 			cwd,
 			action,
-			sessionKey: threadName,
 			model,
+			sessionPath,
 			systemPrompt: THREAD_WORKER_PROMPT,
 		},
-		{
-			signal,
-			observer: {
-				onMessage: (message) => {
-					const threadedMessage = message as Message;
-					result.messages.push(threadedMessage);
-					trackUsage(threadedMessage);
-					emitUpdate();
-				},
-				onStderr: (chunk) => {
-					result.stderr += chunk;
-				},
-			},
-		},
+		{ signal },
 	);
 
-	result.messages = backendResult.messages as Message[];
-	result.stderr = backendResult.stderr;
-	result.usage = {
-		input: backendResult.usage.input,
-		output: backendResult.usage.output,
-		cacheRead: backendResult.usage.cacheRead,
-		cacheWrite: backendResult.usage.cacheWrite,
-		cost: backendResult.usage.cost,
-		contextTokens: backendResult.usage.contextTokens,
-		turns: backendResult.usage.turns,
-	};
-	result.model = backendResult.model ?? result.model;
-	result.stopReason = backendResult.stopReason;
-	result.errorMessage = backendResult.errorMessage;
-	result.exitCode = backendResult.finalState.exitCode ?? (backendResult.finalState.signal ? 1 : 0);
+	const unsubscribe = handle.subscribe((event) => {
+		if (event.type === "message") {
+			const threadedMessage = event.message as Message;
+			result.messages.push(threadedMessage);
+			trackUsage(threadedMessage);
+			emitUpdate();
+		}
+		if (event.type === "stderr") {
+			result.stderr += event.chunk;
+		}
+	});
 
-	if (!result.stopReason && backendResult.finalState.requestedTerminationReason === "abort") {
+	let runtimeResult;
+	try {
+		runtimeResult = await handle.result;
+	} finally {
+		unsubscribe();
+	}
+
+	result.messages = runtimeResult.messages as Message[];
+	result.stderr = runtimeResult.stderr;
+	result.usage = {
+		input: runtimeResult.usage.input,
+		output: runtimeResult.usage.output,
+		cacheRead: runtimeResult.usage.cacheRead,
+		cacheWrite: runtimeResult.usage.cacheWrite,
+		cost: runtimeResult.usage.cost,
+		contextTokens: runtimeResult.usage.contextTokens,
+		turns: runtimeResult.usage.turns,
+	};
+	result.model = runtimeResult.model ?? result.model;
+	result.stopReason = runtimeResult.stopReason;
+	result.errorMessage = runtimeResult.errorMessage;
+	result.exitCode = runtimeResult.finalState.exitCode ?? (runtimeResult.finalState.signal ? 1 : 0);
+
+	if (!result.stopReason && runtimeResult.finalState.requestedTerminationReason === "abort") {
 		result.stopReason = "aborted";
 	}
 
