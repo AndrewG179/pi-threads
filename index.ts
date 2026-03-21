@@ -29,6 +29,7 @@ import { collectSubagentCards, loadSessionBranchFromFile, type SubagentCard } fr
 import { deriveSessionBehavior, resolveActiveToolsForBehavior } from "./src/subagents/mode";
 import { SubagentSelector } from "./src/subagents/selector";
 import { loadThreadsState, rememberParentSession, saveThreadsState } from "./src/subagents/state";
+import { wrapText } from "./src/text/wrap";
 
 // ─── Constants ───
 
@@ -244,30 +245,6 @@ function renderColumnsInRows(
 	}
 
 	return output;
-}
-
-function wrapText(text: string | undefined, width: number): string[] {
-	if (!text) return [""];
-	if (width < 10) return [text];
-	const lines: string[] = [];
-	for (const paragraph of text.split("\n")) {
-		if (!paragraph.trim()) {
-			lines.push("");
-			continue;
-		}
-		const words = paragraph.split(/\s+/);
-		let current = "";
-		for (const word of words) {
-			if (current.length + word.length + 1 > width && current.length > 0) {
-				lines.push(current);
-				current = word;
-			} else {
-				current = current ? current + " " + word : word;
-			}
-		}
-		if (current) lines.push(current);
-	}
-	return lines.length > 0 ? lines : [""];
 }
 
 function formatUsage(usage: UsageStats, model?: string): string {

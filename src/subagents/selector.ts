@@ -1,32 +1,7 @@
 import { getEditorKeybindings, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 
 import type { SubagentCard } from "./metadata";
-
-function wrapText(text: string, width: number): string[] {
-	if (!text) return [""];
-	if (width < 12) return [text];
-
-	const lines: string[] = [];
-	for (const paragraph of text.split("\n")) {
-		if (!paragraph.trim()) {
-			lines.push("");
-			continue;
-		}
-		const words = paragraph.split(/\s+/);
-		let current = "";
-		for (const word of words) {
-			if (current && current.length + word.length + 1 > width) {
-				lines.push(current);
-				current = word;
-			} else {
-				current = current ? `${current} ${word}` : word;
-			}
-		}
-		if (current) lines.push(current);
-	}
-
-	return lines.length > 0 ? lines : [""];
-}
+import { wrapText } from "../text/wrap";
 
 function padToWidth(line: string, width: number): string {
 	const truncated = truncateToWidth(line, width);
@@ -111,8 +86,8 @@ export class SubagentSelector {
 						: "muted";
 
 			const header = `${this.theme.fg("accent", `[${card.thread}]`)} ${this.theme.fg(statusColor, formatStatus(card.status))} ${this.theme.fg("dim", formatCost(card.accumulatedCost))}`;
-			const actionLines = wrapText(card.latestAction || "(no action)", bodyWidth).slice(0, 2);
-			const outputLines = wrapText(card.outputPreview || "(no output yet)", bodyWidth).slice(0, 2);
+			const actionLines = wrapText(card.latestAction || "(no action)", bodyWidth, { minWidth: 12 }).slice(0, 2);
+			const outputLines = wrapText(card.outputPreview || "(no output yet)", bodyWidth, { minWidth: 12 }).slice(0, 2);
 			const toolLine = card.toolPreview ? card.toolPreview : "(no recent tool calls)";
 
 			const cardLines = [
