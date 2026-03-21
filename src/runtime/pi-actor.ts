@@ -394,7 +394,7 @@ function createInvocation(params: {
 			child = spawn(command, args, {
 				cwd: request.cwd,
 				env: process.env,
-				stdio: "pipe",
+				stdio: ["ignore", "pipe", "pipe"],
 				shell: false,
 			});
 			startedAt = Date.now();
