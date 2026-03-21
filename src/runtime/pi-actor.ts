@@ -16,6 +16,7 @@ import { terminateProcess } from "./termination";
 
 const THREADS_DIR = ".pi/threads";
 const DEFAULT_PI_COMMAND = "pi";
+const EXECUTABLE_SCRIPT_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"]);
 
 type RuntimeMessage = EpisodeMessage & {
 	model?: string;
@@ -87,6 +88,11 @@ export interface PiActorRuntimeOptions {
 	command?: string;
 	buildArgs?: PiActorArgsBuilder;
 	defaultSigtermGraceMs?: number;
+}
+
+interface PiCommandSpec {
+	command: string;
+	argsPrefix: string[];
 }
 
 export interface PiActorInvokeOptions {
@@ -223,6 +229,36 @@ function defaultArgsBuilder(request: PiActorInvocationRequest, context: PiActorA
 	if (context.systemPromptFile) args.push("--append-system-prompt", context.systemPromptFile);
 	args.push(request.action);
 	return args;
+}
+
+function resolvePiCommandSpec(): PiCommandSpec {
+	const explicitCommand = process.env.PI_THREADS_PI_COMMAND?.trim();
+	if (explicitCommand) {
+		return { command: explicitCommand, argsPrefix: [] };
+	}
+
+	const entryPoint = process.argv[1];
+	if (entryPoint) {
+		const resolvedEntryPoint = path.resolve(entryPoint);
+		if (fs.existsSync(resolvedEntryPoint)) {
+			const extension = path.extname(resolvedEntryPoint).toLowerCase();
+			if (EXECUTABLE_SCRIPT_EXTENSIONS.has(extension)) {
+				return {
+					command: process.execPath,
+					argsPrefix: [resolvedEntryPoint],
+				};
+			}
+			return {
+				command: resolvedEntryPoint,
+				argsPrefix: [],
+			};
+		}
+	}
+
+	return {
+		command: DEFAULT_PI_COMMAND,
+		argsPrefix: [],
+	};
 }
 
 function asExitedState(state: RunState, exitCode: number | null, signal: NodeJS.Signals | null): ExitedRunState {
@@ -488,8 +524,16 @@ export class PiActorRuntime {
 	private readonly defaultSigtermGraceMs: number;
 
 	constructor(options: PiActorRuntimeOptions = {}) {
-		this.command = options.command ?? DEFAULT_PI_COMMAND;
-		this.argsBuilder = options.buildArgs ?? defaultArgsBuilder;
+		const commandSpec = options.command
+			? { command: options.command, argsPrefix: [] }
+			: resolvePiCommandSpec();
+		const baseArgsBuilder = options.buildArgs ?? defaultArgsBuilder;
+
+		this.command = commandSpec.command;
+		this.argsBuilder = (request, context) => [
+			...commandSpec.argsPrefix,
+			...baseArgsBuilder(request, context),
+		];
 		this.defaultSigtermGraceMs = options.defaultSigtermGraceMs ?? 5_000;
 	}
 

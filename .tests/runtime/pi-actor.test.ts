@@ -4,7 +4,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 
-import registerExtension from "../../index";
 import { PiActorRuntime } from "../../src/runtime/pi-actor.ts";
 
 const EOF_SENSITIVE_WORKER_SCRIPT = `
@@ -73,52 +72,47 @@ test("PiActorRuntime closes worker stdin for one-shot invocations", async () => 
 test("dispatch should not depend on pi being on PATH when the parent CLI path is explicit", async () => {
 	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-actor-cli-path-"));
 	const originalPath = process.env.PATH;
-	const originalCwd = process.cwd();
-	const tools = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
-
-	const fakePi = {
-		on: () => {},
-		registerCommand: () => {},
-		registerShortcut: () => {},
-		registerTool: (tool: { name: string; execute: (...args: any[]) => Promise<any> }) => {
-			tools.set(tool.name, tool);
-		},
-		getActiveTools: () => ["read", "write", "edit", "bash", "dispatch"],
-		getAllTools: () => [{ name: "read" }, { name: "write" }, { name: "edit" }, { name: "bash" }, { name: "dispatch" }],
-		setActiveTools: () => {},
-	};
+	const originalArgv = [...process.argv];
+	const fakePiPath = path.join(tmpDir, "fake-pi.js");
 
 	try {
-		registerExtension(fakePi as never);
-		process.env.PATH = "";
-		process.chdir(tmpDir);
-
-		const dispatch = tools.get("dispatch");
-
-		assert.ok(dispatch, "dispatch tool should be registered");
-
-		const result = await dispatch!.execute(
-			"tool-call-cli-path",
-			{ thread: "smoke-fast", action: "Respond with exactly: hello" },
-			undefined,
-			undefined,
-			{
-				cwd: tmpDir,
-				hasUI: true,
-				ui: { notify: () => {} },
-				sessionManager: {
-					getSessionFile: () => path.join(tmpDir, ".pi", "sessions", "parent.jsonl"),
-					getBranch: () => [],
-				},
-				model: { provider: "google", id: "gemini-2.5-flash" },
-			} as any,
+		fs.writeFileSync(
+			fakePiPath,
+			[
+				"#!/usr/bin/env node",
+				"process.stdout.write(JSON.stringify({",
+				'  type: "message_end",',
+				"  message: {",
+				'    role: "assistant",',
+				'    content: [{ type: "text", text: "hello" }],',
+				"  },",
+				"}) + \"\\n\");",
+			].join("\n"),
+			{ encoding: "utf8", mode: 0o755 },
 		);
 
-		assert.equal(result.isError, undefined);
-		assert.equal(result.details.items[0].result.errorMessage, undefined);
+		process.env.PATH = "";
+		process.argv[1] = fakePiPath;
+
+		const runtime = new PiActorRuntime();
+		const handle = runtime.invoke({
+			runId: "explicit-cli-path",
+			thread: "smoke-fast",
+			cwd: tmpDir,
+			action: "Respond with exactly: hello",
+		});
+
+		const result = await handle.result;
+
+		assert.equal(result.stopReason, undefined);
+		assert.equal(result.errorMessage, undefined);
+		assert.equal(result.messages.length, 1);
+		assert.equal(result.messages[0]?.role, "assistant");
+		assert.equal(result.messages[0]?.content[0]?.type, "text");
+		assert.equal(result.messages[0]?.content[0]?.text, "hello");
 	} finally {
 		process.env.PATH = originalPath;
-		process.chdir(originalCwd);
+		process.argv.splice(0, process.argv.length, ...originalArgv);
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 	}
 });

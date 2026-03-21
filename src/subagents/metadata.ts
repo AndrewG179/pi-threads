@@ -215,15 +215,8 @@ function mergeParentDispatchDetails(cards: Map<string, SubagentCard>, parentBran
 
 		for (const item of details.items) {
 			if (!item.thread) continue;
-			const card = cards.get(item.thread) ?? {
-				thread: item.thread,
-				sessionPath: "",
-				latestAction: "",
-				outputPreview: "",
-				toolPreview: "",
-				accumulatedCost: 0,
-				status: "unknown",
-			};
+			const card = cards.get(item.thread);
+			if (!card) continue;
 
 			card.latestAction = item.action ?? card.latestAction;
 			card.accumulatedCost += extractUsageCost(item.result?.usage?.cost);
@@ -257,9 +250,6 @@ export function collectSubagentCards(cwd: string, parentBranchEntries: unknown[]
 	mergeParentDispatchDetails(cards, parentBranchEntries);
 
 	for (const card of cards.values()) {
-		if (!card.sessionPath) {
-			card.sessionPath = path.join(threadsDir, `${card.thread}.jsonl`);
-		}
 		if (card.parentSessionFile === undefined) {
 			card.parentSessionFile = state.parentBySession[path.resolve(card.sessionPath)];
 		}
