@@ -744,6 +744,7 @@ export default function (pi: ExtensionAPI) {
 				: [{ thread: params.thread!, action: params.action! }];
 
 			const mode = taskList.length > 1 ? "batch" : "single";
+			const taskSessionPaths = new Map(taskList.map((task) => [task.thread, getThreadSessionPath(ctx.cwd, task.thread)]));
 
 			// Track all results for streaming updates in batch mode
 			const allItems: (SingleDispatchResult | null)[] = taskList.map(() => null);
@@ -758,6 +759,15 @@ export default function (pi: ExtensionAPI) {
 					details: { mode, items: currentItems },
 				});
 			};
+
+			if (rememberedParentSession) {
+				for (const task of taskList) {
+					const sessionPath = taskSessionPaths.get(task.thread);
+					if (!sessionPath) continue;
+					threadsState = rememberParentSession(threadsState, sessionPath, rememberedParentSession);
+				}
+				saveThreadsState(ctx.cwd, threadsState);
+			}
 
 			// Run all tasks (parallel for batch, single for single)
 			const runOne = async (task: { thread: string; action: string }, index: number): Promise<SingleDispatchResult> => {
@@ -778,11 +788,7 @@ export default function (pi: ExtensionAPI) {
 							}
 						: undefined;
 
-				const sessionPath = getThreadSessionPath(ctx.cwd, task.thread);
-				if (rememberedParentSession) {
-					threadsState = rememberParentSession(threadsState, sessionPath, rememberedParentSession);
-					saveThreadsState(ctx.cwd, threadsState);
-				}
+				const sessionPath = taskSessionPaths.get(task.thread) ?? getThreadSessionPath(ctx.cwd, task.thread);
 
 				const pendingItem: SingleDispatchResult = {
 					thread: task.thread,
