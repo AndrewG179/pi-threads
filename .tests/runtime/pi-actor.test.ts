@@ -116,3 +116,57 @@ test("dispatch should not depend on pi being on PATH when the parent CLI path is
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 	}
 });
+
+test("dispatch should split canonical provider/model references into CLI provider and model args", async () => {
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-actor-model-args-"));
+	const originalArgv = [...process.argv];
+	const fakePiPath = path.join(tmpDir, "fake-pi.js");
+	const argsOutPath = path.join(tmpDir, "args.json");
+
+	try {
+		fs.writeFileSync(
+			fakePiPath,
+			[
+				"#!/usr/bin/env node",
+				`require("node:fs").writeFileSync(${JSON.stringify(argsOutPath)}, JSON.stringify(process.argv.slice(2)));`,
+				[
+					"process.stdout.write(JSON.stringify({",
+					'  type: "message_end",',
+					"  message: {",
+					'    role: "assistant",',
+					'    model: "google/gemini-2.5-flash",',
+					'    content: [{ type: "text", text: "hello" }],',
+					"  },",
+					"}) + \"\\n\");",
+				].join("\n"),
+			].join("\n"),
+			{ encoding: "utf8", mode: 0o755 },
+		);
+
+		process.argv[1] = fakePiPath;
+
+		const runtime = new PiActorRuntime();
+		const handle = runtime.invoke({
+			runId: "split-model-args",
+			thread: "smoke-fast",
+			cwd: tmpDir,
+			action: "Respond with exactly: hello",
+			model: "google/gemini-2.5-flash",
+		});
+
+		await handle.result;
+
+		const args = JSON.parse(fs.readFileSync(argsOutPath, "utf8")) as string[];
+		const providerIndex = args.indexOf("--provider");
+		const modelIndex = args.indexOf("--model");
+
+		assert.notEqual(providerIndex, -1, "Expected worker args to include --provider");
+		assert.equal(args[providerIndex + 1], "google");
+		assert.notEqual(modelIndex, -1, "Expected worker args to include --model");
+		assert.equal(args[modelIndex + 1], "gemini-2.5-flash");
+		assert.equal(args.includes("google/gemini-2.5-flash"), false);
+	} finally {
+		process.argv.splice(0, process.argv.length, ...originalArgv);
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
