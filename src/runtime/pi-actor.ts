@@ -173,9 +173,18 @@ function waitForClose(child: ChildProcess): Promise<void> {
 
 function makeSessionPath(cwd: string, thread: string): string {
 	const safe = thread.replace(/[^\w.-]+/g, "_");
-	const dir = path.join(cwd, THREADS_DIR);
+	return path.join(cwd, THREADS_DIR, `${safe}.jsonl`);
+}
+
+function ensureSessionDirectory(sessionPath: string): void {
+	const dir = path.dirname(sessionPath);
 	if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-	return path.join(dir, `${safe}.jsonl`);
+}
+
+export function resolveSessionPath(
+	request: Pick<PiActorInvocationRequest, "cwd" | "thread" | "sessionPath">,
+): string {
+	return request.sessionPath ?? makeSessionPath(request.cwd, request.thread);
 }
 
 function writePromptFile(content: string): PromptFile {
@@ -374,7 +383,8 @@ function createInvocation(params: {
 		let finalSignal: NodeJS.Signals | null = null;
 
 		try {
-			const sessionPath = request.sessionPath ?? makeSessionPath(request.cwd, request.thread);
+			const sessionPath = resolveSessionPath(request);
+			ensureSessionDirectory(sessionPath);
 			if (request.systemPrompt) promptFile = writePromptFile(request.systemPrompt);
 
 			const args = argsBuilder(request, {

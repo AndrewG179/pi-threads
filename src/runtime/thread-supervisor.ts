@@ -6,6 +6,7 @@ import {
 	type PiActorInvocationRequest,
 	type PiActorResult,
 	type PiActorSnapshot,
+	resolveSessionPath,
 } from "./pi-actor";
 import { type RunEvent, type RunState, type RunTerminationReason } from "../run/state-machine";
 
@@ -204,11 +205,11 @@ function createSupervisedInvocation(params: {
 }
 
 /**
- * Minimal supervisor: serialize per-thread invocations, keep different thread
- * names concurrent, and expose cancellation/inspection hooks.
+ * Minimal supervisor: serialize invocations that target the same session while
+ * allowing different sessions to run concurrently.
  */
 export class ThreadSupervisor {
-	private readonly threadQueues = new Map<string, Promise<void>>();
+	private readonly sessionQueues = new Map<string, Promise<void>>();
 	private readonly activeInvocations = new Map<string, ThreadHandle>();
 
 	constructor(private readonly runtime: PiActorRuntime) {}
@@ -218,7 +219,8 @@ export class ThreadSupervisor {
 			throw new Error(`Run '${request.runId}' is already active`);
 		}
 
-		const previous = this.threadQueues.get(request.thread) ?? Promise.resolve();
+		const sessionKey = resolveSessionPath(request);
+		const previous = this.sessionQueues.get(sessionKey) ?? Promise.resolve();
 		const waitForTurn = previous.catch(() => undefined);
 
 		let releaseTurn!: () => void;
@@ -226,7 +228,7 @@ export class ThreadSupervisor {
 			releaseTurn = resolve;
 		});
 		const queueTail = waitForTurn.then(() => turnGate);
-		this.threadQueues.set(request.thread, queueTail);
+		this.sessionQueues.set(sessionKey, queueTail);
 
 		const invocation = createSupervisedInvocation({
 			request,
@@ -234,8 +236,8 @@ export class ThreadSupervisor {
 			waitForTurn,
 			releaseTurn: () => {
 				releaseTurn();
-				if (this.threadQueues.get(request.thread) === queueTail) {
-					this.threadQueues.delete(request.thread);
+				if (this.sessionQueues.get(sessionKey) === queueTail) {
+					this.sessionQueues.delete(sessionKey);
 				}
 			},
 			onSettled: () => {

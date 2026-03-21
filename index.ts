@@ -511,7 +511,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const model = "openai-codex/gpt-5.3-codex";
+			const model = "openai/gpt-5.4";
 
 			// Determine mode
 			const hasBatch = params.tasks && params.tasks.length > 0;
@@ -563,6 +563,30 @@ export default function (pi: ExtensionAPI) {
 								emitBatchUpdate();
 							}
 						: undefined;
+
+				const sessionPath = getThreadSessionPath(ctx.cwd, task.thread);
+				const pendingItem: SingleDispatchResult = {
+					thread: task.thread,
+					action: task.action,
+					episode: "(running...)",
+					episodeNumber,
+					result: {
+						thread: task.thread,
+						action: task.action,
+						exitCode: 0,
+						messages: [],
+						stderr: "",
+						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+						model,
+						sessionPath,
+						isNewThread: !fs.existsSync(sessionPath),
+					},
+				};
+				allItems[index] = pendingItem;
+				taskOnUpdate?.({
+					content: [{ type: "text", text: "(running...)" }],
+					details: { mode: "single", items: [pendingItem] },
+				});
 
 				const result = await runThreadAction(
 					ctx.cwd, task.thread, task.action, model, signal,
@@ -650,12 +674,18 @@ export default function (pi: ExtensionAPI) {
 				const threadLabel = theme.fg("accent", theme.bold(`[${item.thread}]`));
 				const epLabel = theme.fg("muted", `ep${item.episodeNumber}`);
 				const modelLabel = r.model ? theme.fg("dim", r.model) : "";
+				const newBadge = r.isNewThread ? theme.fg("warning", " new") : "";
 
 				// ── Running state: action + live tool calls + stats ──
 				if (isRunning) {
 					return {
 						render(colWidth: number): string[] {
 							const lines: string[] = [];
+							lines.push(`${theme.fg("warning", "⏳")} ${threadLabel} ${epLabel} ${modelLabel}${newBadge}`.trim());
+
+							const maxActionLines = isExpanded ? 3 : 1;
+							const actionLines = wrapText(item.action, Math.max(10, colWidth - 2)).slice(0, maxActionLines);
+							lines.push(...actionLines.map((line) => `  ${theme.fg("dim", line)}`));
 
 							// Status line: ⏳ turns · cost · context
 							const statParts: string[] = [];
@@ -663,7 +693,7 @@ export default function (pi: ExtensionAPI) {
 							if (r.usage.cost) statParts.push(`$${r.usage.cost.toFixed(2)}`);
 							if (r.usage.contextTokens > 0) statParts.push(`ctx:${formatTokens(r.usage.contextTokens)}`);
 							if (statParts.length > 0) {
-								lines.push(theme.fg("warning", "⏳") + " " + theme.fg("dim", statParts.join(" · ")));
+								lines.push(theme.fg("dim", statParts.join(" · ")));
 							}
 
 							// Live tool calls
@@ -675,6 +705,10 @@ export default function (pi: ExtensionAPI) {
 								}
 							}
 
+							if (toolCalls.length === 0) {
+								lines.push(theme.fg("muted", "starting..."));
+							}
+
 							return lines;
 						},
 						invalidate(): void {},
@@ -683,7 +717,6 @@ export default function (pi: ExtensionAPI) {
 
 				// ── Done state: episode ──
 				const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
-				const newBadge = r.isNewThread ? theme.fg("warning", " new") : "";
 
 				if (isExpanded) {
 					const mdTheme = getMarkdownTheme();
