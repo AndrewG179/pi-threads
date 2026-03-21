@@ -437,6 +437,7 @@ export default function (pi: ExtensionAPI) {
 	// Track episode counts per thread (reconstructed from session)
 	const episodeCounts = new Map<string, number>();
 	let defaultActiveTools: string[] | null = null;
+	let lastCommandSwitchSession: ((sessionPath: string) => Promise<{ cancelled: boolean }>) | null = null;
 
 	const rebuildEpisodeCounts = (sessionManager: { getBranch(): Array<{ type: string; message: { role: string; toolName?: string; details?: unknown } }> }) => {
 		episodeCounts.clear();
@@ -512,11 +513,17 @@ export default function (pi: ExtensionAPI) {
 		return behavior;
 	};
 
+	const rememberCommandSessionSwitcher = (ctx: {
+		switchSession: (sessionPath: string) => Promise<{ cancelled: boolean }>;
+	}) => {
+		lastCommandSwitchSession = ctx.switchSession.bind(ctx);
+	};
+
 	const switchToRememberedParent = async (ctx: {
 		cwd: string;
 		sessionManager: { getSessionFile(): string | undefined };
 		ui: { notify: (message: string, level?: string) => void };
-		switchSession: (sessionPath: string) => Promise<{ cancelled: boolean }>;
+		switchSession?: (sessionPath: string) => Promise<{ cancelled: boolean }>;
 	}) => {
 		const behavior = deriveSessionBehavior({
 			cwd: ctx.cwd,
@@ -527,7 +534,14 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify("No remembered parent session for this thread.", "warning");
 			return;
 		}
-		await ctx.switchSession(behavior.parentSessionFile);
+
+		const switchSession = ctx.switchSession ?? lastCommandSwitchSession;
+		if (!switchSession) {
+			ctx.ui.notify("Ctrl+B cannot switch sessions yet in this runtime. Use /subagents-back.", "warning");
+			return;
+		}
+
+		await switchSession(behavior.parentSessionFile);
 	};
 
 	// Reconstruct state on session load
@@ -570,6 +584,7 @@ export default function (pi: ExtensionAPI) {
 			return values.length > 0 ? values.map((value) => ({ value, label: value })) : null;
 		},
 		handler: async (args, ctx) => {
+			rememberCommandSessionSwitcher(ctx);
 			const nextMode = args.trim().toLowerCase();
 			if (nextMode !== "on" && nextMode !== "off") {
 				const state = loadThreadsState(ctx.cwd);
@@ -587,6 +602,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("subagents-back", {
 		description: "Return from the current subagent session to its remembered parent session",
 		handler: async (_args, ctx) => {
+			rememberCommandSessionSwitcher(ctx);
 			await switchToRememberedParent(ctx);
 		},
 	});
@@ -601,6 +617,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("subagents", {
 		description: "Browse and open known subagent thread sessions",
 		handler: async (_args, ctx) => {
+			rememberCommandSessionSwitcher(ctx);
 			if (!ctx.hasUI) {
 				ctx.ui.notify("The /subagents selector requires the interactive UI.", "warning");
 				return;
@@ -680,6 +697,13 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+			let threadsState = loadThreadsState(ctx.cwd);
+			const dispatchBehavior = deriveSessionBehavior({
+				cwd: ctx.cwd,
+				sessionFile: ctx.sessionManager.getSessionFile(),
+				state: threadsState,
+			});
+			const rememberedParentSession = dispatchBehavior.parentSessionFile ?? dispatchBehavior.sessionFile;
 
 			// Determine mode
 			const hasBatch = params.tasks && params.tasks.length > 0;
@@ -733,6 +757,11 @@ export default function (pi: ExtensionAPI) {
 						: undefined;
 
 				const sessionPath = getThreadSessionPath(ctx.cwd, task.thread);
+				if (rememberedParentSession) {
+					threadsState = rememberParentSession(threadsState, sessionPath, rememberedParentSession);
+					saveThreadsState(ctx.cwd, threadsState);
+				}
+
 				const pendingItem: SingleDispatchResult = {
 					thread: task.thread,
 					action: task.action,

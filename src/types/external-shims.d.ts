@@ -75,7 +75,9 @@ declare module "@mariozechner/pi-coding-agent" {
 		};
 	}
 
-	interface ExtensionCommandContext extends ToolExecuteContext {
+	interface ExtensionContext extends ToolExecuteContext {}
+
+	interface ExtensionCommandContext extends ExtensionContext {
 		switchSession(sessionPath: string): Promise<{ cancelled: boolean }>;
 	}
 
@@ -116,7 +118,7 @@ declare module "@mariozechner/pi-coding-agent" {
 		): void;
 		registerShortcut(
 			shortcut: string,
-			config: { description?: string; handler: (ctx: ExtensionCommandContext) => Promise<void> | void },
+			config: { description?: string; handler: (ctx: ExtensionContext) => Promise<void> | void },
 		): void;
 		getActiveTools(): string[];
 		getAllTools(): ToolDefinition[];
