@@ -126,6 +126,30 @@ interface DispatchDetails {
 
 // ─── Helpers ───
 
+function createEmptyUsageStats(): UsageStats {
+	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 };
+}
+
+function createEmptyThreadActionResult(params: {
+	thread: string;
+	action: string;
+	model: string | undefined;
+	sessionPath: string;
+	isNewThread: boolean;
+}): ThreadActionResult {
+	return {
+		thread: params.thread,
+		action: params.action,
+		exitCode: 0,
+		messages: [],
+		stderr: "",
+		usage: createEmptyUsageStats(),
+		model: params.model,
+		sessionPath: params.sessionPath,
+		isNewThread: params.isNewThread,
+	};
+}
+
 function getThreadsDir(cwd: string): string {
 	return path.join(cwd, THREADS_DIR);
 }
@@ -274,17 +298,13 @@ async function runThreadAction(
 	const sessionPath = getThreadSessionPath(cwd, threadName);
 	const isNewThread = !fs.existsSync(sessionPath);
 
-	const result: ThreadActionResult = {
+	const result = createEmptyThreadActionResult({
 		thread: threadName,
 		action,
-		exitCode: 0,
-		messages: [],
-		stderr: "",
-		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 		model,
 		sessionPath,
 		isNewThread,
-	};
+	});
 
 	const trackUsage = (msg: Message) => {
 		if (msg.role !== "assistant") return;
@@ -465,6 +485,19 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
+	const resolveSessionContext = (ctx: {
+		cwd: string;
+		sessionManager: { getSessionFile(): string | undefined };
+	}) => {
+		const state = loadThreadsState(ctx.cwd);
+		const behavior = deriveSessionBehavior({
+			cwd: ctx.cwd,
+			sessionFile: ctx.sessionManager.getSessionFile(),
+			state,
+		});
+		return { state, behavior };
+	};
+
 	const renderSubagentBanner = (ctx: { ui: { theme: any; setWidget: (key: string, content: unknown, options?: unknown) => void } }, behavior: ReturnType<typeof deriveSessionBehavior>) => {
 		if (behavior.kind !== "subagent") {
 			ctx.ui.setWidget("pi-threads-subagent-banner", undefined);
@@ -493,12 +526,7 @@ export default function (pi: ExtensionAPI) {
 			setWidget: (key: string, content: unknown, options?: unknown) => void;
 		};
 	}) => {
-		const state = loadThreadsState(ctx.cwd);
-		const behavior = deriveSessionBehavior({
-			cwd: ctx.cwd,
-			sessionFile: ctx.sessionManager.getSessionFile(),
-			state,
-		});
+		const { state, behavior } = resolveSessionContext(ctx);
 		const currentActiveTools = pi.getActiveTools().filter((tool) => tool !== "dispatch");
 		const allToolNames = pi.getAllTools().map((tool) => tool.name);
 
@@ -558,11 +586,7 @@ export default function (pi: ExtensionAPI) {
 		ui: { notify: (message: string, level?: string) => void };
 		switchSession?: (sessionPath: string) => Promise<{ cancelled: boolean }>;
 	}) => {
-		const behavior = deriveSessionBehavior({
-			cwd: ctx.cwd,
-			sessionFile: ctx.sessionManager.getSessionFile(),
-			state: loadThreadsState(ctx.cwd),
-		});
+		const { behavior } = resolveSessionContext(ctx);
 		if (behavior.kind !== "subagent" || !behavior.parentSessionFile) {
 			ctx.ui.notify("No remembered parent session for this thread.", "warning");
 			return;
@@ -588,11 +612,7 @@ export default function (pi: ExtensionAPI) {
 
 	// Inject orchestrator system prompt
 	pi.on("before_agent_start", async (event, ctx) => {
-		const behavior = deriveSessionBehavior({
-			cwd: ctx.cwd,
-			sessionFile: ctx.sessionManager.getSessionFile(),
-			state: loadThreadsState(ctx.cwd),
-		});
+		const { behavior } = resolveSessionContext(ctx);
 		if (!behavior.shouldAppendOrchestratorPrompt) return;
 
 		let extra = ORCHESTRATOR_PROMPT;
@@ -656,12 +676,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const state = loadThreadsState(ctx.cwd);
-			const behavior = deriveSessionBehavior({
-				cwd: ctx.cwd,
-				sessionFile: ctx.sessionManager.getSessionFile(),
-				state,
-			});
+			const { state, behavior } = resolveSessionContext(ctx);
 
 			const parentSessionFile = behavior.parentSessionFile ?? behavior.sessionFile;
 			if (!parentSessionFile) {
@@ -730,12 +745,9 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
-			let threadsState = loadThreadsState(ctx.cwd);
-			const dispatchBehavior = deriveSessionBehavior({
-				cwd: ctx.cwd,
-				sessionFile: ctx.sessionManager.getSessionFile(),
-				state: threadsState,
-			});
+			const sessionContext = resolveSessionContext(ctx);
+			let threadsState = sessionContext.state;
+			const dispatchBehavior = sessionContext.behavior;
 			const rememberedParentSession = dispatchBehavior.parentSessionFile ?? dispatchBehavior.sessionFile;
 
 			// Determine mode
@@ -800,17 +812,13 @@ export default function (pi: ExtensionAPI) {
 					action: task.action,
 					episode: "(running...)",
 					episodeNumber,
-					result: {
+					result: createEmptyThreadActionResult({
 						thread: task.thread,
 						action: task.action,
-						exitCode: 0,
-						messages: [],
-						stderr: "",
-						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 						model,
 						sessionPath,
 						isNewThread: !fs.existsSync(sessionPath),
-					},
+					}),
 				};
 				allItems[index] = pendingItem;
 				taskOnUpdate?.({
