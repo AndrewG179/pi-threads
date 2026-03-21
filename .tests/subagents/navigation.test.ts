@@ -24,6 +24,8 @@ type RegisteredShortcut = {
 	handler: (ctx: Record<string, unknown>) => Promise<void> | void;
 };
 
+type RegisteredEventHandler = (event: unknown, ctx: Record<string, unknown>) => Promise<unknown> | unknown;
+
 function makeTempProject(): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-navigation-"));
 }
@@ -32,9 +34,14 @@ function makeFakePi() {
 	const tools = new Map<string, RegisteredTool>();
 	const shortcuts = new Map<string, RegisteredShortcut>();
 	const commands = new Map<string, { handler: (args: string, ctx: Record<string, unknown>) => Promise<void> | void }>();
+	const events = new Map<string, RegisteredEventHandler[]>();
 
 	return {
-		on: () => {},
+		on(event: string, listener: RegisteredEventHandler) {
+			const handlers = events.get(event) ?? [];
+			handlers.push(listener);
+			events.set(event, handlers);
+		},
 		registerCommand(name: string, config: { handler: (args: string, ctx: Record<string, unknown>) => Promise<void> | void }) {
 			commands.set(name, config);
 		},
@@ -50,6 +57,7 @@ function makeFakePi() {
 		tools,
 		shortcuts,
 		commands,
+		events,
 	};
 }
 
@@ -178,6 +186,77 @@ test("ctrl+b should work from a plain shortcut ExtensionContext shape", async ()
 				getSystemPrompt: () => "",
 			} as any);
 		});
+	} finally {
+		fs.rmSync(projectDir, { recursive: true, force: true });
+	}
+});
+
+test("fresh runtime should install restart-safe ctrl+b back navigation for remembered subagent sessions", async () => {
+	const projectDir = makeTempProject();
+	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
+	const threadSession = path.join(projectDir, ".pi", "threads", "smoke-fast.jsonl");
+
+	try {
+		fs.mkdirSync(path.dirname(parentSession), { recursive: true });
+		fs.writeFileSync(parentSession, "{\"type\":\"session\"}\n", "utf8");
+		fs.mkdirSync(path.dirname(threadSession), { recursive: true });
+		fs.writeFileSync(threadSession, "{\"type\":\"session\"}\n", "utf8");
+		fs.mkdirSync(path.join(projectDir, ".pi", "threads"), { recursive: true });
+		fs.writeFileSync(
+			path.join(projectDir, ".pi", "threads", "state.json"),
+			JSON.stringify(
+				{
+					enabled: true,
+					parentBySession: {
+						[path.resolve(threadSession)]: path.resolve(parentSession),
+					},
+				},
+				null,
+				2,
+			) + "\n",
+			"utf8",
+		);
+
+		const fakePi = makeFakePi();
+		registerExtension(fakePi as any);
+
+		const sessionStartHandlers = fakePi.events.get("session_start") ?? [];
+		assert.equal(sessionStartHandlers.length > 0, true, "session_start handler should be registered");
+
+		let terminalInputHandler: ((data: string) => { consume?: boolean; data?: string } | undefined) | undefined;
+		const ui = {
+			notify: () => {},
+			setStatus: () => {},
+			setWidget: () => {},
+			theme: {
+				fg: (_color: string, text: string) => text,
+			},
+			onTerminalInput(handler: (data: string) => { consume?: boolean; data?: string } | undefined) {
+				terminalInputHandler = handler;
+				return () => {
+					if (terminalInputHandler === handler) {
+						terminalInputHandler = undefined;
+					}
+				};
+			},
+		};
+
+		for (const handler of sessionStartHandlers) {
+			await handler({}, {
+				cwd: projectDir,
+				hasUI: true,
+				ui,
+				sessionManager: {
+					getSessionFile: () => threadSession,
+					getBranch: () => [],
+				},
+			} as any);
+		}
+
+		assert.ok(
+			terminalInputHandler,
+			"fresh runtimes should install a restart-safe terminal-input back-navigation path",
+		);
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });
 	}

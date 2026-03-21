@@ -123,3 +123,51 @@ test("collectSubagentCards combines thread transcript previews with current-pare
 		fs.rmSync(cwd, { recursive: true, force: true });
 	}
 });
+
+test("collectSubagentCards ignores dispatch metadata for threads without real session files", () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-phantom-"));
+
+	try {
+		const cards = collectSubagentCards(cwd, [
+			{
+				type: "message",
+				message: {
+					role: "toolResult",
+					toolName: "dispatch",
+					details: {
+						mode: "single",
+						items: [{
+							thread: "ghost",
+							action: "Respond with exactly: hello",
+							episode: "(running...)",
+							episodeNumber: 1,
+							result: {
+								thread: "ghost",
+								action: "Respond with exactly: hello",
+								exitCode: 0,
+								stderr: "",
+								messages: [],
+								usage: {
+									input: 0,
+									output: 0,
+									cacheRead: 0,
+									cacheWrite: 0,
+									cost: 0,
+									contextTokens: 0,
+									turns: 0,
+								},
+								sessionPath: path.join(cwd, ".pi", "threads", "ghost.jsonl"),
+								isNewThread: true,
+							},
+						}],
+					},
+				},
+			},
+		]);
+
+		assert.equal(cards.length, 0);
+		assert.equal(cards.some((card) => card.thread === "ghost"), false);
+	} finally {
+		fs.rmSync(cwd, { recursive: true, force: true });
+	}
+});
