@@ -74,3 +74,12 @@ test("resolveActiveToolsForBehavior strips built-in file/shell tools only in orc
 		["custom-tool", "dispatch"],
 	);
 });
+
+test("resolveActiveToolsForBehavior restores interactive tools when leaving a dispatch-only orchestrator session", () => {
+	const allTools = [...BUILTIN_FILE_SHELL_TOOLS, "dispatch", "custom-tool"];
+
+	assert.deepEqual(
+		resolveActiveToolsForBehavior("normal", ["dispatch"], allTools),
+		["read", "write", "edit", "bash", "custom-tool"],
+	);
+});
