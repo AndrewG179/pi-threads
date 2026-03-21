@@ -1,0 +1,125 @@
+import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import test from "node:test";
+
+import { collectSubagentCards } from "../../src/subagents/metadata";
+
+function writeThreadSession(filePath: string, lines: unknown[]): void {
+	fs.mkdirSync(path.dirname(filePath), { recursive: true });
+	fs.writeFileSync(
+		filePath,
+		lines.map((line) => JSON.stringify(line)).join("\n") + "\n",
+		"utf8",
+	);
+}
+
+test("collectSubagentCards combines thread transcript previews with current-parent dispatch metadata", () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-cards-"));
+	const alphaSession = path.join(cwd, ".pi", "threads", "alpha.jsonl");
+	const betaSession = path.join(cwd, ".pi", "threads", "beta.jsonl");
+
+	try {
+		writeThreadSession(alphaSession, [
+			{ type: "session", version: 3, cwd },
+			{
+				type: "message",
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "Respond with exactly: hello" }],
+				},
+			},
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "toolCall", name: "bash", arguments: { command: "echo hello" } }],
+				},
+			},
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "hello" }],
+				},
+			},
+		]);
+		writeThreadSession(betaSession, [
+			{ type: "session", version: 3, cwd },
+			{
+				type: "message",
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "Investigate the auth hang" }],
+				},
+			},
+		]);
+
+		const cards = collectSubagentCards(cwd, [
+			{
+				type: "message",
+				message: {
+					role: "toolResult",
+					toolName: "dispatch",
+					details: {
+						mode: "single",
+						items: [{
+							thread: "alpha",
+							action: "Respond with exactly: hello",
+							episode: "hello",
+							episodeNumber: 1,
+							result: {
+								thread: "alpha",
+								action: "Respond with exactly: hello",
+								exitCode: 0,
+								stderr: "",
+								messages: [{ role: "assistant", content: [{ type: "text", text: "hello" }] }],
+								usage: {
+									input: 10,
+									output: 2,
+									cacheRead: 0,
+									cacheWrite: 0,
+									cost: 0.25,
+									contextTokens: 12,
+									turns: 1,
+								},
+								sessionPath: alphaSession,
+								isNewThread: true,
+							},
+						}],
+					},
+				},
+			},
+		]);
+
+		assert.equal(cards.length, 2);
+
+		const alpha = cards.find((card) => card.thread === "alpha");
+		const beta = cards.find((card) => card.thread === "beta");
+
+		assert.deepEqual(alpha, {
+			thread: "alpha",
+			sessionPath: alphaSession,
+			latestAction: "Respond with exactly: hello",
+			outputPreview: "hello",
+			toolPreview: "$ echo hello",
+			accumulatedCost: 0.25,
+			status: "done",
+			parentSessionFile: undefined,
+		});
+
+		assert.deepEqual(beta, {
+			thread: "beta",
+			sessionPath: betaSession,
+			latestAction: "Investigate the auth hang",
+			outputPreview: "",
+			toolPreview: "",
+			accumulatedCost: 0,
+			status: "unknown",
+			parentSessionFile: undefined,
+		});
+	} finally {
+		fs.rmSync(cwd, { recursive: true, force: true });
+	}
+});
