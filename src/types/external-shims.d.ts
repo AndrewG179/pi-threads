@@ -38,27 +38,45 @@ declare module "@mariozechner/pi-coding-agent" {
 
 	interface SessionEntry {
 		type: string;
+		id?: string;
+		parentId?: string | null;
 		message: {
 			role: string;
 			toolName?: string;
 			details?: unknown;
+			content?: Array<{ type?: string; text?: string; name?: string; arguments?: Record<string, unknown> }>;
 		};
 	}
 
 	interface SessionManager {
 		getBranch(): SessionEntry[];
+		getSessionFile(): string | undefined;
 	}
 
 	interface UIApi {
 		notify(message: string, level?: string): void;
+		setStatus(key: string, text: string | undefined): void;
+		setWidget(key: string, content: unknown, options?: unknown): void;
+		custom<T>(
+			factory: (tui: any, theme: any, keybindings: any, done: (result: T) => void) => any,
+			options?: unknown,
+		): Promise<T>;
+		theme: any;
 	}
 
 	interface ToolExecuteContext {
 		cwd: string;
+		hasUI: boolean;
+		ui: UIApi;
+		sessionManager: SessionManager;
 		model?: {
 			provider: string;
 			id: string;
 		};
+	}
+
+	interface ExtensionCommandContext extends ToolExecuteContext {
+		switchSession(sessionPath: string): Promise<{ cancelled: boolean }>;
 	}
 
 	interface DispatchToolParams {
@@ -88,6 +106,19 @@ declare module "@mariozechner/pi-coding-agent" {
 
 	export interface ExtensionAPI {
 		on(event: string, listener: (event: any, ctx: any) => any): void;
+		registerCommand(
+			name: string,
+			config: {
+				description?: string;
+				getArgumentCompletions?: (prefix: string) => Array<{ value: string; label: string }> | null;
+				handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> | void;
+			},
+		): void;
+		registerShortcut(
+			shortcut: string,
+			config: { description?: string; handler: (ctx: ExtensionCommandContext) => Promise<void> | void },
+		): void;
+		getActiveTools(): string[];
 		getAllTools(): ToolDefinition[];
 		setActiveTools(toolNames: string[]): void;
 		registerTool(config: ToolDefinitionConfig): void;
@@ -97,6 +128,10 @@ declare module "@mariozechner/pi-coding-agent" {
 }
 
 declare module "@mariozechner/pi-tui" {
+	export interface KeybindingMatcher {
+		matches(input: string, command: string): boolean;
+	}
+
 	export interface Renderable {
 		render(width: number): string[];
 		invalidate(): void;
@@ -127,6 +162,7 @@ declare module "@mariozechner/pi-tui" {
 		invalidate(): void;
 	}
 
+	export function getEditorKeybindings(): KeybindingMatcher;
 	export function truncateToWidth(input: string, width: number): string;
 	export function visibleWidth(input: string): number;
 }

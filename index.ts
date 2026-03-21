@@ -25,6 +25,10 @@ import { Type } from "@sinclair/typebox";
 import { buildEpisode as buildThreadEpisode } from "./src/episode/builder";
 import { PiActorRuntime } from "./src/runtime/pi-actor";
 import { ThreadSupervisor } from "./src/runtime/thread-supervisor";
+import { collectSubagentCards, loadSessionBranchFromFile, type SubagentCard } from "./src/subagents/metadata";
+import { deriveSessionBehavior, resolveActiveToolsForBehavior } from "./src/subagents/mode";
+import { SubagentSelector } from "./src/subagents/selector";
+import { loadThreadsState, rememberParentSession, saveThreadsState } from "./src/subagents/state";
 
 // ─── Constants ───
 
@@ -432,20 +436,11 @@ function getDisplayItems(messages: Message[]): DisplayItem[] {
 export default function (pi: ExtensionAPI) {
 	// Track episode counts per thread (reconstructed from session)
 	const episodeCounts = new Map<string, number>();
+	let defaultActiveTools: string[] | null = null;
 
-	// Reconstruct state on session load
-	pi.on("session_start", async (_event, ctx) => {
+	const rebuildEpisodeCounts = (sessionManager: { getBranch(): Array<{ type: string; message: { role: string; toolName?: string; details?: unknown } }> }) => {
 		episodeCounts.clear();
-
-		// Strip built-in tools — orchestrator only dispatches
-		const allTools = pi.getAllTools();
-		const keepTools = allTools.map((t) => t.name).filter((n) => !["read", "write", "edit", "bash", "grep", "find", "ls"].includes(n));
-		if (keepTools.length > 0) {
-			pi.setActiveTools(keepTools);
-		}
-
-		// Reconstruct episode counts from session history
-		for (const entry of ctx.sessionManager.getBranch()) {
+		for (const entry of sessionManager.getBranch()) {
 			if (entry.type === "message" && entry.message.role === "toolResult") {
 				if (entry.message.toolName === "dispatch") {
 					const details = entry.message.details as DispatchDetails | undefined;
@@ -457,12 +452,102 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 		}
+	};
 
-		ctx.ui.notify("🧵 Thread orchestrator active", "info");
+	const renderSubagentBanner = (ctx: { ui: { theme: any; setWidget: (key: string, content: unknown, options?: unknown) => void } }, behavior: ReturnType<typeof deriveSessionBehavior>) => {
+		if (behavior.kind !== "subagent") {
+			ctx.ui.setWidget("pi-threads-subagent-banner", undefined);
+			return;
+		}
+
+		const parentLabel = behavior.parentSessionFile ? path.basename(behavior.parentSessionFile) : "unknown";
+		ctx.ui.setWidget(
+			"pi-threads-subagent-banner",
+			[
+				ctx.ui.theme.fg("warning", `Subagent [${behavior.threadName ?? "thread"}]`) + ctx.ui.theme.fg("dim", `  parent ${parentLabel}`),
+				ctx.ui.theme.fg("dim", "Ctrl+B or /subagents-back to return · /subagents to switch threads"),
+			],
+			{ placement: "aboveEditor" },
+		);
+	};
+
+	const syncSessionMode = (ctx: {
+		cwd: string;
+		sessionManager: { getSessionFile(): string | undefined; getBranch(): Array<{ type: string; message: { role: string; toolName?: string; details?: unknown } }> };
+		ui: {
+			theme: any;
+			setStatus: (key: string, text: string | undefined) => void;
+			setWidget: (key: string, content: unknown, options?: unknown) => void;
+		};
+	}) => {
+		const state = loadThreadsState(ctx.cwd);
+		const behavior = deriveSessionBehavior({
+			cwd: ctx.cwd,
+			sessionFile: ctx.sessionManager.getSessionFile(),
+			state,
+		});
+
+		if (!defaultActiveTools) {
+			defaultActiveTools = pi.getActiveTools().filter((tool) => tool !== "dispatch");
+		}
+
+		const allToolNames = pi.getAllTools().map((tool) => tool.name);
+		const nextActiveTools = resolveActiveToolsForBehavior(
+			behavior.kind,
+			defaultActiveTools ?? allToolNames,
+			allToolNames,
+		);
+		pi.setActiveTools(nextActiveTools);
+
+		if (behavior.kind === "orchestrator") {
+			ctx.ui.setStatus("pi-threads", ctx.ui.theme.fg("accent", "threads:on"));
+		} else if (behavior.kind === "subagent") {
+			ctx.ui.setStatus("pi-threads", ctx.ui.theme.fg("warning", `subagent:${behavior.threadName ?? "thread"}`));
+		} else {
+			ctx.ui.setStatus("pi-threads", undefined);
+		}
+
+		renderSubagentBanner(ctx, behavior);
+		rebuildEpisodeCounts(ctx.sessionManager);
+		return behavior;
+	};
+
+	const switchToRememberedParent = async (ctx: {
+		cwd: string;
+		sessionManager: { getSessionFile(): string | undefined };
+		ui: { notify: (message: string, level?: string) => void };
+		switchSession: (sessionPath: string) => Promise<{ cancelled: boolean }>;
+	}) => {
+		const behavior = deriveSessionBehavior({
+			cwd: ctx.cwd,
+			sessionFile: ctx.sessionManager.getSessionFile(),
+			state: loadThreadsState(ctx.cwd),
+		});
+		if (behavior.kind !== "subagent" || !behavior.parentSessionFile) {
+			ctx.ui.notify("No remembered parent session for this thread.", "warning");
+			return;
+		}
+		await ctx.switchSession(behavior.parentSessionFile);
+	};
+
+	// Reconstruct state on session load
+	pi.on("session_start", async (_event, ctx) => {
+		syncSessionMode(ctx);
+	});
+
+	pi.on("session_switch", async (_event, ctx) => {
+		syncSessionMode(ctx);
 	});
 
 	// Inject orchestrator system prompt
 	pi.on("before_agent_start", async (event, ctx) => {
+		const behavior = deriveSessionBehavior({
+			cwd: ctx.cwd,
+			sessionFile: ctx.sessionManager.getSessionFile(),
+			state: loadThreadsState(ctx.cwd),
+		});
+		if (!behavior.shouldAppendOrchestratorPrompt) return;
+
 		let extra = ORCHESTRATOR_PROMPT;
 
 		// Tell the orchestrator about existing threads
@@ -476,6 +561,89 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		return { systemPrompt: event.systemPrompt + extra };
+	});
+
+	pi.registerCommand("threads", {
+		description: "Turn thread orchestrator mode on or off for this project",
+		getArgumentCompletions(prefix) {
+			const values = ["on", "off"].filter((value) => value.startsWith(prefix));
+			return values.length > 0 ? values.map((value) => ({ value, label: value })) : null;
+		},
+		handler: async (args, ctx) => {
+			const nextMode = args.trim().toLowerCase();
+			if (nextMode !== "on" && nextMode !== "off") {
+				const state = loadThreadsState(ctx.cwd);
+				ctx.ui.notify(`Thread mode is ${state.enabled ? "on" : "off"}. Use /threads on or /threads off.`, "info");
+				return;
+			}
+
+			const state = loadThreadsState(ctx.cwd);
+			saveThreadsState(ctx.cwd, { ...state, enabled: nextMode === "on" });
+			syncSessionMode(ctx);
+			ctx.ui.notify(`Thread mode ${nextMode}.`, "info");
+		},
+	});
+
+	pi.registerCommand("subagents-back", {
+		description: "Return from the current subagent session to its remembered parent session",
+		handler: async (_args, ctx) => {
+			await switchToRememberedParent(ctx);
+		},
+	});
+
+	pi.registerShortcut("ctrl+b", {
+		description: "Return to remembered parent session from a subagent",
+		handler: async (ctx) => {
+			await switchToRememberedParent(ctx);
+		},
+	});
+
+	pi.registerCommand("subagents", {
+		description: "Browse and open known subagent thread sessions",
+		handler: async (_args, ctx) => {
+			if (!ctx.hasUI) {
+				ctx.ui.notify("The /subagents selector requires the interactive UI.", "warning");
+				return;
+			}
+
+			const state = loadThreadsState(ctx.cwd);
+			const behavior = deriveSessionBehavior({
+				cwd: ctx.cwd,
+				sessionFile: ctx.sessionManager.getSessionFile(),
+				state,
+			});
+
+			const parentSessionFile = behavior.parentSessionFile ?? behavior.sessionFile;
+			if (!parentSessionFile) {
+				ctx.ui.notify("Current session is not persisted, so parent navigation cannot be remembered.", "warning");
+				return;
+			}
+
+			const parentEntries = behavior.parentSessionFile
+				? loadSessionBranchFromFile(behavior.parentSessionFile)
+				: ctx.sessionManager.getBranch();
+
+			const cards = collectSubagentCards(ctx.cwd, parentEntries);
+			const selected = await ctx.ui.custom<SubagentCard | undefined>(
+				(_tui, theme, _keybindings, done) => new SubagentSelector(cards, theme, done),
+				{
+					overlay: true,
+					overlayOptions: {
+						width: "90%",
+						maxHeight: "80%",
+						anchor: "center",
+						margin: 1,
+					},
+				},
+			);
+
+			if (!selected) return;
+			if (selected.sessionPath === ctx.sessionManager.getSessionFile()) return;
+
+			const nextState = rememberParentSession(state, selected.sessionPath, parentSessionFile);
+			saveThreadsState(ctx.cwd, nextState);
+			await ctx.switchSession(selected.sessionPath);
+		},
 	});
 
 	// Register the dispatch tool

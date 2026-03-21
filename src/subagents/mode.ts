@@ -6,6 +6,8 @@ export type SessionBehaviorKind = "normal" | "orchestrator" | "subagent";
 
 export interface SessionBehavior {
 	kind: SessionBehaviorKind;
+	sessionFile?: string;
+	threadName?: string;
 	shouldAppendOrchestratorPrompt: boolean;
 	parentSessionFile?: string;
 }
@@ -40,9 +42,11 @@ export function deriveSessionBehavior(input: DeriveSessionBehaviorInput): Sessio
 	const parentSessionFile = sessionFile ? input.state.parentBySession[sessionFile] : undefined;
 	const isThreadSession = isSessionUnderDir(sessionFile, threadsDir);
 
-	if (parentSessionFile) {
+	if (isThreadSession) {
 		return {
 			kind: "subagent",
+			sessionFile,
+			threadName: sessionFile ? path.basename(sessionFile, ".jsonl") : undefined,
 			shouldAppendOrchestratorPrompt: false,
 			parentSessionFile,
 		};
@@ -51,12 +55,14 @@ export function deriveSessionBehavior(input: DeriveSessionBehaviorInput): Sessio
 	if (input.state.enabled && !isThreadSession) {
 		return {
 			kind: "orchestrator",
+			sessionFile,
 			shouldAppendOrchestratorPrompt: true,
 		};
 	}
 
 	return {
 		kind: "normal",
+		sessionFile,
 		shouldAppendOrchestratorPrompt: false,
 	};
 }
@@ -66,13 +72,25 @@ export function resolveActiveToolsForBehavior(
 	currentActiveTools: string[],
 	allTools: ReadonlyArray<string | { name: string }>,
 ): string[] {
+	const normalizedAllTools = allTools.map(extractToolName);
+
 	if (behaviorKind !== "orchestrator") {
-		return [...currentActiveTools];
+		const withoutDispatch = currentActiveTools.filter((toolName) => toolName !== "dispatch");
+		if (withoutDispatch.length === 0 && currentActiveTools.includes("dispatch")) {
+			const preferredInteractiveTools = new Set(["read", "write", "edit", "bash"]);
+			return normalizedAllTools.filter(
+				(toolName) =>
+					preferredInteractiveTools.has(toolName) ||
+					(!BUILTIN_FILE_SHELL_TOOLS.includes(toolName as (typeof BUILTIN_FILE_SHELL_TOOLS)[number]) && toolName !== "dispatch"),
+			);
+		}
+		return withoutDispatch;
 	}
 
-	const blocked = new Set(BUILTIN_FILE_SHELL_TOOLS);
-	return allTools
-		.map(extractToolName)
-		.filter((toolName) => !blocked.has(toolName));
+	const blocked = new Set<string>(BUILTIN_FILE_SHELL_TOOLS);
+	const allowed = new Set(currentActiveTools.filter((toolName) => !blocked.has(toolName)));
+	if (normalizedAllTools.includes("dispatch")) {
+		allowed.add("dispatch");
+	}
+	return normalizedAllTools.filter((toolName) => allowed.has(toolName));
 }
-

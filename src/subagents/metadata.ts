@@ -35,6 +35,8 @@ interface SessionMessage {
 
 interface SessionLine {
 	type?: string;
+	id?: string;
+	parentId?: string | null;
 	message?: SessionMessage;
 }
 
@@ -119,13 +121,41 @@ function parseJsonLines(filePath: string): SessionLine[] {
 	return lines;
 }
 
+export function loadSessionBranchFromFile(sessionPath: string): SessionLine[] {
+	const entries = parseJsonLines(sessionPath).filter((entry) => entry.type !== "session");
+	if (entries.length === 0) return [];
+
+	const byId = new Map<string, SessionLine>();
+	const referencedParents = new Set<string>();
+	for (const entry of entries) {
+		if (entry.id) byId.set(entry.id, entry);
+		if (entry.parentId) referencedParents.add(entry.parentId);
+	}
+
+	let leaf = [...entries].reverse().find((entry) => entry.id && !referencedParents.has(entry.id));
+	if (!leaf) {
+		leaf = [...entries].reverse().find((entry) => Boolean(entry.id)) ?? entries[entries.length - 1];
+	}
+
+	if (!leaf.id) return entries;
+
+	const branch: SessionLine[] = [];
+	let current: SessionLine | undefined = leaf;
+	while (current) {
+		branch.push(current);
+		current = current.parentId ? byId.get(current.parentId) : undefined;
+	}
+
+	return branch.reverse();
+}
+
 function summarizeThreadSession(sessionPath: string, parentSessionFile?: string): SubagentCard {
 	const thread = getThreadName(sessionPath);
 	let latestAction = "";
 	let outputPreview = "";
 	let toolPreview = "";
 
-	for (const line of parseJsonLines(sessionPath)) {
+	for (const line of loadSessionBranchFromFile(sessionPath)) {
 		if (line.type !== "message" || !line.message) continue;
 		const message = line.message;
 		if (message.role === "user") {
@@ -237,4 +267,3 @@ export function collectSubagentCards(cwd: string, parentBranchEntries: unknown[]
 
 	return [...cards.values()].sort((a, b) => a.thread.localeCompare(b.thread));
 }
-
