@@ -1,54 +1,51 @@
-# `/subagents` behavior
+# Thread orchestrator behavior (current implementation)
 
-This extension adds two user-facing controls:
+This document describes the **currently implemented** behavior in this package.
 
-- `/threads on`
-- `/threads off`
-- `/subagents`
+> Canonical source of truth: runtime code in `index.ts` and `src/backends/pi-run-backend.ts`.
 
-## Thread mode
+## Scope
 
-Thread mode is **off by default**.
+This extension currently provides a `dispatch` tool for thread-based execution.
+It does **not** register slash commands such as `/threads on`, `/threads off`, or `/subagents`.
 
-When thread mode is **on** in a non-thread session:
-- the session behaves like the orchestrator session
-- the orchestrator system prompt is appended before agent turns
-- the `dispatch` tool is available
-- direct file/shell tools are removed from the active tool set
+## Session startup behavior
 
-When thread mode is **off**:
-- the orchestrator system prompt is not appended
-- the `dispatch` tool is not active
-- the session behaves like a normal pi session
+On session start, the extension:
 
-The on/off state is stored per-project in `.pi/threads/state.json`.
+- reconstructs per-thread episode counters from prior `dispatch` tool results in branch history
+- removes direct file/shell tools from the active tool set (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`)
+- emits a UI notification that thread orchestrator mode is active
 
-## `/subagents`
+On each agent turn, it appends an orchestrator system prompt before execution.
 
-`/subagents` opens an interactive selector overlay that lists known thread sessions from `.pi/threads/*.jsonl`.
+## Thread persistence model
 
-The selector should show a compact card per subagent with the information this extension actually has:
-- subagent/thread name
-- latest task/action
-- latest agent output preview
-- recent tool-call preview
-- accumulated cost seen in the current parent session
-- completion status (`Done`, `Escalated`, `Aborted`, or unknown)
+Thread sessions are persisted under:
 
-Keyboard behavior:
-- arrow keys move selection
-- `Enter` opens the selected subagent session
-- `Esc` closes the selector
+- `.pi/threads/<sanitized-thread-name>.jsonl`
 
-## Opening a subagent
+Thread names are sanitized by replacing non `[A-Za-z0-9_.-]` characters with `_` before generating the session filename.
 
-Opening a subagent switches the current pi session to that thread session file.
+## Dispatch execution model
 
-Once opened, the subagent is just a **normal pi chat session**. The only extra UI is a small banner that says it is a subagent session and shows the remembered parent session.
+`dispatch` accepts:
 
-While inside a subagent session:
-- `Ctrl+B` should return to the remembered parent session
-- `/subagents-back` should also return to the remembered parent session
-- `/subagents` can be used again to jump to another subagent
+- single mode: `{ thread, action }`
+- batch mode: `{ tasks: [{ thread, action }, ...] }`
 
-Returning to the parent restores the parent chat session rather than opening a copy.
+Execution semantics:
+
+- tasks in different threads can run concurrently
+- runs for the same thread are serialized in order
+- each successful run increments that thread's episode counter
+
+## Episode summarization
+
+Dispatch results are summarized into an episode composed of:
+
+- tool call summaries
+- tool result summaries
+- assistant response text
+
+This is designed to return high-signal execution context to the orchestrator without raw trace dumps.

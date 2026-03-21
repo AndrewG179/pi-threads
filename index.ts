@@ -658,7 +658,7 @@ export default function (pi: ExtensionAPI) {
 				// ── Running state: action + live tool calls + stats ──
 				if (isRunning) {
 					return {
-						render(colWidth: number): string[] {
+						render(_colWidth: number): string[] {
 							const lines: string[] = [];
 
 							// Status line: ⏳ turns · cost · context
