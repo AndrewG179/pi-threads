@@ -446,6 +446,9 @@ export default function (pi: ExtensionAPI) {
 	let lastCommandSwitchSession: ((sessionPath: string) => Promise<{ cancelled: boolean }>) | null = null;
 	let releaseSubagentBackListener: (() => void) | null = null;
 
+	const arraysEqual = (left: string[], right: string[]) =>
+		left.length === right.length && left.every((value, index) => value === right[index]);
+
 	const rebuildEpisodeCounts = (sessionManager: { getBranch(): Array<{ type: string; message: { role: string; toolName?: string; details?: unknown } }> }) => {
 		episodeCounts.clear();
 		for (const entry of sessionManager.getBranch()) {
@@ -496,15 +499,27 @@ export default function (pi: ExtensionAPI) {
 			sessionFile: ctx.sessionManager.getSessionFile(),
 			state,
 		});
+		const currentActiveTools = pi.getActiveTools().filter((tool) => tool !== "dispatch");
+		const allToolNames = pi.getAllTools().map((tool) => tool.name);
 
 		if (!defaultActiveTools) {
-			defaultActiveTools = pi.getActiveTools().filter((tool) => tool !== "dispatch");
+			defaultActiveTools = currentActiveTools;
 		}
 
-		const allToolNames = pi.getAllTools().map((tool) => tool.name);
+		const strippedCachedTools = resolveActiveToolsForBehavior("orchestrator", defaultActiveTools, allToolNames)
+			.filter((tool) => tool !== "dispatch");
+		if (!arraysEqual(currentActiveTools, strippedCachedTools)) {
+			defaultActiveTools = currentActiveTools;
+		}
+
+		const toolSource = behavior.kind === "orchestrator"
+			? defaultActiveTools
+			: arraysEqual(currentActiveTools, strippedCachedTools)
+				? defaultActiveTools
+				: currentActiveTools;
 		const nextActiveTools = resolveActiveToolsForBehavior(
 			behavior.kind,
-			defaultActiveTools ?? allToolNames,
+			toolSource ?? allToolNames,
 			allToolNames,
 		);
 		pi.setActiveTools(nextActiveTools);
