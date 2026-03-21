@@ -55,6 +55,7 @@ declare module "@mariozechner/pi-coding-agent" {
 
 	interface UIApi {
 		notify(message: string, level?: string): void;
+		onTerminalInput(handler: (data: string) => { consume?: boolean; data?: string } | undefined): () => void;
 		setStatus(key: string, text: string | undefined): void;
 		setWidget(key: string, content: unknown, options?: unknown): void;
 		custom<T>(

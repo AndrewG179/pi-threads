@@ -163,6 +163,7 @@ function formatTokens(count: number): string {
 }
 
 const MAX_COLUMNS = 3;
+const CTRL_B_INPUT = "\u0002";
 
 /**
  * Render items in rows of up to MAX_COLUMNS columns.
@@ -438,6 +439,7 @@ export default function (pi: ExtensionAPI) {
 	const episodeCounts = new Map<string, number>();
 	let defaultActiveTools: string[] | null = null;
 	let lastCommandSwitchSession: ((sessionPath: string) => Promise<{ cancelled: boolean }>) | null = null;
+	let releaseSubagentBackListener: (() => void) | null = null;
 
 	const rebuildEpisodeCounts = (sessionManager: { getBranch(): Array<{ type: string; message: { role: string; toolName?: string; details?: unknown } }> }) => {
 		episodeCounts.clear();
@@ -473,9 +475,11 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const syncSessionMode = (ctx: {
+		hasUI?: boolean;
 		cwd: string;
 		sessionManager: { getSessionFile(): string | undefined; getBranch(): Array<{ type: string; message: { role: string; toolName?: string; details?: unknown } }> };
 		ui: {
+			onTerminalInput?: (handler: (data: string) => { consume?: boolean; data?: string } | undefined) => () => void;
 			theme: any;
 			setStatus: (key: string, text: string | undefined) => void;
 			setWidget: (key: string, content: unknown, options?: unknown) => void;
@@ -499,6 +503,15 @@ export default function (pi: ExtensionAPI) {
 			allToolNames,
 		);
 		pi.setActiveTools(nextActiveTools);
+
+		releaseSubagentBackListener?.();
+		releaseSubagentBackListener = null;
+		if (behavior.kind === "subagent" && ctx.hasUI && typeof ctx.ui.onTerminalInput === "function") {
+			releaseSubagentBackListener = ctx.ui.onTerminalInput((data) => {
+				if (data !== CTRL_B_INPUT) return undefined;
+				return { data: "/subagents-back\n" };
+			});
+		}
 
 		if (behavior.kind === "orchestrator") {
 			ctx.ui.setStatus("pi-threads", ctx.ui.theme.fg("accent", "threads:on"));

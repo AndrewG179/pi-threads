@@ -257,6 +257,7 @@ test("fresh runtime should install restart-safe ctrl+b back navigation for remem
 			terminalInputHandler,
 			"fresh runtimes should install a restart-safe terminal-input back-navigation path",
 		);
+		assert.deepEqual(terminalInputHandler!("\u0002"), { data: "/subagents-back\n" });
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });
 	}
