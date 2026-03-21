@@ -511,7 +511,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const model = "openai/gpt-5.4";
+			const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 
 			// Determine mode
 			const hasBatch = params.tasks && params.tasks.length > 0;

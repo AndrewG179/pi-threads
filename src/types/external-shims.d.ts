@@ -55,6 +55,10 @@ declare module "@mariozechner/pi-coding-agent" {
 
 	interface ToolExecuteContext {
 		cwd: string;
+		model?: {
+			provider: string;
+			id: string;
+		};
 	}
 
 	interface DispatchToolParams {
