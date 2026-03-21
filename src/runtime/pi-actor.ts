@@ -225,7 +225,20 @@ function defaultArgsBuilder(request: PiActorInvocationRequest, context: PiActorA
 		"--session",
 		context.sessionPath,
 	];
-	if (request.model) args.push("--model", request.model);
+	if (request.model) {
+		const slashIndex = request.model.indexOf("/");
+		if (slashIndex > 0) {
+			const provider = request.model.slice(0, slashIndex).trim();
+			const modelId = request.model.slice(slashIndex + 1).trim();
+			if (provider && modelId) {
+				args.push("--provider", provider, "--model", modelId);
+			} else {
+				args.push("--model", request.model);
+			}
+		} else {
+			args.push("--model", request.model);
+		}
+	}
 	if (context.systemPromptFile) args.push("--append-system-prompt", context.systemPromptFile);
 	args.push(request.action);
 	return args;

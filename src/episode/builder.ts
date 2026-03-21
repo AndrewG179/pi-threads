@@ -36,6 +36,10 @@ export interface OtherEpisodeMessage {
 
 export type EpisodeMessage = AssistantEpisodeMessage | ToolResultEpisodeMessage | OtherEpisodeMessage;
 
+export interface BuildEpisodeOptions {
+	emptyFallback?: string;
+}
+
 function summarizeInline(text: string, maxChars: number): string {
 	const normalized = text.replace(/\s+/g, " ").trim();
 	if (!normalized) return "";
@@ -88,7 +92,7 @@ function isToolResultMessage(message: EpisodeMessage): message is ToolResultEpis
 	return message.role === "toolResult" && Array.isArray(message.content);
 }
 
-export function buildEpisode(messages: readonly EpisodeMessage[]): string {
+export function buildEpisode(messages: readonly EpisodeMessage[], options?: BuildEpisodeOptions): string {
 	const toolCallLines: string[] = [];
 	const toolResultLines: string[] = [];
 	const assistantBlocks: string[] = [];
@@ -136,5 +140,5 @@ export function buildEpisode(messages: readonly EpisodeMessage[]): string {
 		sections.push(assistantBlocks.join("\n\n"));
 	}
 
-	return sections.join("\n") || "(no output)";
+	return sections.join("\n") || options?.emptyFallback || "(no output)";
 }

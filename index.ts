@@ -381,6 +381,11 @@ function getFinalOutput(messages: Message[]): string {
 	return "";
 }
 
+function getDispatchFailureSummary(result: Pick<ThreadActionResult, "errorMessage" | "stderr">): string | undefined {
+	const errorText = result.errorMessage?.trim() || result.stderr.trim();
+	return errorText ? `THREAD ERROR:\n${errorText}` : undefined;
+}
+
 // ─── Rendering Helpers ───
 
 function formatToolCall(
@@ -805,7 +810,10 @@ export default function (pi: ExtensionAPI) {
 				);
 
 				// Build episode from normalized messages (tool calls + tool results + assistant response)
-				const episode = buildThreadEpisode(result.messages as Parameters<typeof buildThreadEpisode>[0]);
+				const episode = buildThreadEpisode(
+					result.messages as Parameters<typeof buildThreadEpisode>[0],
+					{ emptyFallback: getDispatchFailureSummary(result) },
+				);
 				episodeCounts.set(task.thread, episodeNumber);
 
 				const item: SingleDispatchResult = { thread: task.thread, action: task.action, episode, episodeNumber, result };
