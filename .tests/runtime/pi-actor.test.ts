@@ -4,9 +4,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 
-import { PiActorRuntime } from "../../src/runtime/pi-actor";
+import { PiActorRuntime } from "../../src/runtime/pi-actor.ts";
 
 const EOF_SENSITIVE_WORKER_SCRIPT = `
+const fs = require("node:fs");
 process.stdout.write(JSON.stringify({
   type: "message_end",
   message: {
@@ -15,69 +16,55 @@ process.stdout.write(JSON.stringify({
   }
 }) + "\\n");
 
-process.stdin.setEncoding("utf8");
-process.stdin.resume();
-process.stdin.on("end", () => {
-  process.exit(0);
-});
+const buffer = Buffer.alloc(1);
+try {
+  while (fs.readSync(0, buffer, 0, 1, null) !== 0) {}
+} catch {
+  // Ignore stdin read errors and exit.
+}
+process.exit(0);
 `;
 
-async function settleWithin<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
-	return await Promise.race([
-		promise,
-		new Promise<T>((_, reject) => {
-			setTimeout(() => reject(new Error(`${label} did not settle within ${timeoutMs}ms`)), timeoutMs);
-		}),
-	]);
-}
+type SettledResult =
+	| { type: "result"; result: Awaited<ReturnType<PiActorRuntime["invoke"]>["result"]> }
+	| { type: "timeout" };
 
-test("PiActorRuntime settles after a one-shot child exits on stdin EOF", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-actor-repro-"));
+test("PiActorRuntime closes worker stdin for one-shot invocations", async () => {
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-actor-eof-"));
+	const workerPath = path.join(tmpDir, "eof-worker.js");
+	fs.writeFileSync(workerPath, EOF_SENSITIVE_WORKER_SCRIPT, "utf8");
+
 	const runtime = new PiActorRuntime({
 		command: process.execPath,
-		buildArgs: (request) => ["-e", EOF_SENSITIVE_WORKER_SCRIPT, request.action],
+		buildArgs: () => [workerPath],
+		defaultSigtermGraceMs: 25,
 	});
 
 	const handle = runtime.invoke({
-		runId: "pi-actor-repro",
-		thread: "pi-actor-repro",
-		cwd,
+		runId: "stdin-eof-repro",
+		thread: "stdin-eof-thread",
+		cwd: tmpDir,
 		action: "noop",
 	});
 
-	const messages: string[] = [];
-	const unsubscribe = handle.subscribe((event) => {
-		if (event.type === "message" && event.message.role === "assistant") {
-			messages.push("assistant");
-		}
-	});
-
 	try {
-		await settleWithin(
-			new Promise<void>((resolve, reject) => {
-				const startedAt = Date.now();
-				const tick = setInterval(() => {
-					if (messages.length > 0) {
-						clearInterval(tick);
-						resolve();
-						return;
-					}
-					if (Date.now() - startedAt > 1_000) {
-						clearInterval(tick);
-						reject(new Error("assistant message was not observed"));
-					}
-				}, 10);
-			}),
-			1_500,
-			"assistant message",
-		);
+		const settled = await Promise.race<SettledResult>([
+			handle.result.then((result) => ({ type: "result", result })),
+			new Promise<SettledResult>((resolve) => setTimeout(() => resolve({ type: "timeout" }), 300)),
+		]);
 
-		const result = await settleWithin(handle.result, 300, "PiActorRuntime result");
-		assert.equal(result.messages.length > 0, true);
-		assert.equal(result.finalState.tag, "exited");
+		assert.notEqual(
+			settled.type,
+			"timeout",
+			"Expected PiActorRuntime to settle after the worker emitted its response",
+		);
+		if (settled.type === "result") {
+			assert.equal(settled.result.finalState.tag, "exited");
+			assert.equal(settled.result.messages.length > 0, true);
+			assert.equal(settled.result.messages[0]?.role, "assistant");
+		}
 	} finally {
-		unsubscribe();
-		await handle.cancel("abort").catch(() => undefined);
-		fs.rmSync(cwd, { recursive: true, force: true });
+		await handle.cancel("abort").catch(() => {});
+		fs.rmSync(tmpDir, { recursive: true, force: true });
 	}
 });
