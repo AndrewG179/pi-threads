@@ -513,18 +513,14 @@ export default function (pi: ExtensionAPI) {
 
 		const strippedCachedTools = resolveActiveToolsForBehavior("orchestrator", defaultActiveTools, allToolNames)
 			.filter((tool) => tool !== "dispatch");
-		if (!arraysEqual(currentActiveTools, strippedCachedTools)) {
+		const isCurrentToolsetCached = arraysEqual(currentActiveTools, strippedCachedTools);
+		if (!isCurrentToolsetCached) {
 			defaultActiveTools = currentActiveTools;
 		}
 
-		const toolSource = behavior.kind === "orchestrator"
-			? defaultActiveTools
-			: arraysEqual(currentActiveTools, strippedCachedTools)
-				? defaultActiveTools
-				: currentActiveTools;
 		const nextActiveTools = resolveActiveToolsForBehavior(
 			behavior.kind,
-			toolSource ?? allToolNames,
+			behavior.kind === "orchestrator" || isCurrentToolsetCached ? defaultActiveTools : currentActiveTools,
 			allToolNames,
 		);
 		pi.setActiveTools(nextActiveTools);
@@ -726,12 +722,13 @@ export default function (pi: ExtensionAPI) {
 			let threadsState = sessionContext.state;
 			const dispatchBehavior = sessionContext.behavior;
 			const rememberedParentSession = dispatchBehavior.parentSessionFile ?? dispatchBehavior.sessionFile;
+			const taskList = params.tasks?.length
+				? params.tasks
+				: params.thread && params.action
+					? [{ thread: params.thread, action: params.action }]
+					: null;
 
-			// Determine mode
-			const hasBatch = params.tasks && params.tasks.length > 0;
-			const hasSingle = params.thread && params.action;
-
-			if (!hasBatch && !hasSingle) {
+			if (!taskList) {
 				return {
 					content: [{ type: "text", text: "Provide either thread+action (single) or tasks array (batch)." }],
 					details: { mode: "single" as const, items: [] },
@@ -739,20 +736,13 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const taskList = hasBatch
-				? params.tasks!
-				: [{ thread: params.thread!, action: params.action! }];
-
 			const mode = taskList.length > 1 ? "batch" : "single";
 			const taskSessionPaths = new Map(taskList.map((task) => [task.thread, getThreadSessionPath(ctx.cwd, task.thread)]));
-
-			// Track all results for streaming updates in batch mode
 			const allItems: (SingleDispatchResult | null)[] = taskList.map(() => null);
 
 			const emitBatchUpdate = () => {
 				if (!onUpdate) return;
-				const currentItems: SingleDispatchResult[] = allItems
-					.filter((i): i is SingleDispatchResult => i !== null);
+				const currentItems = allItems.filter((i): i is SingleDispatchResult => i !== null);
 				if (currentItems.length === 0) return;
 				onUpdate({
 					content: [{ type: "text", text: currentItems.map((i) => `[${i.thread}] ${i.episode || "(running...)"}`).join("\n\n") }],
@@ -769,21 +759,14 @@ export default function (pi: ExtensionAPI) {
 				saveThreadsState(ctx.cwd, threadsState);
 			}
 
-			// Run all tasks (parallel for batch, single for single)
 			const runOne = async (task: { thread: string; action: string }, index: number): Promise<SingleDispatchResult> => {
 				const episodeNumber = (episodeCounts.get(task.thread) || 0) + 1;
-
-				// For single mode, pass onUpdate directly for live streaming
-				// For batch mode, create a per-task updater that updates this task's slot and emits
 				const taskOnUpdate = mode === "single"
 					? onUpdate
 					: onUpdate
 						? (partial: AgentToolResult<DispatchDetails>) => {
-								// Update this task's in-progress slot
 								const inProgress = partial.details?.items?.[0];
-								if (inProgress) {
-									allItems[index] = inProgress;
-								}
+								if (inProgress) allItems[index] = inProgress;
 								emitBatchUpdate();
 							}
 						: undefined;
@@ -815,7 +798,6 @@ export default function (pi: ExtensionAPI) {
 					episodeNumber,
 				);
 
-				// Build episode from normalized messages (tool calls + tool results + assistant response)
 				const episode = buildThreadEpisode(
 					result.messages as Parameters<typeof buildThreadEpisode>[0],
 					{ emptyFallback: getDispatchFailureSummary(result) },
@@ -828,17 +810,10 @@ export default function (pi: ExtensionAPI) {
 				return item;
 			};
 
-			let items: SingleDispatchResult[];
-			if (taskList.length === 1) {
-				items = [await runOne(taskList[0], 0)];
-			} else {
-				items = await Promise.all(taskList.map((t, i) => runOne(t, i)));
-			}
-
-			const anyError = items.some(
-				(i) => i.result.exitCode !== 0 || i.result.stopReason === "error" || i.result.stopReason === "aborted",
+			const items = await Promise.all(taskList.map((task, index) => runOne(task, index)));
+			const anyError = items.some(({ result }) =>
+				result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted",
 			);
-
 			const contentText = items.map((i) => `[${i.thread}] ${i.episode}`).join("\n\n");
 
 			return {

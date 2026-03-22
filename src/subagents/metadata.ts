@@ -191,16 +191,12 @@ function extractUsageCost(cost: unknown): number {
 	return 0;
 }
 
-function isDoneResult(result: DispatchItem["result"]): boolean {
-	return !!result && result.exitCode === 0 && result.stopReason !== "aborted" && result.stopReason !== "error";
-}
-
-function isEscalatedResult(result: DispatchItem["result"]): boolean {
-	return !!result && result.stopReason === "escalated";
-}
-
-function isAbortedResult(result: DispatchItem["result"]): boolean {
-	return !!result && (result.stopReason === "aborted" || (typeof result.exitCode === "number" && result.exitCode !== 0));
+function getDispatchStatus(result: DispatchItem["result"]): SubagentCard["status"] {
+	if (!result) return "unknown";
+	if (result.stopReason === "escalated") return "escalated";
+	if (result.stopReason === "aborted" || (typeof result.exitCode === "number" && result.exitCode !== 0)) return "aborted";
+	if (result.exitCode === 0 && result.stopReason !== "error") return "done";
+	return "unknown";
 }
 
 function mergeParentDispatchDetails(cards: Map<string, SubagentCard>, parentBranchEntries: unknown[]): void {
@@ -220,13 +216,7 @@ function mergeParentDispatchDetails(cards: Map<string, SubagentCard>, parentBran
 
 			card.latestAction = item.action ?? card.latestAction;
 			card.accumulatedCost += extractUsageCost(item.result?.usage?.cost);
-			if (isEscalatedResult(item.result)) {
-				card.status = "escalated";
-			} else if (isAbortedResult(item.result)) {
-				card.status = "aborted";
-			} else if (isDoneResult(item.result)) {
-				card.status = "done";
-			}
+			card.status = getDispatchStatus(item.result);
 
 			cards.set(item.thread, card);
 		}
@@ -248,12 +238,6 @@ export function collectSubagentCards(cwd: string, parentBranchEntries: unknown[]
 	}
 
 	mergeParentDispatchDetails(cards, parentBranchEntries);
-
-	for (const card of cards.values()) {
-		if (card.parentSessionFile === undefined) {
-			card.parentSessionFile = state.parentBySession[path.resolve(card.sessionPath)];
-		}
-	}
 
 	return [...cards.values()].sort((a, b) => a.thread.localeCompare(b.thread));
 }
