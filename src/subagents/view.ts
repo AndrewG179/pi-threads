@@ -13,6 +13,13 @@ type TuiLike = {
 	};
 };
 
+type SelectionOutcome =
+	| { kind: "open" }
+	| { kind: "blocked"; message: string }
+	| { kind: "stay" };
+
+type SelectionHandlerResult = SelectionOutcome | Promise<SelectionOutcome>;
+
 const WIDE_LAYOUT_MIN_WIDTH = 56;
 const MIN_BROWSER_ROWS = 18;
 const SESSION_CARD_ROWS = 2;
@@ -83,6 +90,8 @@ function maybeHighlight(theme: any, line: string, selected: boolean): string {
 
 export class SubagentBrowser {
 	private selectedIndex = 0;
+	private statusMessage: string | null = null;
+	private selectionInFlight = false;
 
 	constructor(
 		private readonly cards: SubagentCard[],
@@ -90,6 +99,7 @@ export class SubagentBrowser {
 		private readonly theme: any,
 		private readonly keybindings: KeybindingMatcher | undefined,
 		private readonly done: (result: SubagentCard | undefined) => void,
+		private readonly onSelect?: (card: SubagentCard) => SelectionHandlerResult,
 	) {}
 
 	handleInput(keyData: string): void {
@@ -106,8 +116,7 @@ export class SubagentBrowser {
 			return;
 		}
 		if (kb.matches(keyData, "tui.select.confirm")) {
-			if (this.cards.length === 0) return;
-			this.done(this.cards[this.selectedIndex]);
+			void this.confirmSelection();
 			return;
 		}
 		if (kb.matches(keyData, "tui.select.cancel")) {
@@ -116,6 +125,26 @@ export class SubagentBrowser {
 	}
 
 	invalidate(): void {}
+
+	private async confirmSelection(): Promise<void> {
+		if (this.cards.length === 0 || this.selectionInFlight) return;
+		const selected = this.cards[this.selectedIndex];
+		this.selectionInFlight = true;
+
+		try {
+			const outcome = await (this.onSelect?.(selected) ?? { kind: "open" });
+			if (outcome.kind === "blocked") {
+				this.statusMessage = outcome.message;
+				return;
+			}
+			if (outcome.kind === "stay") {
+				return;
+			}
+			this.done(selected);
+		} finally {
+			this.selectionInFlight = false;
+		}
+	}
 
 	private getSelectedCard(): SubagentCard | undefined {
 		return this.cards[this.selectedIndex] ?? this.cards[0];
@@ -210,9 +239,15 @@ export class SubagentBrowser {
 	}
 
 	render(width: number): string[] {
+		const statusLines = this.statusMessage
+			? wrapText(this.statusMessage, Math.max(12, width), { minWidth: 12 })
+				.slice(0, 2)
+				.map((line) => this.theme.fg("warning", line))
+			: [];
 		const headerLines = [
 			this.theme.fg("toolTitle", "Subagents"),
 			this.theme.fg("dim", "Current branch only. Up/Down browse, Enter open, Esc close"),
+			...statusLines,
 			"",
 		];
 		const viewportHeight = this.getViewportHeight();

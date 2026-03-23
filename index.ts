@@ -670,6 +670,12 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		const unsafeParentSessionFile = getUnsafeSubagentSwitchParentSession(ctx, runtimeParentSessionFile);
+		if (unsafeParentSessionFile) {
+			ctx.ui.notify(formatUnsafeSubagentSwitchMessage(unsafeParentSessionFile), "warning");
+			return;
+		}
+
 		const switchResult = await switchSession(runtimeParentSessionFile);
 		notifyIfUnsafeSubagentSwitchWasCancelled(ctx, runtimeParentSessionFile, switchResult);
 	};
@@ -707,8 +713,48 @@ export default function (pi: ExtensionAPI) {
 			? loadSessionBranchFromFile(runtimeParentSessionFile)
 			: ctx.sessionManager.getBranch();
 		const cards = collectSubagentCards(ctx.cwd, parentEntries, getRuntimeSessionsForParent(parentSessionFile));
+		const switchSession = ctx.switchSession ?? lastSessionSwitchSession;
 		const selected = await ctx.ui.custom<SubagentCard | undefined>(
-			(tui, theme, keybindings, done) => new SubagentBrowser(cards, tui, theme, keybindings, done),
+			(tui, theme, keybindings, done) =>
+				new SubagentBrowser(cards, tui, theme, keybindings, done, async (candidate) => {
+					if (candidate.sessionPath === ctx.sessionManager.getSessionFile()) {
+						return { kind: "stay" };
+					}
+
+					if (!switchSession) {
+						return {
+							kind: "blocked",
+							message: "This runtime cannot switch sessions from the subagent browser yet. Use /subagents.",
+						};
+					}
+
+					const unsafeParentSessionFile = getUnsafeSubagentSwitchParentSession(ctx, candidate.sessionPath);
+					if (unsafeParentSessionFile) {
+						return {
+							kind: "blocked",
+							message: formatUnsafeSubagentSwitchMessage(unsafeParentSessionFile),
+						};
+					}
+
+					const switchResult = await switchSession(candidate.sessionPath);
+					if (switchResult?.cancelled) {
+						const parentSessionFile = getUnsafeSubagentSwitchParentSession(ctx, candidate.sessionPath);
+						if (parentSessionFile) {
+							return {
+								kind: "blocked",
+								message: formatUnsafeSubagentSwitchMessage(parentSessionFile),
+							};
+						}
+
+						return {
+							kind: "blocked",
+							message: "Session switch was cancelled. Stay here and try again when the target session is available.",
+						};
+					}
+
+					rememberRuntimeSubagent(parentSessionFile, candidate.thread, candidate.sessionPath);
+					return { kind: "open" };
+				}),
 			{
 				overlay: true,
 				overlayOptions: {
@@ -723,17 +769,6 @@ export default function (pi: ExtensionAPI) {
 		);
 
 		if (!selected) return;
-		if (selected.sessionPath === ctx.sessionManager.getSessionFile()) return;
-
-		const switchSession = ctx.switchSession ?? lastSessionSwitchSession;
-		if (!switchSession) {
-			ctx.ui.notify("This runtime cannot switch sessions from the subagent browser yet. Use /subagents.", "warning");
-			return;
-		}
-
-		rememberRuntimeSubagent(parentSessionFile, selected.thread, selected.sessionPath);
-		const switchResult = await switchSession(selected.sessionPath);
-		notifyIfUnsafeSubagentSwitchWasCancelled(ctx, selected.sessionPath, switchResult);
 	};
 
 	// Reconstruct state on session load

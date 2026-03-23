@@ -61,6 +61,19 @@ function makeFakePi() {
 	};
 }
 
+function makeSelectKeybindings() {
+	return {
+		matches(input: string, command: string) {
+			return (
+				(input === "UP" && command === "tui.select.up") ||
+				(input === "DOWN" && command === "tui.select.down") ||
+				(input === "ENTER" && command === "tui.select.confirm") ||
+				(input === "ESC" && command === "tui.select.cancel")
+			);
+		},
+	};
+}
+
 function writeThreadSession(filePath: string, lines: unknown[]): void {
 	fs.mkdirSync(path.dirname(filePath), { recursive: true });
 	fs.writeFileSync(
@@ -173,7 +186,8 @@ test("/subagents should establish runtime-only back navigation for the opened su
 		assert.equal(fakePi.shortcuts.get("ctrl+b"), undefined, "ctrl+b should not be registered through the shortcut API");
 
 		const switchedSessions: string[] = [];
-		await subagents!.handler("", {
+		let browser: { handleInput(input: string): void } | undefined;
+		const handlerPromise = subagents!.handler("", {
 			cwd: projectDir,
 			hasUI: true,
 			switchSession: async (sessionPath: string) => {
@@ -182,15 +196,18 @@ test("/subagents should establish runtime-only back navigation for the opened su
 			},
 			ui: {
 				notify: () => {},
-				custom: async () => ({
-					thread: "alpha",
-					sessionPath: alphaSession,
-					latestAction: "Inspect alpha",
-					outputPreview: "alpha ready",
-					toolPreview: "",
-					accumulatedCost: 0.02,
-					status: "done",
-				}),
+				custom: (factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (result: unknown) => void) => unknown) =>
+					new Promise<unknown>((resolve) => {
+						browser = factory(
+							{ terminal: { rows: 24 } },
+							{
+								fg: (_color: string, text: string) => text,
+								bg: (_color: string, text: string) => text,
+							},
+							makeSelectKeybindings(),
+							resolve,
+						) as { handleInput(input: string): void };
+					}),
 			},
 			sessionManager: {
 				getSessionFile: () => parentSession,
@@ -228,6 +245,11 @@ test("/subagents should establish runtime-only back navigation for the opened su
 				}],
 			},
 		} as any);
+
+		await Promise.resolve();
+		assert.ok(browser, "the subagent browser should open");
+		browser!.handleInput("ENTER");
+		await handlerPromise;
 
 		assert.deepEqual(switchedSessions, [alphaSession]);
 
@@ -599,7 +621,7 @@ test("session_before_switch should block leaving a subagent while its remembered
 	}
 });
 
-test("/subagents should warn if the switch is cancelled because the parent dispatch is still active", async () => {
+test("/subagents should refuse a blocked child switch before calling switchSession", async () => {
 	const projectDir = makeTempProject();
 	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
 	const alphaSession = path.join(projectDir, ".pi", "threads", "alpha.jsonl");
@@ -663,9 +685,9 @@ test("/subagents should warn if the switch is cancelled because the parent dispa
 		try {
 			await Promise.resolve();
 
-			const notifications: Array<{ message: string; level?: string }> = [];
 			const switchedSessions: string[] = [];
-			await subagents!.handler("", {
+			let browser: { handleInput(input: string): void; render(width: number): string[] } | undefined;
+			const handlerPromise = subagents!.handler("", {
 				cwd: projectDir,
 				hasUI: true,
 				switchSession: async (sessionPath: string) => {
@@ -673,18 +695,19 @@ test("/subagents should warn if the switch is cancelled because the parent dispa
 					return { cancelled: true };
 				},
 				ui: {
-					notify: (message: string, level?: string) => {
-						notifications.push({ message, level });
-					},
-					custom: async () => ({
-						thread: "alpha",
-						sessionPath: alphaSession,
-						latestAction: "Inspect alpha",
-						outputPreview: "(running...)",
-						toolPreview: "$ sleep 75",
-						accumulatedCost: 0,
-						status: "unknown",
-					}),
+					notify: () => {},
+					custom: (factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (result: unknown) => void) => unknown) =>
+						new Promise<unknown>((resolve) => {
+							browser = factory(
+								{ terminal: { rows: 24 } },
+								{
+									fg: (_color: string, text: string) => text,
+									bg: (_color: string, text: string) => text,
+								},
+								makeSelectKeybindings(),
+								resolve,
+							) as { handleInput(input: string): void; render(width: number): string[] };
+						}),
 				},
 				sessionManager: {
 					getSessionFile: () => parentSession,
@@ -692,11 +715,17 @@ test("/subagents should warn if the switch is cancelled because the parent dispa
 				},
 			} as any);
 
-			assert.deepEqual(switchedSessions, [alphaSession]);
-			assert.deepEqual(notifications, [{
-				message: "Blocked session switch: parent dispatch is still running in parent.jsonl. Switching into or out of a subagent now would stop that in-flight dispatch. Wait for the dispatch to finish, then try again.",
-				level: "warning",
-			}]);
+			await Promise.resolve();
+			assert.ok(browser, "the subagent browser should open");
+			browser!.handleInput("ENTER");
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			const rendered = browser!.render(80).join("\n");
+
+			assert.deepEqual(switchedSessions, []);
+			assert.match(rendered, /Blocked session switch:/);
+
+			browser!.handleInput("ESC");
+			await handlerPromise;
 		} finally {
 			resolveRun({
 				runId: "run-enter-cancel",
@@ -715,7 +744,184 @@ test("/subagents should warn if the switch is cancelled because the parent dispa
 	}
 });
 
-test("/subagents-back should warn if the return switch is cancelled because the parent dispatch is still active", async () => {
+test("/subagents should keep the browser open and render a visible block message when a child switch is refused", async () => {
+	const projectDir = makeTempProject();
+	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
+	const alphaSession = path.join(projectDir, ".pi", "threads", "alpha.jsonl");
+
+	try {
+		writeThreadSession(parentSession, [{ type: "session", version: 3, cwd: projectDir }]);
+		writeThreadSession(alphaSession, [
+			{ type: "session", version: 3, cwd: projectDir },
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "alpha ready" }],
+				},
+			},
+		]);
+		fs.mkdirSync(path.join(projectDir, ".pi", "threads"), { recursive: true });
+		fs.writeFileSync(
+			path.join(projectDir, ".pi", "threads", "state.json"),
+			JSON.stringify({ enabled: true }, null, 2) + "\n",
+			"utf8",
+		);
+
+		const fakePi = makeFakePi();
+		registerExtension(fakePi as any);
+
+		const dispatch = fakePi.tools.get("dispatch");
+		const subagents = fakePi.commands.get("subagents");
+		assert.ok(dispatch, "dispatch tool should be registered");
+		assert.ok(subagents, "/subagents should be registered");
+
+		let resolveRun!: (value: unknown) => void;
+		const originalInvoke = ThreadSupervisor.prototype.invoke;
+		ThreadSupervisor.prototype.invoke = function () {
+			return {
+				runId: "run-enter-visible-block",
+				thread: "alpha",
+				result: new Promise((resolve) => {
+					resolveRun = resolve;
+				}),
+				cancel: async () => {},
+				subscribe: () => () => {},
+				getSnapshot: () => ({
+					runId: "run-enter-visible-block",
+					thread: "alpha",
+					pid: undefined,
+					startedAt: Date.now(),
+					state: { tag: "running" },
+				}),
+			} as any;
+		};
+
+		const dispatchExecution = dispatch!.execute(
+			"tool-call-enter-visible-block",
+			{ thread: "alpha", action: "Inspect alpha" },
+			undefined,
+			undefined,
+			{
+				cwd: projectDir,
+				hasUI: true,
+				ui: { notify: () => {} },
+				sessionManager: {
+					getSessionFile: () => parentSession,
+					getBranch: () => [],
+				},
+				model: { provider: "openai-codex", id: "gpt-5.4" },
+			} as any,
+		);
+
+		let browser: { handleInput(input: string): void } | undefined;
+		let handlerSettled = false;
+		const switchedSessions: string[] = [];
+		const notifications: Array<{ message: string; level?: string }> = [];
+
+		const handlerPromise = subagents!.handler("", {
+			cwd: projectDir,
+			hasUI: true,
+			switchSession: async (sessionPath: string) => {
+				switchedSessions.push(sessionPath);
+				return { cancelled: true };
+			},
+			ui: {
+				notify: (message: string, level?: string) => {
+					notifications.push({ message, level });
+				},
+				custom: (factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (result: unknown) => void) => unknown) =>
+					new Promise<unknown>((resolve) => {
+						browser = factory(
+							{ terminal: { rows: 24 } },
+							{
+								fg: (_color: string, text: string) => text,
+								bg: (_color: string, text: string) => text,
+							},
+							makeSelectKeybindings(),
+							resolve,
+						) as { handleInput(input: string): void };
+					}),
+			},
+			sessionManager: {
+				getSessionFile: () => parentSession,
+				getBranch: () => [{
+					type: "message",
+					message: {
+						role: "toolResult",
+						toolName: "dispatch",
+						details: {
+							mode: "single",
+							items: [{
+								thread: "alpha",
+								action: "Inspect alpha",
+								episode: "alpha ready",
+								episodeNumber: 1,
+								result: {
+									exitCode: 0,
+									stderr: "",
+									messages: [{ role: "assistant", content: [{ type: "text", text: "alpha ready" }] }],
+									usage: {
+										input: 12,
+										output: 8,
+										cacheRead: 0,
+										cacheWrite: 0,
+										cost: 0.02,
+										contextTokens: 20,
+										turns: 1,
+									},
+									sessionPath: alphaSession,
+									isNewThread: false,
+								},
+							}],
+						},
+					},
+				}],
+			},
+		} as any).then(() => {
+			handlerSettled = true;
+		});
+
+		try {
+			await Promise.resolve();
+			assert.ok(browser, "the subagent browser should open");
+
+			browser!.handleInput("ENTER");
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			const rendered = (browser as { render(width: number): string[] }).render(80).join("\n");
+
+			assert.deepEqual(switchedSessions, []);
+			assert.equal(
+				handlerSettled,
+				false,
+				"blocked child selection should keep the browser open so the blocked state remains visible instead of silently returning to the parent",
+			);
+			assert.deepEqual(notifications, []);
+			assert.match(rendered, /Blocked session switch:/);
+			assert.match(rendered, /parent dispatch is still running in parent\.jsonl/);
+		} finally {
+			if (!handlerSettled && browser) {
+				browser.handleInput("ESC");
+			}
+			await handlerPromise;
+			resolveRun({
+				runId: "run-enter-visible-block",
+				thread: "alpha",
+				finalState: { tag: "exited", exitCode: 0, signal: null },
+				messages: [],
+				stderr: "",
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+				model: "openai-codex/gpt-5.4",
+			});
+			await dispatchExecution;
+			ThreadSupervisor.prototype.invoke = originalInvoke;
+		}
+	} finally {
+		fs.rmSync(projectDir, { recursive: true, force: true });
+	}
+});
+
+test("/subagents-back should refuse the return switch before calling switchSession when the parent dispatch is still active", async () => {
 	const projectDir = makeTempProject();
 	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
 	const alphaSession = path.join(projectDir, ".pi", "threads", "alpha.jsonl");
@@ -863,7 +1069,7 @@ test("/subagents-back should warn if the return switch is cancelled because the 
 				},
 			} as any);
 
-			assert.deepEqual(switchedSessions, [parentSession]);
+			assert.deepEqual(switchedSessions, []);
 			assert.deepEqual(notifications, [{
 				message: "Blocked session switch: parent dispatch is still running in parent.jsonl. Switching into or out of a subagent now would stop that in-flight dispatch. Wait for the dispatch to finish, then try again.",
 				level: "warning",

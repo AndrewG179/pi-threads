@@ -51,7 +51,7 @@ Keyboard behavior:
 
 Opening a subagent switches the current pi session to that thread session file.
 
-If the current runtime still owns an in-flight parent `dispatch`, that session switch is blocked with a warning. This is a safety guard only: the extension does not claim to keep that dispatch alive across session switches.
+If the current runtime still owns an in-flight parent `dispatch`, that session switch is blocked before it reaches `switchSession()`. In `/subagents`, the browser stays open and shows the block message inline instead of silently bouncing back to the parent view. This is a safety guard only: the extension does not claim to keep that dispatch alive across session switches.
 
 Once opened, the subagent is just a **normal pi chat session**. The only extra UI is a small banner that says it is a subagent session and shows the current-runtime parent when one is known.
 
