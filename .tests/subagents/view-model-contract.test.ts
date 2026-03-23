@@ -95,19 +95,19 @@ function makeDispatchItem(thread: string, episode: string) {
 	};
 }
 
-function flattenRenderedLines(component: unknown, width = 120): string[] {
+function flattenRenderedLines(component: unknown, width = 120, height?: number): string[] {
 	if (!component || typeof component !== "object") return [];
 	if (component instanceof Container) {
-		return component.children.flatMap((child) => flattenRenderedLines(child, width));
+		return component.children.flatMap((child) => flattenRenderedLines(child, width, height));
 	}
 	if (component instanceof Text) {
 		return component.render(width);
 	}
 	if ("render" in component && typeof component.render === "function") {
-		return component.render(width);
+		return component.render(width, height);
 	}
 	if ("children" in component && Array.isArray(component.children)) {
-		return component.children.flatMap((child: unknown) => flattenRenderedLines(child, width));
+		return component.children.flatMap((child: unknown) => flattenRenderedLines(child, width, height));
 	}
 	return [];
 }
@@ -308,6 +308,107 @@ test("/subagents browser should keep navigation and selected-detail panes visibl
 			constrainedViewport,
 			/Action/,
 			"the selected-detail pane should keep its top section visible even if lower detail is truncated by viewport height",
+		);
+	} finally {
+		fs.rmSync(projectDir, { recursive: true, force: true });
+	}
+});
+
+test("/subagents browser should render a full editor-height frame so stale transcript rows are not left behind in the replaced region", async () => {
+	const projectDir = makeTempProject();
+	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
+	const alphaSession = path.join(projectDir, ".pi", "threads", "alpha.jsonl");
+
+	try {
+		writeThreadSession(parentSession, [{ type: "session", version: 3, cwd: projectDir }]);
+		writeThreadSession(alphaSession, [
+			{ type: "session", version: 3, cwd: projectDir },
+			{
+				type: "message",
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "Inspect alpha" }],
+				},
+			},
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "alpha ready" }],
+				},
+			},
+		]);
+
+		const fakePi = makeFakePi();
+		registerExtension(fakePi as any);
+
+		const subagents = fakePi.commands.get("subagents");
+		assert.ok(subagents, "/subagents should be registered");
+
+		let customRenderer: ((...args: any[]) => unknown) | undefined;
+
+		await subagents!.handler("", {
+			cwd: projectDir,
+			hasUI: true,
+			switchSession: async () => ({ cancelled: false }),
+			ui: {
+				notify: () => {},
+				custom: async (renderer: (...args: any[]) => unknown) => {
+					customRenderer = renderer;
+					return undefined;
+				},
+			},
+			sessionManager: {
+				getSessionFile: () => parentSession,
+				getBranch: () => [{
+					type: "message",
+					message: {
+						role: "toolResult",
+						toolName: "dispatch",
+						details: {
+							mode: "single",
+							items: [{
+								thread: "alpha",
+								action: "Inspect alpha",
+								episode: "alpha ready",
+								episodeNumber: 1,
+								result: {
+									exitCode: 0,
+									stderr: "",
+									messages: [{ role: "assistant", content: [{ type: "text", text: "alpha ready" }] }],
+									usage: {
+										input: 12,
+										output: 8,
+										cacheRead: 0,
+										cacheWrite: 0,
+										cost: 0.02,
+										contextTokens: 20,
+										turns: 1,
+									},
+									sessionPath: alphaSession,
+									isNewThread: false,
+								},
+							}],
+						},
+					},
+				}],
+			},
+		} as any);
+
+		assert.ok(customRenderer, "/subagents should invoke ctx.ui.custom()");
+
+		const editorHeight = 18;
+		const renderedLines = flattenRenderedLines(
+			customRenderer!({ height: editorHeight }, makeTheme(), undefined, () => {}),
+			80,
+			editorHeight,
+		);
+
+		assert.match(renderedLines[0] ?? "", /Subagents/, "the browser header should start at the top of the replaced editor region");
+		assert.equal(
+			renderedLines.length,
+			editorHeight,
+			"the standalone browser should render enough rows to fully replace the editor region; shorter output leaves stale prior content visible around the browser",
 		);
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });
