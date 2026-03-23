@@ -7,10 +7,14 @@ type KeybindingMatcher = {
 	matches(input: string, command: string): boolean;
 };
 
+type TuiLike = {
+	terminal?: {
+		rows?: number;
+	};
+};
+
 const WIDE_LAYOUT_MIN_WIDTH = 56;
-const WIDE_LAYOUT_ROWS = 8;
-const NARROW_SESSIONS_ROWS = 5;
-const NARROW_DETAILS_ROWS = 7;
+const MIN_BROWSER_ROWS = 18;
 const SESSION_CARD_ROWS = 2;
 
 function formatCost(cost: number): string {
@@ -82,6 +86,7 @@ export class SubagentBrowser {
 
 	constructor(
 		private readonly cards: SubagentCard[],
+		private readonly tui: TuiLike | undefined,
 		private readonly theme: any,
 		private readonly keybindings: KeybindingMatcher | undefined,
 		private readonly done: (result: SubagentCard | undefined) => void,
@@ -114,6 +119,10 @@ export class SubagentBrowser {
 
 	private getSelectedCard(): SubagentCard | undefined {
 		return this.cards[this.selectedIndex] ?? this.cards[0];
+	}
+
+	private getViewportHeight(): number {
+		return Math.max(MIN_BROWSER_ROWS, this.tui?.terminal?.rows ?? 0);
 	}
 
 	private renderSessionsPane(width: number, height: number): string[] {
@@ -181,41 +190,53 @@ export class SubagentBrowser {
 		return finalizePane(lines, width, height);
 	}
 
-	private renderWide(width: number): string[] {
+	private renderWide(width: number, height: number): string[] {
 		const innerWidth = Math.max(24, width - 3);
 		const leftWidth = Math.max(24, Math.floor(innerWidth * 0.42));
 		const rightWidth = Math.max(24, innerWidth - leftWidth);
 		return combineColumns(
-			this.renderSessionsPane(leftWidth, WIDE_LAYOUT_ROWS),
-			this.renderDetailPane(rightWidth, WIDE_LAYOUT_ROWS),
+			this.renderSessionsPane(leftWidth, height),
+			this.renderDetailPane(rightWidth, height),
 			leftWidth,
 			rightWidth,
-			WIDE_LAYOUT_ROWS,
+			height,
 		);
 	}
 
-	private renderNarrow(width: number): string[] {
+	private renderNarrow(width: number, height: number): string[] {
+		const sessionsHeight = Math.max(4, Math.floor((height - 1) * 0.4));
+		const detailHeight = Math.max(4, height - 1 - sessionsHeight);
 		return [
-			...this.renderSessionsPane(width, NARROW_SESSIONS_ROWS),
+			...this.renderSessionsPane(width, sessionsHeight),
 			"",
-			...this.renderDetailPane(width, NARROW_DETAILS_ROWS),
+			...this.renderDetailPane(width, detailHeight),
 		];
 	}
 
 	render(width: number): string[] {
-		const lines = [
+		const headerLines = [
 			this.theme.fg("toolTitle", "Subagents"),
 			this.theme.fg("dim", "Current branch only. Up/Down browse, Enter open, Esc close"),
 			"",
 		];
+		const viewportHeight = this.getViewportHeight();
+		const bodyHeight = Math.max(6, viewportHeight - headerLines.length);
 
 		if (this.cards.length === 0) {
-			lines.push(this.theme.fg("muted", "No subagent sessions on the current branch."));
-			return lines.map((line) => truncateToWidth(line, width));
+			return finalizePane(
+				[...headerLines, this.theme.fg("muted", "No subagent sessions on the current branch.")],
+				width,
+				viewportHeight,
+			).map((line) => truncateToWidth(line, width));
 		}
 
-		return [...lines, ...(width >= WIDE_LAYOUT_MIN_WIDTH ? this.renderWide(width) : this.renderNarrow(width))].map((line) =>
-			truncateToWidth(line, width),
-		);
+		return finalizePane(
+			[
+				...headerLines,
+				...(width >= WIDE_LAYOUT_MIN_WIDTH ? this.renderWide(width, bodyHeight) : this.renderNarrow(width, bodyHeight)),
+			],
+			width,
+			viewportHeight,
+		).map((line) => truncateToWidth(line, width));
 	}
 }

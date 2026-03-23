@@ -595,7 +595,18 @@ export default function (pi: ExtensionAPI) {
 			: ctx.sessionManager.getBranch();
 		const cards = collectSubagentCards(ctx.cwd, parentEntries);
 		const selected = await ctx.ui.custom<SubagentCard | undefined>(
-			(_tui, theme, keybindings, done) => new SubagentBrowser(cards, theme, keybindings, done),
+			(tui, theme, keybindings, done) => new SubagentBrowser(cards, tui, theme, keybindings, done),
+			{
+				overlay: true,
+				overlayOptions: {
+					anchor: "top-left",
+					row: 0,
+					col: 0,
+					width: "100%",
+					maxHeight: "100%",
+					margin: 0,
+				},
+			},
 		);
 
 		if (!selected) return;

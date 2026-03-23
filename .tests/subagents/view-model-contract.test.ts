@@ -95,19 +95,19 @@ function makeDispatchItem(thread: string, episode: string) {
 	};
 }
 
-function flattenRenderedLines(component: unknown, width = 120, height?: number): string[] {
+function flattenRenderedLines(component: unknown, width = 120): string[] {
 	if (!component || typeof component !== "object") return [];
 	if (component instanceof Container) {
-		return component.children.flatMap((child) => flattenRenderedLines(child, width, height));
+		return component.children.flatMap((child) => flattenRenderedLines(child, width));
 	}
 	if (component instanceof Text) {
 		return component.render(width);
 	}
 	if ("render" in component && typeof component.render === "function") {
-		return component.render(width, height);
+		return component.render(width);
 	}
 	if ("children" in component && Array.isArray(component.children)) {
-		return component.children.flatMap((child: unknown) => flattenRenderedLines(child, width, height));
+		return component.children.flatMap((child: unknown) => flattenRenderedLines(child, width));
 	}
 	return [];
 }
@@ -196,11 +196,11 @@ test("/subagents should open an independent custom view instead of a modal overl
 		} as any);
 
 		assert.ok(customRenderer, "/subagents should invoke ctx.ui.custom()");
-		assert.notEqual(
-			customOptions?.overlay,
-			true,
-			"/subagents should replace the active view rather than opening the selector in overlay mode",
-		);
+		assert.equal(customOptions?.overlay, true, "/subagents should mount as a fullscreen overlay to cover prior transcript content");
+		assert.equal(customOptions?.overlayOptions?.anchor, "top-left");
+		assert.equal(customOptions?.overlayOptions?.width, "100%");
+		assert.equal(customOptions?.overlayOptions?.maxHeight, "100%");
+		assert.equal(customOptions?.overlayOptions?.margin, 0);
 
 		const rendered = flattenRenderedLines(customRenderer!(undefined, makeTheme(), undefined, () => {}), 80).join("\n");
 		assert.match(rendered, /\[alpha\]/, "the subagent view should still render subagent card summaries from collected card data");
@@ -399,9 +399,8 @@ test("/subagents browser should render a full editor-height frame so stale trans
 
 		const editorHeight = 18;
 		const renderedLines = flattenRenderedLines(
-			customRenderer!({ height: editorHeight }, makeTheme(), undefined, () => {}),
+			customRenderer!({ terminal: { rows: editorHeight } }, makeTheme(), undefined, () => {}),
 			80,
-			editorHeight,
 		);
 
 		assert.match(renderedLines[0] ?? "", /Subagents/, "the browser header should start at the top of the replaced editor region");
@@ -655,11 +654,7 @@ test("ctrl+o should route into the standalone /subagents browser when shortcuts 
 		} as any);
 
 		assert.ok(customRenderer, "ctrl+o should open the subagent browser");
-		assert.notEqual(
-			customOptions?.overlay,
-			true,
-			"ctrl+o should enter the standalone browser rather than opening an overlay modal",
-		);
+		assert.equal(customOptions?.overlay, true, "ctrl+o should open the fullscreen browser overlay");
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });
 	}
