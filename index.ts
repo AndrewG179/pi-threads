@@ -290,7 +290,10 @@ async function runPiOnThread(
 ): Promise<{ exitCode: number; messages: Message[]; stderr: string }> {
 	const args: string[] = ["--mode", "json", "-p", "--no-extensions", "--no-skills", "--no-prompt-templates"];
 	args.push("--session", sessionPath);
-	if (model) args.push("--model", model);
+	if (model) {
+		const modelArg = model.includes("/") ? model.substring(model.indexOf("/") + 1) : model;
+		args.push("--model", modelArg);
+	}
 	if (systemPromptFile) args.push("--append-system-prompt", systemPromptFile);
 	args.push(message);
 
@@ -590,6 +593,216 @@ function getDisplayItems(messages: Message[]): DisplayItem[] {
 export default function (pi: ExtensionAPI) {
 	// Track episode counts per thread (reconstructed from session)
 	const episodeCounts = new Map<string, number>();
+	let subagentModel = "anthropic/claude-sonnet-4-6";
+
+	pi.registerCommand("model-sub", {
+		description: "Set the subagent model for thread workers",
+		handler: async (args, ctx) => {
+			const input = args.trim();
+
+			// Direct match via argument (like /model <term>)
+			if (input) {
+				const slashIndex = input.indexOf("/");
+				if (slashIndex > 0) {
+					const provider = input.substring(0, slashIndex);
+					const modelId = input.substring(slashIndex + 1);
+					const found = ctx.modelRegistry.find(provider, modelId);
+					if (found) {
+						subagentModel = `${provider}/${modelId}`;
+						ctx.ui.setStatus("subagent-model", `\x1b[${(process.stdout.columns ?? 120) - `sub: ${subagentModel}`.length + 1}G\x1b[2msub: ${subagentModel}\x1b[0m`);
+						ctx.ui.notify(`Subagent model set to: ${subagentModel}`, "info");
+						return;
+					}
+				}
+				// Fuzzy match
+				const allModels = ctx.modelRegistry.getAvailable();
+				const matches = allModels.filter((m: any) =>
+					`${m.id} ${m.provider} ${m.provider}/${m.id}`.toLowerCase().includes(input.toLowerCase())
+				);
+				if (matches.length === 1) {
+					subagentModel = `${matches[0].provider}/${matches[0].id}`;
+					ctx.ui.setStatus("subagent-model", `\x1b[${(process.stdout.columns ?? 120) - `sub: ${subagentModel}`.length + 1}G\x1b[2msub: ${subagentModel}\x1b[0m`);
+					ctx.ui.notify(`Subagent model set to: ${subagentModel}`, "info");
+					return;
+				}
+				// Fall through to picker with search pre-filled
+			}
+
+			// Show interactive picker (mirrors /model UI)
+			const available = ctx.modelRegistry.getAvailable();
+			if (available.length === 0) {
+				ctx.ui.notify("No models available", "error");
+				return;
+			}
+
+			// Sort: current model first, then alphabetical by provider
+			const items = available
+				.map((m: any) => ({
+					id: m.id,
+					name: m.name || m.id,
+					provider: m.provider,
+					isCurrent: `${m.provider}/${m.id}` === subagentModel,
+				}))
+				.sort((a: any, b: any) => {
+					if (a.isCurrent && !b.isCurrent) return -1;
+					if (!a.isCurrent && b.isCurrent) return 1;
+					return a.provider.localeCompare(b.provider);
+				});
+
+			const { DynamicBorder } = await import("@mariozechner/pi-coding-agent");
+			const { Container, Text, Input } = await import("@mariozechner/pi-tui");
+
+			const choice = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+				const maxVisible = 10;
+				let selectedIndex = 0;
+				let filtered = [...items];
+				let searchText = input || "";
+
+				// Apply initial search if provided
+				if (searchText) {
+					applyFilter();
+				}
+
+				function applyFilter() {
+					const q = searchText.toLowerCase();
+					if (!q) {
+						filtered = [...items];
+					} else {
+						filtered = items.filter((m: any) =>
+							`${m.id} ${m.provider} ${m.provider}/${m.id} ${m.name}`.toLowerCase().includes(q)
+						);
+					}
+					selectedIndex = Math.min(selectedIndex, Math.max(0, filtered.length - 1));
+				}
+
+				const container = new Container();
+
+				const topBorder = new DynamicBorder((s: string) => theme.fg("accent", s));
+				container.addChild(topBorder);
+
+				const headerText = new Text(theme.fg("muted", "  Only showing models with configured API keys. Configure keys in settings or environment."), 0, 1);
+				container.addChild(headerText);
+
+				const searchInput = new Input(
+					(s: string) => theme.fg("text", s),
+					(s: string) => theme.fg("accent", s),
+					80,
+					"Search models..."
+				);
+				if (searchText) {
+					// Pre-fill search
+					for (const ch of searchText) {
+						searchInput.handleInput(ch);
+					}
+				}
+				searchInput.onChange = (text: string) => {
+					searchText = text;
+					applyFilter();
+					tui.requestRender();
+				};
+				container.addChild(searchInput);
+
+				// Spacer
+				container.addChild(new Text("", 0, 1));
+
+				// Model list (rendered dynamically)
+				const listText = new Text("", 0, 0);
+				container.addChild(listText);
+
+				// Detail line
+				const detailText = new Text("", 0, 1);
+				container.addChild(detailText);
+
+				const bottomBorder = new DynamicBorder((s: string) => theme.fg("accent", s));
+				container.addChild(bottomBorder);
+
+				function renderList() {
+					if (filtered.length === 0) {
+						listText.text = theme.fg("warning", "  No matching models");
+						detailText.text = "";
+						return;
+					}
+
+					// Scroll window centred on selectedIndex
+					let startIndex = Math.max(0, selectedIndex - Math.floor(maxVisible / 2));
+					if (startIndex + maxVisible > filtered.length) {
+						startIndex = Math.max(0, filtered.length - maxVisible);
+					}
+					const endIndex = Math.min(startIndex + maxVisible, filtered.length);
+
+					const lines: string[] = [];
+					for (let i = startIndex; i < endIndex; i++) {
+						const m = filtered[i];
+						const isSelected = i === selectedIndex;
+						const checkmark = m.isCurrent ? theme.fg("success", " ✓") : "";
+						const providerBadge = theme.fg("muted", `[${m.provider}]`);
+
+						if (isSelected) {
+							lines.push(`${theme.fg("accent", "→ " + m.id)} ${providerBadge}${checkmark}`);
+						} else {
+							lines.push(`  ${m.id} ${providerBadge}${checkmark}`);
+						}
+					}
+
+					// Scroll indicator
+					if (filtered.length > maxVisible) {
+						lines.push(theme.fg("muted", `  (${selectedIndex + 1}/${filtered.length})`));
+					}
+
+					listText.text = lines.join("\n");
+
+					// Detail line: model name
+					const sel = filtered[selectedIndex];
+					if (sel) {
+						detailText.text = theme.fg("muted", `  Model Name: ${sel.name}`);
+					} else {
+						detailText.text = "";
+					}
+				}
+
+				renderList();
+
+				return {
+					render: (w: number) => container.render(w),
+					invalidate: () => container.invalidate(),
+					handleInput: (data: string) => {
+						// Check for arrow keys and enter/escape before forwarding to search
+						if (data === "\x1b[A" || data === "\x1bOA") {
+							// Up arrow — wrap around
+							selectedIndex = selectedIndex <= 0 ? filtered.length - 1 : selectedIndex - 1;
+							renderList();
+							tui.requestRender();
+						} else if (data === "\x1b[B" || data === "\x1bOB") {
+							// Down arrow — wrap around
+							selectedIndex = selectedIndex >= filtered.length - 1 ? 0 : selectedIndex + 1;
+							renderList();
+							tui.requestRender();
+						} else if (data === "\r" || data === "\n") {
+							// Enter — select
+							if (filtered.length > 0) {
+								const sel = filtered[selectedIndex];
+								done(`${sel.provider}/${sel.id}`);
+							}
+						} else if (data === "\x1b" || data === "\x03") {
+							// Escape or Ctrl+C — cancel
+							done(null);
+						} else {
+							// Forward to search input
+							searchInput.handleInput(data);
+							renderList();
+							tui.requestRender();
+						}
+					},
+				};
+			});
+
+			if (!choice) return;
+
+			subagentModel = choice;
+			ctx.ui.setStatus("subagent-model", `\x1b[${(process.stdout.columns ?? 120) - `sub: ${subagentModel}`.length + 1}G\x1b[2msub: ${subagentModel}\x1b[0m`);
+			ctx.ui.notify(`Subagent model set to: ${subagentModel}`, "info");
+		},
+	});
 
 	// Reconstruct state on session load
 	pi.on("session_start", async (_event, ctx) => {
@@ -617,6 +830,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		ctx.ui.notify("🧵 Thread orchestrator active", "info");
+		ctx.ui.setStatus("subagent-model", `\x1b[${(process.stdout.columns ?? 120) - `sub: ${subagentModel}`.length + 1}G\x1b[2msub: ${subagentModel}\x1b[0m`);
 	});
 
 	// Inject orchestrator system prompt
@@ -632,6 +846,8 @@ export default function (pi: ExtensionAPI) {
 			});
 			extra += `\n## Active Threads\n${threadInfo.join("\n")}\n`;
 		}
+
+		extra += `\n## Current Subagent Model\n${subagentModel}\n`;
 
 		return { systemPrompt: event.systemPrompt + extra };
 	});
@@ -669,7 +885,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const model = "openai-codex/gpt-5.3-codex";
+			const model = subagentModel;
 
 			// Determine mode
 			const hasBatch = params.tasks && params.tasks.length > 0;
@@ -832,7 +1048,7 @@ export default function (pi: ExtensionAPI) {
 								}
 							}
 
-							return lines;
+							return lines.map((l) => truncateToWidth(l, colWidth));
 						},
 						invalidate(): void {},
 					};
