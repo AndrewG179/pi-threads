@@ -21,6 +21,7 @@
     "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/bugsleep-par-1.jsonl": "/tmp/pi-threads-bugsearch/probe2-parent.jsonl",
     "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/bugsleep-par-2.jsonl": "/tmp/pi-threads-bugsearch/probe2-parent.jsonl",
     "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/bugsleep-par-3.jsonl": "/tmp/pi-threads-bugsearch/probe2-parent.jsonl",
-    "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/bugqueue.jsonl": "/tmp/pi-threads-bugsearch/probe3-parent.jsonl"
+    "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/bugqueue.jsonl": "/tmp/pi-threads-bugsearch/probe3-parent.jsonl",
+    "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/subagent-hi.jsonl": "/home/bitzaven/.pi/agent/sessions/--home-bitzaven-CodingProjects-pi-threads--/2026-03-23T04-58-50-987Z_1327d780-44ab-46b5-9697-3e621c45f484.jsonl"
   }
 }
