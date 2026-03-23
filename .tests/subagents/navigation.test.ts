@@ -262,3 +262,158 @@ test("fresh runtime should install restart-safe ctrl+b back navigation for remem
 		fs.rmSync(projectDir, { recursive: true, force: true });
 	}
 });
+
+test("subagent sessions without remembered parents should not install a ctrl+b terminal rewrite", async () => {
+	const projectDir = makeTempProject();
+	const threadSession = path.join(projectDir, ".pi", "threads", "orphan.jsonl");
+
+	try {
+		fs.mkdirSync(path.dirname(threadSession), { recursive: true });
+		fs.writeFileSync(threadSession, "{\"type\":\"session\"}\n", "utf8");
+		fs.writeFileSync(
+			path.join(projectDir, ".pi", "threads", "state.json"),
+			JSON.stringify(
+				{
+					enabled: true,
+					parentBySession: {},
+				},
+				null,
+				2,
+			) + "\n",
+			"utf8",
+		);
+
+		const fakePi = makeFakePi();
+		registerExtension(fakePi as any);
+
+		const sessionStartHandlers = fakePi.events.get("session_start") ?? [];
+		assert.equal(sessionStartHandlers.length > 0, true, "session_start handler should be registered");
+
+		let terminalInputHandler: ((data: string) => { consume?: boolean; data?: string } | undefined) | undefined;
+		const ui = {
+			notify: () => {},
+			setStatus: () => {},
+			setWidget: () => {},
+			theme: {
+				fg: (_color: string, text: string) => text,
+			},
+			onTerminalInput(handler: (data: string) => { consume?: boolean; data?: string } | undefined) {
+				terminalInputHandler = handler;
+				return () => {
+					if (terminalInputHandler === handler) {
+						terminalInputHandler = undefined;
+					}
+				};
+			},
+		};
+
+		for (const handler of sessionStartHandlers) {
+			await handler({}, {
+				cwd: projectDir,
+				hasUI: true,
+				ui,
+				sessionManager: {
+					getSessionFile: () => threadSession,
+					getBranch: () => [],
+				},
+			} as any);
+		}
+
+		assert.equal(
+			terminalInputHandler,
+			undefined,
+			"subagent sessions without remembered parents should not advertise an unusable terminal-input ctrl+b path",
+		);
+	} finally {
+		fs.rmSync(projectDir, { recursive: true, force: true });
+	}
+});
+
+test("ctrl+b without a remembered parent should warn at most once across registered back-navigation bindings", async () => {
+	const projectDir = makeTempProject();
+	const threadSession = path.join(projectDir, ".pi", "threads", "orphan.jsonl");
+
+	try {
+		fs.mkdirSync(path.dirname(threadSession), { recursive: true });
+		fs.writeFileSync(threadSession, "{\"type\":\"session\"}\n", "utf8");
+		fs.writeFileSync(
+			path.join(projectDir, ".pi", "threads", "state.json"),
+			JSON.stringify(
+				{
+					enabled: true,
+					parentBySession: {},
+				},
+				null,
+				2,
+			) + "\n",
+			"utf8",
+		);
+
+		const fakePi = makeFakePi();
+		registerExtension(fakePi as any);
+
+		const sessionStartHandlers = fakePi.events.get("session_start") ?? [];
+		const shortcut = fakePi.shortcuts.get("ctrl+b");
+		const backCommand = fakePi.commands.get("subagents-back");
+		assert.ok(shortcut, "ctrl+b shortcut should be registered");
+		assert.ok(backCommand, "/subagents-back command should be registered");
+
+		const notifications: Array<{ message: string; level?: string }> = [];
+		let terminalInputHandler: ((data: string) => { consume?: boolean; data?: string } | undefined) | undefined;
+		const ctx = {
+			cwd: projectDir,
+			hasUI: true,
+			ui: {
+				notify: (message: string, level?: string) => {
+					notifications.push({ message, level });
+				},
+				setStatus: () => {},
+				setWidget: () => {},
+				theme: {
+					fg: (_color: string, text: string) => text,
+				},
+				onTerminalInput(handler: (data: string) => { consume?: boolean; data?: string } | undefined) {
+					terminalInputHandler = handler;
+					return () => {
+						if (terminalInputHandler === handler) {
+							terminalInputHandler = undefined;
+						}
+					};
+				},
+			},
+			sessionManager: {
+				getSessionFile: () => threadSession,
+				getBranch: () => [],
+			},
+			switchSession: async () => ({ cancelled: false }),
+			modelRegistry: {},
+			model: undefined,
+			isIdle: () => true,
+			abort: () => {},
+			hasPendingMessages: () => false,
+			shutdown: () => {},
+			getContextUsage: () => undefined,
+			compact: () => {},
+			getSystemPrompt: () => "",
+		};
+
+		for (const handler of sessionStartHandlers) {
+			await handler({}, ctx as any);
+		}
+
+		const rewritten = terminalInputHandler?.("\u0002");
+		if (rewritten?.data === "/subagents-back\n") {
+			await backCommand.handler("", ctx as any);
+		}
+		await shortcut.handler(ctx as any);
+
+		assert.deepEqual(notifications, [
+			{
+				message: "No remembered parent session for this thread.",
+				level: "warning",
+			},
+		]);
+	} finally {
+		fs.rmSync(projectDir, { recursive: true, force: true });
+	}
+});
