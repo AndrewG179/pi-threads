@@ -254,6 +254,27 @@ function resolveDispatchSessionPath(threadsDir: string, item: DispatchItem): str
 	return undefined;
 }
 
+function collectPersistedCurrentParentSessions(
+	threadsDir: string,
+	parentBySession: Record<string, string>,
+	currentParentSessionFile?: string,
+): Map<string, string> {
+	if (!currentParentSessionFile) return new Map<string, string>();
+
+	const resolvedParentSessionFile = path.resolve(currentParentSessionFile);
+	const sessions = new Map<string, string>();
+
+	for (const [childSessionPath, parentSessionPath] of Object.entries(parentBySession)) {
+		if (path.resolve(parentSessionPath) !== resolvedParentSessionFile) continue;
+		if (!isThreadSessionFile(threadsDir, childSessionPath)) continue;
+
+		const resolvedChildSessionPath = path.resolve(childSessionPath);
+		sessions.set(getThreadName(resolvedChildSessionPath), resolvedChildSessionPath);
+	}
+
+	return sessions;
+}
+
 function collectCurrentBranchSessions(threadsDir: string, parentBranchEntries: unknown[]): Map<string, string> {
 	const sessions = new Map<string, string>();
 
@@ -277,10 +298,24 @@ function collectCurrentBranchSessions(threadsDir: string, parentBranchEntries: u
 	return sessions;
 }
 
-export function collectSubagentCards(cwd: string, parentBranchEntries: unknown[]): SubagentCard[] {
+export function collectSubagentCards(
+	cwd: string,
+	parentBranchEntries: unknown[],
+	currentParentSessionFile?: string,
+): SubagentCard[] {
 	const threadsDir = path.join(cwd, ".pi", "threads");
 	const state = loadThreadsState(cwd);
 	const cards = new Map<string, SubagentCard>();
+
+	for (const [thread, sessionPath] of collectPersistedCurrentParentSessions(
+		threadsDir,
+		state.parentBySession,
+		currentParentSessionFile,
+	)) {
+		const parentSessionFile = state.parentBySession[path.resolve(sessionPath)];
+		const card = summarizeThreadSession(sessionPath, parentSessionFile);
+		cards.set(thread, { ...card, thread });
+	}
 
 	for (const [thread, sessionPath] of collectCurrentBranchSessions(threadsDir, parentBranchEntries)) {
 		const parentSessionFile = state.parentBySession[path.resolve(sessionPath)];

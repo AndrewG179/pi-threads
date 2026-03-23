@@ -593,7 +593,7 @@ export default function (pi: ExtensionAPI) {
 		const parentEntries = behavior.parentSessionFile
 			? loadSessionBranchFromFile(behavior.parentSessionFile)
 			: ctx.sessionManager.getBranch();
-		const cards = collectSubagentCards(ctx.cwd, parentEntries);
+		const cards = collectSubagentCards(ctx.cwd, parentEntries, parentSessionFile);
 		const selected = await ctx.ui.custom<SubagentCard | undefined>(
 			(tui, theme, keybindings, done) => new SubagentBrowser(cards, tui, theme, keybindings, done),
 			{
