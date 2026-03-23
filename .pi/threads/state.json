@@ -1,4 +1,26 @@
 {
   "enabled": true,
-  "parentBySession": {}
+  "parentBySession": {
+    "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/repo-survey.jsonl": "/home/bitzaven/.pi/agent/sessions/--home-bitzaven-CodingProjects-pi-threads--/2026-03-23T01-33-28-368Z_d1faa511-5a2f-4a4e-9b3b-e9be5fb96fb9.jsonl",
+    "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/issue-scan.jsonl": "/home/bitzaven/.pi/agent/sessions/--home-bitzaven-CodingProjects-pi-threads--/2026-03-23T01-33-28-368Z_d1faa511-5a2f-4a4e-9b3b-e9be5fb96fb9.jsonl",
+    "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/pi-loading.jsonl": "/home/bitzaven/.pi/agent/sessions/--home-bitzaven-CodingProjects-pi-threads--/2026-03-23T01-33-28-368Z_d1faa511-5a2f-4a4e-9b3b-e9be5fb96fb9.jsonl",
+    "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/repro-harness.jsonl": "/home/bitzaven/.pi/agent/sessions/--home-bitzaven-CodingProjects-pi-threads--/2026-03-23T01-33-28-368Z_d1faa511-5a2f-4a4e-9b3b-e9be5fb96fb9.jsonl",
+    "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/live-basic.jsonl": "/home/bitzaven/.pi/agent/sessions/--home-bitzaven-CodingProjects-pi-threads--/2026-03-23T01-33-28-368Z_d1faa511-5a2f-4a4e-9b3b-e9be5fb96fb9.jsonl",
+    "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/live-parallel.jsonl": "/home/bitzaven/.pi/agent/sessions/--home-bitzaven-CodingProjects-pi-threads--/2026-03-23T01-33-28-368Z_d1faa511-5a2f-4a4e-9b3b-e9be5fb96fb9.jsonl",
+    "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/live-abort.jsonl": "/home/bitzaven/.pi/agent/sessions/--home-bitzaven-CodingProjects-pi-threads--/2026-03-23T01-33-28-368Z_d1faa511-5a2f-4a4e-9b3b-e9be5fb96fb9.jsonl",
+    "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/live-path.jsonl": "/home/bitzaven/.pi/agent/sessions/--home-bitzaven-CodingProjects-pi-threads--/2026-03-23T01-33-28-368Z_d1faa511-5a2f-4a4e-9b3b-e9be5fb96fb9.jsonl",
+    "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/.._bugescape-probe.jsonl": "/home/bitzaven/.pi/agent/sessions/--home-bitzaven-CodingProjects-pi-threads--/2026-03-23T01-49-31-134Z_d22e8f7b-3c73-484e-b31b-c3fe4836bc30.jsonl",
+    "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/bugsearch-single.jsonl": "/tmp/pi-live-drive-64ZPrf/outer-run1.jsonl",
+    "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/bugsearch-mem.jsonl": "/tmp/pi-live-drive-64ZPrf/outer-run3.jsonl",
+    "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/nested_bugslash-probe.jsonl": "/home/bitzaven/.pi/agent/sessions/--home-bitzaven-CodingProjects-pi-threads--/2026-03-23T01-50-42-218Z_70068bfa-d503-41ab-8fa4-0e8d6f2896e0.jsonl",
+    "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/bugpar-1.jsonl": "/tmp/pi-threads-bugsearch/probe1-parent.jsonl",
+    "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/bugpar-2.jsonl": "/tmp/pi-threads-bugsearch/probe1-parent.jsonl",
+    "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/bugpar-3.jsonl": "/tmp/pi-threads-bugsearch/probe1-parent.jsonl",
+    "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/bugpar-4.jsonl": "/tmp/pi-threads-bugsearch/probe1-parent.jsonl",
+    "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/bugpar-5.jsonl": "/tmp/pi-threads-bugsearch/probe1-parent.jsonl",
+    "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/bugsleep-par-1.jsonl": "/tmp/pi-threads-bugsearch/probe2-parent.jsonl",
+    "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/bugsleep-par-2.jsonl": "/tmp/pi-threads-bugsearch/probe2-parent.jsonl",
+    "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/bugsleep-par-3.jsonl": "/tmp/pi-threads-bugsearch/probe2-parent.jsonl",
+    "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/bugqueue.jsonl": "/tmp/pi-threads-bugsearch/probe3-parent.jsonl"
+  }
 }
