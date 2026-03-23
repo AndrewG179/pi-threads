@@ -338,3 +338,550 @@ test("fresh runtime in a thread session should not install ctrl+b back navigatio
 		fs.rmSync(projectDir, { recursive: true, force: true });
 	}
 });
+
+test("session_before_switch should block entering a subagent while the current parent dispatch is still active", async () => {
+	const projectDir = makeTempProject();
+	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
+	const alphaSession = path.join(projectDir, ".pi", "threads", "alpha.jsonl");
+
+	try {
+		writeThreadSession(parentSession, [{ type: "session", version: 3, cwd: projectDir }]);
+		writeThreadSession(alphaSession, [{ type: "session", version: 3, cwd: projectDir }]);
+		fs.mkdirSync(path.join(projectDir, ".pi", "threads"), { recursive: true });
+		fs.writeFileSync(
+			path.join(projectDir, ".pi", "threads", "state.json"),
+			JSON.stringify({ enabled: true }, null, 2) + "\n",
+			"utf8",
+		);
+
+		const fakePi = makeFakePi();
+		registerExtension(fakePi as any);
+
+		const dispatch = fakePi.tools.get("dispatch");
+		const beforeSwitchHandlers = fakePi.events.get("session_before_switch") ?? [];
+		assert.ok(dispatch, "dispatch tool should be registered");
+		assert.equal(beforeSwitchHandlers.length > 0, true, "session_before_switch handler should be registered");
+
+		let resolveRun!: (value: unknown) => void;
+		const originalInvoke = ThreadSupervisor.prototype.invoke;
+		ThreadSupervisor.prototype.invoke = function () {
+			return {
+				runId: "run-1",
+				thread: "alpha",
+				result: new Promise((resolve) => {
+					resolveRun = resolve;
+				}),
+				cancel: async () => {},
+				subscribe: () => () => {},
+				getSnapshot: () => ({
+					runId: "run-1",
+					thread: "alpha",
+					pid: undefined,
+					startedAt: Date.now(),
+					state: { tag: "running" },
+				}),
+			} as any;
+		};
+
+		const dispatchExecution = dispatch!.execute(
+			"tool-call-1",
+			{ thread: "alpha", action: "Inspect alpha" },
+			undefined,
+			undefined,
+			{
+				cwd: projectDir,
+				hasUI: true,
+				ui: {
+					notify: () => {},
+				},
+				sessionManager: {
+					getSessionFile: () => parentSession,
+					getBranch: () => [],
+				},
+				model: { provider: "openai-codex", id: "gpt-5.4" },
+			} as any,
+		);
+
+		try {
+			await Promise.resolve();
+
+			const guardResults = await Promise.all(beforeSwitchHandlers.map((handler) => handler(
+				{ type: "session_before_switch", reason: "resume", targetSessionFile: alphaSession },
+				{
+					cwd: projectDir,
+					hasUI: true,
+					ui: { notify: () => {} },
+					sessionManager: {
+						getSessionFile: () => parentSession,
+						getBranch: () => [],
+					},
+				} as any,
+			)));
+
+			assert.deepEqual(guardResults, [{ cancel: true }]);
+		} finally {
+			resolveRun({
+				runId: "run-1",
+				thread: "alpha",
+				finalState: { tag: "exited", exitCode: 0, signal: null },
+				messages: [],
+				stderr: "",
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+				model: "openai-codex/gpt-5.4",
+			});
+			await dispatchExecution;
+			ThreadSupervisor.prototype.invoke = originalInvoke;
+		}
+	} finally {
+		fs.rmSync(projectDir, { recursive: true, force: true });
+	}
+});
+
+test("session_before_switch should block leaving a subagent while its remembered parent dispatch is still active", async () => {
+	const projectDir = makeTempProject();
+	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
+	const alphaSession = path.join(projectDir, ".pi", "threads", "alpha.jsonl");
+
+	try {
+		writeThreadSession(parentSession, [{ type: "session", version: 3, cwd: projectDir }]);
+		writeThreadSession(alphaSession, [
+			{ type: "session", version: 3, cwd: projectDir },
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "alpha ready" }],
+				},
+			},
+		]);
+		fs.mkdirSync(path.join(projectDir, ".pi", "threads"), { recursive: true });
+		fs.writeFileSync(
+			path.join(projectDir, ".pi", "threads", "state.json"),
+			JSON.stringify({ enabled: true }, null, 2) + "\n",
+			"utf8",
+		);
+
+		const fakePi = makeFakePi();
+		registerExtension(fakePi as any);
+
+		const dispatch = fakePi.tools.get("dispatch");
+		const subagents = fakePi.commands.get("subagents");
+		const beforeSwitchHandlers = fakePi.events.get("session_before_switch") ?? [];
+		assert.ok(dispatch, "dispatch tool should be registered");
+		assert.ok(subagents, "/subagents should be registered");
+		assert.equal(beforeSwitchHandlers.length > 0, true, "session_before_switch handler should be registered");
+
+		await subagents!.handler("", {
+			cwd: projectDir,
+			hasUI: true,
+			switchSession: async () => ({ cancelled: false }),
+			ui: {
+				notify: () => {},
+				custom: async () => ({
+					thread: "alpha",
+					sessionPath: alphaSession,
+					latestAction: "Inspect alpha",
+					outputPreview: "alpha ready",
+					toolPreview: "",
+					accumulatedCost: 0.02,
+					status: "done",
+				}),
+			},
+			sessionManager: {
+				getSessionFile: () => parentSession,
+				getBranch: () => [{
+					type: "message",
+					message: {
+						role: "toolResult",
+						toolName: "dispatch",
+						details: {
+							mode: "single",
+							items: [{
+								thread: "alpha",
+								action: "Inspect alpha",
+								episode: "alpha ready",
+								episodeNumber: 1,
+								result: {
+									exitCode: 0,
+									stderr: "",
+									messages: [{ role: "assistant", content: [{ type: "text", text: "alpha ready" }] }],
+									usage: {
+										input: 12,
+										output: 8,
+										cacheRead: 0,
+										cacheWrite: 0,
+										cost: 0.02,
+										contextTokens: 20,
+										turns: 1,
+									},
+									sessionPath: alphaSession,
+									isNewThread: false,
+								},
+							}],
+						},
+					},
+				}],
+			},
+		} as any);
+
+		let resolveRun!: (value: unknown) => void;
+		const originalInvoke = ThreadSupervisor.prototype.invoke;
+		ThreadSupervisor.prototype.invoke = function () {
+			return {
+				runId: "run-2",
+				thread: "alpha",
+				result: new Promise((resolve) => {
+					resolveRun = resolve;
+				}),
+				cancel: async () => {},
+				subscribe: () => () => {},
+				getSnapshot: () => ({
+					runId: "run-2",
+					thread: "alpha",
+					pid: undefined,
+					startedAt: Date.now(),
+					state: { tag: "running" },
+				}),
+			} as any;
+		};
+
+		const dispatchExecution = dispatch!.execute(
+			"tool-call-2",
+			{ thread: "alpha", action: "Inspect alpha again" },
+			undefined,
+			undefined,
+			{
+				cwd: projectDir,
+				hasUI: true,
+				ui: {
+					notify: () => {},
+				},
+				sessionManager: {
+					getSessionFile: () => parentSession,
+					getBranch: () => [],
+				},
+				model: { provider: "openai-codex", id: "gpt-5.4" },
+			} as any,
+		);
+
+		try {
+			await Promise.resolve();
+
+			const guardResults = await Promise.all(beforeSwitchHandlers.map((handler) => handler(
+				{ type: "session_before_switch", reason: "resume", targetSessionFile: parentSession },
+				{
+					cwd: projectDir,
+					hasUI: true,
+					ui: { notify: () => {} },
+					sessionManager: {
+						getSessionFile: () => alphaSession,
+						getBranch: () => [],
+					},
+				} as any,
+			)));
+
+			assert.deepEqual(guardResults, [{ cancel: true }]);
+		} finally {
+			resolveRun({
+				runId: "run-2",
+				thread: "alpha",
+				finalState: { tag: "exited", exitCode: 0, signal: null },
+				messages: [],
+				stderr: "",
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+				model: "openai-codex/gpt-5.4",
+			});
+			await dispatchExecution;
+			ThreadSupervisor.prototype.invoke = originalInvoke;
+		}
+	} finally {
+		fs.rmSync(projectDir, { recursive: true, force: true });
+	}
+});
+
+test("/subagents should warn if the switch is cancelled because the parent dispatch is still active", async () => {
+	const projectDir = makeTempProject();
+	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
+	const alphaSession = path.join(projectDir, ".pi", "threads", "alpha.jsonl");
+
+	try {
+		writeThreadSession(parentSession, [{ type: "session", version: 3, cwd: projectDir }]);
+		writeThreadSession(alphaSession, [{ type: "session", version: 3, cwd: projectDir }]);
+		fs.mkdirSync(path.join(projectDir, ".pi", "threads"), { recursive: true });
+		fs.writeFileSync(
+			path.join(projectDir, ".pi", "threads", "state.json"),
+			JSON.stringify({ enabled: true }, null, 2) + "\n",
+			"utf8",
+		);
+
+		const fakePi = makeFakePi();
+		registerExtension(fakePi as any);
+
+		const dispatch = fakePi.tools.get("dispatch");
+		const subagents = fakePi.commands.get("subagents");
+		assert.ok(dispatch, "dispatch tool should be registered");
+		assert.ok(subagents, "/subagents should be registered");
+
+		let resolveRun!: (value: unknown) => void;
+		const originalInvoke = ThreadSupervisor.prototype.invoke;
+		ThreadSupervisor.prototype.invoke = function () {
+			return {
+				runId: "run-enter-cancel",
+				thread: "alpha",
+				result: new Promise((resolve) => {
+					resolveRun = resolve;
+				}),
+				cancel: async () => {},
+				subscribe: () => () => {},
+				getSnapshot: () => ({
+					runId: "run-enter-cancel",
+					thread: "alpha",
+					pid: undefined,
+					startedAt: Date.now(),
+					state: { tag: "running" },
+				}),
+			} as any;
+		};
+
+		const dispatchExecution = dispatch!.execute(
+			"tool-call-enter-cancel",
+			{ thread: "alpha", action: "Inspect alpha" },
+			undefined,
+			undefined,
+			{
+				cwd: projectDir,
+				hasUI: true,
+				ui: { notify: () => {} },
+				sessionManager: {
+					getSessionFile: () => parentSession,
+					getBranch: () => [],
+				},
+				model: { provider: "openai-codex", id: "gpt-5.4" },
+			} as any,
+		);
+
+		try {
+			await Promise.resolve();
+
+			const notifications: Array<{ message: string; level?: string }> = [];
+			const switchedSessions: string[] = [];
+			await subagents!.handler("", {
+				cwd: projectDir,
+				hasUI: true,
+				switchSession: async (sessionPath: string) => {
+					switchedSessions.push(sessionPath);
+					return { cancelled: true };
+				},
+				ui: {
+					notify: (message: string, level?: string) => {
+						notifications.push({ message, level });
+					},
+					custom: async () => ({
+						thread: "alpha",
+						sessionPath: alphaSession,
+						latestAction: "Inspect alpha",
+						outputPreview: "(running...)",
+						toolPreview: "$ sleep 75",
+						accumulatedCost: 0,
+						status: "unknown",
+					}),
+				},
+				sessionManager: {
+					getSessionFile: () => parentSession,
+					getBranch: () => [],
+				},
+			} as any);
+
+			assert.deepEqual(switchedSessions, [alphaSession]);
+			assert.deepEqual(notifications, [{
+				message: "Blocked session switch: parent dispatch is still running in parent.jsonl. Switching into or out of a subagent now would stop that in-flight dispatch. Wait for the dispatch to finish, then try again.",
+				level: "warning",
+			}]);
+		} finally {
+			resolveRun({
+				runId: "run-enter-cancel",
+				thread: "alpha",
+				finalState: { tag: "exited", exitCode: 0, signal: null },
+				messages: [],
+				stderr: "",
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+				model: "openai-codex/gpt-5.4",
+			});
+			await dispatchExecution;
+			ThreadSupervisor.prototype.invoke = originalInvoke;
+		}
+	} finally {
+		fs.rmSync(projectDir, { recursive: true, force: true });
+	}
+});
+
+test("/subagents-back should warn if the return switch is cancelled because the parent dispatch is still active", async () => {
+	const projectDir = makeTempProject();
+	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
+	const alphaSession = path.join(projectDir, ".pi", "threads", "alpha.jsonl");
+
+	try {
+		writeThreadSession(parentSession, [{ type: "session", version: 3, cwd: projectDir }]);
+		writeThreadSession(alphaSession, [
+			{ type: "session", version: 3, cwd: projectDir },
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "alpha ready" }],
+				},
+			},
+		]);
+		fs.mkdirSync(path.join(projectDir, ".pi", "threads"), { recursive: true });
+		fs.writeFileSync(
+			path.join(projectDir, ".pi", "threads", "state.json"),
+			JSON.stringify({ enabled: true }, null, 2) + "\n",
+			"utf8",
+		);
+
+		const fakePi = makeFakePi();
+		registerExtension(fakePi as any);
+
+		const dispatch = fakePi.tools.get("dispatch");
+		const subagents = fakePi.commands.get("subagents");
+		const backCommand = fakePi.commands.get("subagents-back");
+		assert.ok(dispatch, "dispatch tool should be registered");
+		assert.ok(subagents, "/subagents should be registered");
+		assert.ok(backCommand, "/subagents-back should be registered");
+
+		await subagents!.handler("", {
+			cwd: projectDir,
+			hasUI: true,
+			switchSession: async () => ({ cancelled: false }),
+			ui: {
+				notify: () => {},
+				custom: async () => ({
+					thread: "alpha",
+					sessionPath: alphaSession,
+					latestAction: "Inspect alpha",
+					outputPreview: "alpha ready",
+					toolPreview: "",
+					accumulatedCost: 0.02,
+					status: "done",
+				}),
+			},
+			sessionManager: {
+				getSessionFile: () => parentSession,
+				getBranch: () => [{
+					type: "message",
+					message: {
+						role: "toolResult",
+						toolName: "dispatch",
+						details: {
+							mode: "single",
+							items: [{
+								thread: "alpha",
+								action: "Inspect alpha",
+								episode: "alpha ready",
+								episodeNumber: 1,
+								result: {
+									exitCode: 0,
+									stderr: "",
+									messages: [{ role: "assistant", content: [{ type: "text", text: "alpha ready" }] }],
+									usage: {
+										input: 12,
+										output: 8,
+										cacheRead: 0,
+										cacheWrite: 0,
+										cost: 0.02,
+										contextTokens: 20,
+										turns: 1,
+									},
+									sessionPath: alphaSession,
+									isNewThread: false,
+								},
+							}],
+						},
+					},
+				}],
+			},
+		} as any);
+
+		let resolveRun!: (value: unknown) => void;
+		const originalInvoke = ThreadSupervisor.prototype.invoke;
+		ThreadSupervisor.prototype.invoke = function () {
+			return {
+				runId: "run-back-cancel",
+				thread: "alpha",
+				result: new Promise((resolve) => {
+					resolveRun = resolve;
+				}),
+				cancel: async () => {},
+				subscribe: () => () => {},
+				getSnapshot: () => ({
+					runId: "run-back-cancel",
+					thread: "alpha",
+					pid: undefined,
+					startedAt: Date.now(),
+					state: { tag: "running" },
+				}),
+			} as any;
+		};
+
+		const dispatchExecution = dispatch!.execute(
+			"tool-call-back-cancel",
+			{ thread: "alpha", action: "Inspect alpha again" },
+			undefined,
+			undefined,
+			{
+				cwd: projectDir,
+				hasUI: true,
+				ui: { notify: () => {} },
+				sessionManager: {
+					getSessionFile: () => parentSession,
+					getBranch: () => [],
+				},
+				model: { provider: "openai-codex", id: "gpt-5.4" },
+			} as any,
+		);
+
+		try {
+			await Promise.resolve();
+
+			const notifications: Array<{ message: string; level?: string }> = [];
+			const switchedSessions: string[] = [];
+			await backCommand!.handler("", {
+				cwd: projectDir,
+				hasUI: true,
+				switchSession: async (sessionPath: string) => {
+					switchedSessions.push(sessionPath);
+					return { cancelled: true };
+				},
+				ui: {
+					notify: (message: string, level?: string) => {
+						notifications.push({ message, level });
+					},
+				},
+				sessionManager: {
+					getSessionFile: () => alphaSession,
+					getBranch: () => [],
+				},
+			} as any);
+
+			assert.deepEqual(switchedSessions, [parentSession]);
+			assert.deepEqual(notifications, [{
+				message: "Blocked session switch: parent dispatch is still running in parent.jsonl. Switching into or out of a subagent now would stop that in-flight dispatch. Wait for the dispatch to finish, then try again.",
+				level: "warning",
+			}]);
+		} finally {
+			resolveRun({
+				runId: "run-back-cancel",
+				thread: "alpha",
+				finalState: { tag: "exited", exitCode: 0, signal: null },
+				messages: [],
+				stderr: "",
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+				model: "openai-codex/gpt-5.4",
+			});
+			await dispatchExecution;
+			ThreadSupervisor.prototype.invoke = originalInvoke;
+		}
+	} finally {
+		fs.rmSync(projectDir, { recursive: true, force: true });
+	}
+});

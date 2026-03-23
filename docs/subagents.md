@@ -51,12 +51,16 @@ Keyboard behavior:
 
 Opening a subagent switches the current pi session to that thread session file.
 
+If the current runtime still owns an in-flight parent `dispatch`, that session switch is blocked with a warning. This is a safety guard only: the extension does not claim to keep that dispatch alive across session switches.
+
 Once opened, the subagent is just a **normal pi chat session**. The only extra UI is a small banner that says it is a subagent session and shows the current-runtime parent when one is known.
 
 While inside a subagent session:
 - `Ctrl+B` should return to the parent session when that parent was established in the current runtime
 - `/subagents-back` should also return to that current-runtime parent session
 - `/subagents` can be used again to jump to another subagent
+
+If that remembered parent still has an in-flight `dispatch` owned by the current runtime, leaving the subagent is also blocked with the same warning until the dispatch finishes.
 
 Returning to the parent restores the parent chat session rather than opening a copy.
 

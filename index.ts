@@ -425,6 +425,7 @@ export default function (pi: ExtensionAPI) {
 	let releaseSubagentBackListener: (() => void) | null = null;
 	const runtimeParentByChildSession = new Map<string, string>();
 	const runtimeChildrenByParentSession = new Map<string, Map<string, string>>();
+	const activeParentDispatchCounts = new Map<string, number>();
 
 	const arraysEqual = (left: string[], right: string[]) =>
 		left.length === right.length && left.every((value, index) => value === right[index]);
@@ -451,6 +452,29 @@ export default function (pi: ExtensionAPI) {
 		const resolvedParent = normalizeSessionPath(parentSessionFile);
 		if (!resolvedParent) return new Map<string, string>();
 		return new Map(runtimeChildrenByParentSession.get(resolvedParent) ?? []);
+	};
+
+	const trackActiveParentDispatch = (sessionFile: string | undefined, behaviorKind: ReturnType<typeof deriveSessionBehavior>["kind"]) => {
+		const resolvedSessionFile = normalizeSessionPath(sessionFile);
+		if (behaviorKind !== "orchestrator" || !resolvedSessionFile) {
+			return () => {};
+		}
+
+		activeParentDispatchCounts.set(resolvedSessionFile, (activeParentDispatchCounts.get(resolvedSessionFile) ?? 0) + 1);
+		return () => {
+			const currentCount = activeParentDispatchCounts.get(resolvedSessionFile) ?? 0;
+			if (currentCount <= 1) {
+				activeParentDispatchCounts.delete(resolvedSessionFile);
+				return;
+			}
+			activeParentDispatchCounts.set(resolvedSessionFile, currentCount - 1);
+		};
+	};
+
+	const hasActiveParentDispatch = (sessionFile: string | undefined): boolean => {
+		const resolvedSessionFile = normalizeSessionPath(sessionFile);
+		if (!resolvedSessionFile) return false;
+		return (activeParentDispatchCounts.get(resolvedSessionFile) ?? 0) > 0;
 	};
 
 	const rebuildEpisodeCounts = (sessionManager: { getBranch(): Array<{ type: string; message: { role: string; toolName?: string; details?: unknown } }> }) => {
@@ -482,6 +506,62 @@ export default function (pi: ExtensionAPI) {
 		});
 		const runtimeParentSessionFile = behavior.kind === "subagent" ? getRuntimeParentSession(sessionFile) : undefined;
 		return { state, behavior, sessionFile, runtimeParentSessionFile };
+	};
+
+	const getUnsafeSubagentSwitchParentSession = (
+		ctx: {
+			cwd: string;
+			sessionManager: { getSessionFile(): string | undefined };
+		},
+		targetSessionFile: string | undefined,
+	): string | undefined => {
+		const { state, behavior, sessionFile, runtimeParentSessionFile } = resolveSessionContext(ctx);
+		const normalizedTargetSessionFile = normalizeSessionPath(targetSessionFile);
+		if (!normalizedTargetSessionFile || normalizedTargetSessionFile === sessionFile) {
+			return undefined;
+		}
+
+		const targetBehavior = deriveSessionBehavior({
+			cwd: ctx.cwd,
+			sessionFile: normalizedTargetSessionFile,
+			state,
+		});
+
+		if (behavior.kind === "orchestrator" && targetBehavior.kind === "subagent" && hasActiveParentDispatch(sessionFile)) {
+			return sessionFile;
+		}
+
+		if (behavior.kind === "subagent" && runtimeParentSessionFile && hasActiveParentDispatch(runtimeParentSessionFile)) {
+			return runtimeParentSessionFile;
+		}
+
+		return undefined;
+	};
+
+	const formatUnsafeSubagentSwitchMessage = (parentSessionFile: string): string =>
+		`Blocked session switch: parent dispatch is still running in ${path.basename(parentSessionFile)}. ` +
+		"Switching into or out of a subagent now would stop that in-flight dispatch. Wait for the dispatch to finish, then try again.";
+
+	const notifyIfUnsafeSubagentSwitchWasCancelled = (
+		ctx: {
+			cwd: string;
+			sessionManager: { getSessionFile(): string | undefined };
+			ui: { notify: (message: string, level?: string) => void };
+		},
+		targetSessionFile: string,
+		switchResult: { cancelled: boolean } | undefined,
+	): boolean => {
+		if (!switchResult?.cancelled) {
+			return false;
+		}
+
+		const parentSessionFile = getUnsafeSubagentSwitchParentSession(ctx, targetSessionFile);
+		if (!parentSessionFile) {
+			return false;
+		}
+
+		ctx.ui.notify(formatUnsafeSubagentSwitchMessage(parentSessionFile), "warning");
+		return true;
 	};
 
 	const renderSubagentBanner = (
@@ -590,7 +670,8 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		await switchSession(runtimeParentSessionFile);
+		const switchResult = await switchSession(runtimeParentSessionFile);
+		notifyIfUnsafeSubagentSwitchWasCancelled(ctx, runtimeParentSessionFile, switchResult);
 	};
 
 	const openSubagentsBrowser = async (ctx: {
@@ -651,12 +732,22 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		rememberRuntimeSubagent(parentSessionFile, selected.thread, selected.sessionPath);
-		await switchSession(selected.sessionPath);
+		const switchResult = await switchSession(selected.sessionPath);
+		notifyIfUnsafeSubagentSwitchWasCancelled(ctx, selected.sessionPath, switchResult);
 	};
 
 	// Reconstruct state on session load
 	pi.on("session_start", async (_event, ctx) => {
 		syncSessionMode(ctx);
+	});
+
+	pi.on("session_before_switch", async (event: { reason?: string; targetSessionFile?: string }, ctx) => {
+		if (event.reason !== "resume") return;
+
+		const parentSessionFile = getUnsafeSubagentSwitchParentSession(ctx, event.targetSessionFile);
+		if (!parentSessionFile) return;
+
+		return { cancel: true };
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
@@ -783,90 +874,99 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const mode = taskList.length > 1 ? "batch" : "single";
-			const taskSessionPaths = new Map(taskList.map((task) => [task.thread, getThreadSessionPath(ctx.cwd, task.thread)]));
-			const allItems: (SingleDispatchResult | null)[] = taskList.map(() => null);
+			const releaseActiveParentDispatch = trackActiveParentDispatch(
+				sessionContext.sessionFile,
+				sessionContext.behavior.kind,
+			);
 
-			const emitBatchUpdate = () => {
-				if (!onUpdate) return;
-				const currentItems = allItems.filter((i): i is SingleDispatchResult => i !== null);
-				if (currentItems.length === 0) return;
-				onUpdate({
-					content: [{ type: "text", text: currentItems.map((i) => `[${i.thread}] ${i.episode || "(running...)"}`).join("\n\n") }],
-					details: { mode, items: currentItems },
-				});
-			};
+			try {
+				const mode = taskList.length > 1 ? "batch" : "single";
+				const taskSessionPaths = new Map(taskList.map((task) => [task.thread, getThreadSessionPath(ctx.cwd, task.thread)]));
+				const allItems: (SingleDispatchResult | null)[] = taskList.map(() => null);
 
-			if (rememberedParentSession) {
-				for (const task of taskList) {
-					const sessionPath = taskSessionPaths.get(task.thread);
-					if (!sessionPath) continue;
-					rememberRuntimeSubagent(rememberedParentSession, task.thread, sessionPath);
+				const emitBatchUpdate = () => {
+					if (!onUpdate) return;
+					const currentItems = allItems.filter((i): i is SingleDispatchResult => i !== null);
+					if (currentItems.length === 0) return;
+					onUpdate({
+						content: [{ type: "text", text: currentItems.map((i) => `[${i.thread}] ${i.episode || "(running...)"}`).join("\n\n") }],
+						details: { mode, items: currentItems },
+					});
+				};
+
+				if (rememberedParentSession) {
+					for (const task of taskList) {
+						const sessionPath = taskSessionPaths.get(task.thread);
+						if (!sessionPath) continue;
+						rememberRuntimeSubagent(rememberedParentSession, task.thread, sessionPath);
+					}
 				}
-			}
 
-			const runOne = async (task: { thread: string; action: string }, index: number): Promise<SingleDispatchResult> => {
-				const episodeNumber = (episodeCounts.get(task.thread) || 0) + 1;
-				const taskOnUpdate = mode === "single"
-					? onUpdate
-					: onUpdate
-						? (partial: AgentToolResult<DispatchDetails>) => {
-								const inProgress = partial.details?.items?.[0];
-								if (inProgress) allItems[index] = inProgress;
-								emitBatchUpdate();
-							}
-						: undefined;
+				const runOne = async (task: { thread: string; action: string }, index: number): Promise<SingleDispatchResult> => {
+					const episodeNumber = (episodeCounts.get(task.thread) || 0) + 1;
+					const taskOnUpdate = mode === "single"
+						? onUpdate
+						: onUpdate
+							? (partial: AgentToolResult<DispatchDetails>) => {
+									const inProgress = partial.details?.items?.[0];
+									if (inProgress) allItems[index] = inProgress;
+									emitBatchUpdate();
+								}
+							: undefined;
 
-				const sessionPath = taskSessionPaths.get(task.thread) ?? getThreadSessionPath(ctx.cwd, task.thread);
+					const sessionPath = taskSessionPaths.get(task.thread) ?? getThreadSessionPath(ctx.cwd, task.thread);
 
-				const pendingItem: SingleDispatchResult = {
-					thread: task.thread,
-					action: task.action,
-					episode: "(running...)",
-					episodeNumber,
-					result: createEmptyThreadActionResult({
+					const pendingItem: SingleDispatchResult = {
 						thread: task.thread,
 						action: task.action,
-						model,
-						sessionPath,
-						isNewThread: !fs.existsSync(sessionPath),
-					}),
+						episode: "(running...)",
+						episodeNumber,
+						result: createEmptyThreadActionResult({
+							thread: task.thread,
+							action: task.action,
+							model,
+							sessionPath,
+							isNewThread: !fs.existsSync(sessionPath),
+						}),
+					};
+					allItems[index] = pendingItem;
+					taskOnUpdate?.({
+						content: [{ type: "text", text: "(running...)" }],
+						details: { mode: "single", items: [pendingItem] },
+					});
+
+					const result = await runThreadAction(
+						ctx.cwd, task.thread, task.action, model, signal,
+						taskOnUpdate,
+						episodeNumber,
+					);
+
+					const episode = buildThreadEpisode(
+						result.messages as Parameters<typeof buildThreadEpisode>[0],
+						{ emptyFallback: getDispatchFailureSummary(result) },
+					);
+					episodeCounts.set(task.thread, episodeNumber);
+
+					const item: SingleDispatchResult = { thread: task.thread, action: task.action, episode, episodeNumber, result };
+					allItems[index] = item;
+					if (mode === "batch") emitBatchUpdate();
+					return item;
 				};
-				allItems[index] = pendingItem;
-				taskOnUpdate?.({
-					content: [{ type: "text", text: "(running...)" }],
-					details: { mode: "single", items: [pendingItem] },
-				});
 
-				const result = await runThreadAction(
-					ctx.cwd, task.thread, task.action, model, signal,
-					taskOnUpdate,
-					episodeNumber,
+				const items = await Promise.all(taskList.map((task, index) => runOne(task, index)));
+				const anyError = items.some(({ result }) =>
+					result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted",
 				);
+				const contentText = items.map((i) => `[${i.thread}] ${i.episode}`).join("\n\n");
 
-				const episode = buildThreadEpisode(
-					result.messages as Parameters<typeof buildThreadEpisode>[0],
-					{ emptyFallback: getDispatchFailureSummary(result) },
-				);
-				episodeCounts.set(task.thread, episodeNumber);
-
-				const item: SingleDispatchResult = { thread: task.thread, action: task.action, episode, episodeNumber, result };
-				allItems[index] = item;
-				if (mode === "batch") emitBatchUpdate();
-				return item;
-			};
-
-			const items = await Promise.all(taskList.map((task, index) => runOne(task, index)));
-			const anyError = items.some(({ result }) =>
-				result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted",
-			);
-			const contentText = items.map((i) => `[${i.thread}] ${i.episode}`).join("\n\n");
-
-			return {
-				content: [{ type: "text", text: contentText }],
-				details: { mode, items },
-				isError: anyError ? true : undefined,
-			};
+				return {
+					content: [{ type: "text", text: contentText }],
+					details: { mode, items },
+					isError: anyError ? true : undefined,
+				};
+			} finally {
+				releaseActiveParentDispatch();
+			}
 		},
 
 		// ─── Rendering ───
