@@ -482,11 +482,14 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const parentLabel = behavior.parentSessionFile ? path.basename(behavior.parentSessionFile) : "unknown";
+		const navigationHint = behavior.parentSessionFile
+			? "Ctrl+B or /subagents-back to return · /subagents to switch threads"
+			: "/subagents to switch threads";
 		ctx.ui.setWidget(
 			"pi-threads-subagent-banner",
 			[
 				ctx.ui.theme.fg("warning", `Subagent [${behavior.threadName ?? "thread"}]`) + ctx.ui.theme.fg("dim", `  parent ${parentLabel}`),
-				ctx.ui.theme.fg("dim", "Ctrl+B or /subagents-back to return · /subagents to switch threads"),
+				ctx.ui.theme.fg("dim", navigationHint),
 			],
 			{ placement: "aboveEditor" },
 		);
@@ -527,7 +530,7 @@ export default function (pi: ExtensionAPI) {
 
 		releaseSubagentBackListener?.();
 		releaseSubagentBackListener = null;
-		if (behavior.kind === "subagent" && ctx.hasUI && typeof ctx.ui.onTerminalInput === "function") {
+		if (behavior.kind === "subagent" && behavior.parentSessionFile && ctx.hasUI && typeof ctx.ui.onTerminalInput === "function") {
 			releaseSubagentBackListener = ctx.ui.onTerminalInput((data) => {
 				if (data !== CTRL_B_INPUT) return undefined;
 				return { data: "/subagents-back\n" };
@@ -548,8 +551,11 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const rememberCommandSessionSwitcher = (ctx: {
-		switchSession: (sessionPath: string) => Promise<{ cancelled: boolean }>;
+		switchSession?: (sessionPath: string) => Promise<{ cancelled: boolean }>;
 	}) => {
+		if (typeof ctx.switchSession !== "function") {
+			return;
+		}
 		lastCommandSwitchSession = ctx.switchSession.bind(ctx);
 	};
 
@@ -629,13 +635,6 @@ export default function (pi: ExtensionAPI) {
 		description: "Return from the current subagent session to its remembered parent session",
 		handler: async (_args, ctx) => {
 			rememberCommandSessionSwitcher(ctx);
-			await switchToRememberedParent(ctx);
-		},
-	});
-
-	pi.registerShortcut("ctrl+b", {
-		description: "Return to remembered parent session from a subagent",
-		handler: async (ctx) => {
 			await switchToRememberedParent(ctx);
 		},
 	});

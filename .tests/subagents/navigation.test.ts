@@ -134,7 +134,7 @@ test("dispatch should remember the parent session for spawned thread sessions", 
 	}
 });
 
-test("ctrl+b should work from a plain shortcut ExtensionContext shape", async () => {
+test("/subagents-back should work from a plain command ExtensionContext shape", async () => {
 	const projectDir = makeTempProject();
 	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
 	const threadSession = path.join(projectDir, ".pi", "threads", "smoke-fast.jsonl");
@@ -163,11 +163,11 @@ test("ctrl+b should work from a plain shortcut ExtensionContext shape", async ()
 		const fakePi = makeFakePi();
 		registerExtension(fakePi as any);
 
-		const shortcut = fakePi.shortcuts.get("ctrl+b");
-		assert.ok(shortcut, "ctrl+b shortcut should be registered");
+		const backCommand = fakePi.commands.get("subagents-back");
+		assert.ok(backCommand, "/subagents-back command should be registered");
 
 		await assert.doesNotReject(async () => {
-			await shortcut!.handler({
+			await backCommand!.handler("", {
 				cwd: projectDir,
 				hasUI: true,
 				ui: { notify: () => {} },
@@ -290,10 +290,13 @@ test("subagent sessions without remembered parents should not install a ctrl+b t
 		assert.equal(sessionStartHandlers.length > 0, true, "session_start handler should be registered");
 
 		let terminalInputHandler: ((data: string) => { consume?: boolean; data?: string } | undefined) | undefined;
+		const widgets = new Map<string, unknown>();
 		const ui = {
 			notify: () => {},
 			setStatus: () => {},
-			setWidget: () => {},
+			setWidget: (key: string, content: unknown) => {
+				widgets.set(key, content);
+			},
 			theme: {
 				fg: (_color: string, text: string) => text,
 			},
@@ -324,16 +327,23 @@ test("subagent sessions without remembered parents should not install a ctrl+b t
 			undefined,
 			"subagent sessions without remembered parents should not advertise an unusable terminal-input ctrl+b path",
 		);
+		assert.deepEqual(widgets.get("pi-threads-subagent-banner"), [
+			"Subagent [orphan]  parent unknown",
+			"/subagents to switch threads",
+		]);
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });
 	}
 });
 
-test("ctrl+b without a remembered parent should warn at most once across registered back-navigation bindings", async () => {
+test("BR-010 should route back navigation through /subagents-back only", async () => {
 	const projectDir = makeTempProject();
-	const threadSession = path.join(projectDir, ".pi", "threads", "orphan.jsonl");
+	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
+	const threadSession = path.join(projectDir, ".pi", "threads", "child.jsonl");
 
 	try {
+		fs.mkdirSync(path.dirname(parentSession), { recursive: true });
+		fs.writeFileSync(parentSession, "{\"type\":\"session\"}\n", "utf8");
 		fs.mkdirSync(path.dirname(threadSession), { recursive: true });
 		fs.writeFileSync(threadSession, "{\"type\":\"session\"}\n", "utf8");
 		fs.writeFileSync(
@@ -341,7 +351,9 @@ test("ctrl+b without a remembered parent should warn at most once across registe
 			JSON.stringify(
 				{
 					enabled: true,
-					parentBySession: {},
+					parentBySession: {
+						[path.resolve(threadSession)]: path.resolve(parentSession),
+					},
 				},
 				null,
 				2,
@@ -353,10 +365,9 @@ test("ctrl+b without a remembered parent should warn at most once across registe
 		registerExtension(fakePi as any);
 
 		const sessionStartHandlers = fakePi.events.get("session_start") ?? [];
-		const shortcut = fakePi.shortcuts.get("ctrl+b");
 		const backCommand = fakePi.commands.get("subagents-back");
-		assert.ok(shortcut, "ctrl+b shortcut should be registered");
 		assert.ok(backCommand, "/subagents-back command should be registered");
+		assert.equal(fakePi.shortcuts.get("ctrl+b"), undefined, "ctrl+b should not be registered twice through the shortcut API");
 
 		const notifications: Array<{ message: string; level?: string }> = [];
 		let terminalInputHandler: ((data: string) => { consume?: boolean; data?: string } | undefined) | undefined;
@@ -401,18 +412,12 @@ test("ctrl+b without a remembered parent should warn at most once across registe
 			await handler({}, ctx as any);
 		}
 
-		const rewritten = terminalInputHandler?.("\u0002");
-		if (rewritten?.data === "/subagents-back\n") {
+		assert.ok(terminalInputHandler, "remembered subagent sessions should still install the terminal ctrl+b rewrite");
+		assert.deepEqual(terminalInputHandler!("\u0002"), { data: "/subagents-back\n" });
+		await assert.doesNotReject(async () => {
 			await backCommand.handler("", ctx as any);
-		}
-		await shortcut.handler(ctx as any);
-
-		assert.deepEqual(notifications, [
-			{
-				message: "No remembered parent session for this thread.",
-				level: "warning",
-			},
-		]);
+		});
+		assert.deepEqual(notifications, []);
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });
 	}
