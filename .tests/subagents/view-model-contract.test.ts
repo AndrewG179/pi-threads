@@ -418,6 +418,78 @@ test("/subagents should ignore stale state.json parent linkage when no same-runt
 	}
 });
 
+test("/subagents should ignore stray thread transcript files when there is no live runtime record or completed parent dispatch result", async () => {
+	const projectDir = makeTempProject();
+	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
+	const alphaSession = path.join(projectDir, ".pi", "threads", "alpha.jsonl");
+	const betaSession = path.join(projectDir, ".pi", "threads", "beta.jsonl");
+
+	try {
+		writeThreadSession(parentSession, [{ type: "session", version: 3, cwd: projectDir }]);
+		writeThreadSession(alphaSession, [
+			{ type: "session", version: 3, cwd: projectDir },
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "alpha transcript output that should stay historical only" }],
+				},
+			},
+		]);
+		writeThreadSession(betaSession, [
+			{ type: "session", version: 3, cwd: projectDir },
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "beta transcript output that should stay historical only" }],
+				},
+			},
+		]);
+
+		const fakePi = makeFakePi();
+		registerExtension(fakePi as any);
+
+		const subagents = fakePi.commands.get("subagents");
+		assert.ok(subagents, "/subagents should be registered");
+
+		let customRenderer: ((...args: any[]) => unknown) | undefined;
+
+		await subagents!.handler("", {
+			cwd: projectDir,
+			hasUI: true,
+			switchSession: async () => ({ cancelled: false }),
+			ui: {
+				notify: () => {},
+				custom: async (renderer: (...args: any[]) => unknown) => {
+					customRenderer = renderer;
+					return undefined;
+				},
+			},
+			sessionManager: {
+				getSessionFile: () => parentSession,
+				getBranch: () => [],
+			},
+		} as any);
+
+		assert.ok(customRenderer, "/subagents should invoke ctx.ui.custom()");
+
+		const rendered = flattenRenderedLines(customRenderer!(undefined, makeTheme(), undefined, () => {}), 80).join("\n");
+		assert.match(
+			rendered,
+			/No subagent runs in this session\./,
+			"thread transcript files on disk are durable history, not live parent/child discovery authority for /subagents",
+		);
+		assert.doesNotMatch(
+			rendered,
+			/\[alpha\]|\[beta\]/,
+			"historical thread transcript files should stay hidden until the current parent session owns a live run or a completed dispatch result for them",
+		);
+	} finally {
+		fs.rmSync(projectDir, { recursive: true, force: true });
+	}
+});
+
 test("/subagents browser should keep navigation and selected-detail panes visible together above the fold instead of stacking the full list first", async () => {
 	const projectDir = makeTempProject();
 	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
