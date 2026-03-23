@@ -165,7 +165,7 @@ declare module "@mariozechner/pi-tui" {
 		invalidate(): void;
 	}
 
-	export function getEditorKeybindings(): KeybindingMatcher;
+	export function getKeybindings(): KeybindingMatcher;
 	export function truncateToWidth(input: string, width: number): string;
 	export function visibleWidth(input: string): number;
 }

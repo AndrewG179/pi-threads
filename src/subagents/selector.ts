@@ -1,4 +1,4 @@
-import { getEditorKeybindings, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { getKeybindings, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 
 import type { SubagentCard } from "./metadata";
 import { wrapText } from "../text/wrap";
@@ -39,22 +39,22 @@ export class SubagentSelector {
 	) {}
 
 	handleInput(keyData: string): void {
-		const kb = getEditorKeybindings();
-		if (kb.matches(keyData, "selectUp")) {
+		const kb = getKeybindings();
+		if (kb.matches(keyData, "tui.select.up")) {
 			if (this.cards.length === 0) return;
 			this.selectedIndex = this.selectedIndex === 0 ? this.cards.length - 1 : this.selectedIndex - 1;
 			return;
 		}
-		if (kb.matches(keyData, "selectDown")) {
+		if (kb.matches(keyData, "tui.select.down")) {
 			if (this.cards.length === 0) return;
 			this.selectedIndex = this.selectedIndex === this.cards.length - 1 ? 0 : this.selectedIndex + 1;
 			return;
 		}
-		if (kb.matches(keyData, "selectConfirm")) {
+		if (kb.matches(keyData, "tui.select.confirm")) {
 			this.done(this.cards[this.selectedIndex]);
 			return;
 		}
-		if (kb.matches(keyData, "selectCancel")) {
+		if (kb.matches(keyData, "tui.select.cancel")) {
 			this.done(undefined);
 		}
 	}
