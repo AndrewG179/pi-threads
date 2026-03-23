@@ -17,6 +17,10 @@ type RegisteredCommand = {
 	handler: (args: string, ctx: Record<string, unknown>) => Promise<void> | void;
 };
 
+type RegisteredShortcut = {
+	handler: (ctx: Record<string, unknown>) => Promise<void> | void;
+};
+
 function makeTempProject(): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-view-model-"));
 }
@@ -24,13 +28,16 @@ function makeTempProject(): string {
 function makeFakePi() {
 	const tools = new Map<string, RegisteredTool>();
 	const commands = new Map<string, RegisteredCommand>();
+	const shortcuts = new Map<string, RegisteredShortcut>();
 
 	return {
 		on: () => {},
 		registerCommand(name: string, config: RegisteredCommand) {
 			commands.set(name, config);
 		},
-		registerShortcut: () => {},
+		registerShortcut(name: string, config: RegisteredShortcut) {
+			shortcuts.set(name, config);
+		},
 		registerTool(config: RegisteredTool) {
 			tools.set(config.name, config);
 		},
@@ -39,6 +46,7 @@ function makeFakePi() {
 		setActiveTools: () => {},
 		tools,
 		commands,
+		shortcuts,
 	};
 }
 
@@ -196,6 +204,361 @@ test("/subagents should open an independent custom view instead of a modal overl
 
 		const rendered = flattenRenderedLines(customRenderer!(undefined, makeTheme(), undefined, () => {}), 80).join("\n");
 		assert.match(rendered, /\[alpha\]/, "the subagent view should still render subagent card summaries from collected card data");
+	} finally {
+		fs.rmSync(projectDir, { recursive: true, force: true });
+	}
+});
+
+test("/subagents browser should keep navigation and selected-detail panes visible together above the fold instead of stacking the full list first", async () => {
+	const projectDir = makeTempProject();
+	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
+	const threadNames = ["alpha", "beta", "gamma", "delta"];
+
+	try {
+		writeThreadSession(parentSession, [{ type: "session", version: 3, cwd: projectDir }]);
+		for (const thread of threadNames) {
+			writeThreadSession(path.join(projectDir, ".pi", "threads", `${thread}.jsonl`), [
+				{ type: "session", version: 3, cwd: projectDir },
+				{
+					type: "message",
+					message: {
+						role: "user",
+						content: [{ type: "text", text: `Inspect ${thread} implementation details` }],
+					},
+				},
+				{
+					type: "message",
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: `${thread} preview output with enough detail to wrap across lines.` }],
+					},
+				},
+			]);
+		}
+
+		const fakePi = makeFakePi();
+		registerExtension(fakePi as any);
+
+		const subagents = fakePi.commands.get("subagents");
+		assert.ok(subagents, "/subagents should be registered");
+
+		let customRenderer: ((...args: any[]) => unknown) | undefined;
+
+		await subagents!.handler("", {
+			cwd: projectDir,
+			hasUI: true,
+			switchSession: async () => ({ cancelled: false }),
+			ui: {
+				notify: () => {},
+				custom: async (renderer: (...args: any[]) => unknown) => {
+					customRenderer = renderer;
+					return undefined;
+				},
+			},
+			sessionManager: {
+				getSessionFile: () => parentSession,
+				getBranch: () => [{
+					type: "message",
+					message: {
+						role: "toolResult",
+						toolName: "dispatch",
+						details: {
+							mode: "batch",
+							items: threadNames.map((thread) => ({
+								thread,
+								action: `Inspect ${thread} implementation details with a longer action summary`,
+								episode: `${thread} ready`,
+								episodeNumber: 1,
+								result: {
+									exitCode: 0,
+									stderr: "",
+									messages: [{ role: "assistant", content: [{ type: "text", text: `${thread} ready` }] }],
+									usage: {
+										input: 12,
+										output: 8,
+										cacheRead: 0,
+										cacheWrite: 0,
+										cost: 0.02,
+										contextTokens: 20,
+										turns: 1,
+									},
+									sessionPath: path.join(projectDir, ".pi", "threads", `${thread}.jsonl`),
+									isNewThread: false,
+								},
+							})),
+						},
+					},
+				}],
+			},
+		} as any);
+
+		assert.ok(customRenderer, "/subagents should invoke ctx.ui.custom()");
+
+		const renderedLines = flattenRenderedLines(customRenderer!(undefined, makeTheme(), undefined, () => {}), 72);
+		const constrainedViewport = renderedLines.slice(0, 8).join("\n");
+
+		assert.match(constrainedViewport, /Subagents/, "the browser title should remain visible in a constrained viewport");
+		assert.match(constrainedViewport, /Sessions/, "the navigation-pane header should remain visible in a constrained viewport");
+		assert.match(
+			constrainedViewport,
+			/Selected/,
+			"the selected-detail pane header should stay above the fold rather than being pushed below a stacked list of sessions",
+		);
+		assert.match(
+			constrainedViewport,
+			/Action/,
+			"the selected-detail pane should keep its top section visible even if lower detail is truncated by viewport height",
+		);
+	} finally {
+		fs.rmSync(projectDir, { recursive: true, force: true });
+	}
+});
+
+test("standalone /subagents browser should use the keybindings object supplied by ctx.ui.custom() for navigation and selection", async () => {
+	const projectDir = makeTempProject();
+	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
+	const alphaSession = path.join(projectDir, ".pi", "threads", "alpha.jsonl");
+	const betaSession = path.join(projectDir, ".pi", "threads", "beta.jsonl");
+
+	try {
+		writeThreadSession(parentSession, [{ type: "session", version: 3, cwd: projectDir }]);
+		writeThreadSession(alphaSession, [
+			{ type: "session", version: 3, cwd: projectDir },
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "alpha ready" }],
+				},
+			},
+		]);
+		writeThreadSession(betaSession, [
+			{ type: "session", version: 3, cwd: projectDir },
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "beta ready" }],
+				},
+			},
+		]);
+
+		const fakePi = makeFakePi();
+		registerExtension(fakePi as any);
+
+		const subagents = fakePi.commands.get("subagents");
+		assert.ok(subagents, "/subagents should be registered");
+
+		let customRenderer: ((...args: any[]) => unknown) | undefined;
+
+		await subagents!.handler("", {
+			cwd: projectDir,
+			hasUI: true,
+			switchSession: async () => ({ cancelled: false }),
+			ui: {
+				notify: () => {},
+				custom: async (renderer: (...args: any[]) => unknown) => {
+					customRenderer = renderer;
+					return undefined;
+				},
+			},
+			sessionManager: {
+				getSessionFile: () => parentSession,
+				getBranch: () => [{
+					type: "message",
+					message: {
+						role: "toolResult",
+						toolName: "dispatch",
+						details: {
+							mode: "batch",
+							items: [
+								{
+									thread: "alpha",
+									action: "Inspect alpha",
+									episode: "alpha ready",
+									episodeNumber: 1,
+									result: {
+										exitCode: 0,
+										stderr: "",
+										messages: [{ role: "assistant", content: [{ type: "text", text: "alpha ready" }] }],
+										usage: {
+											input: 12,
+											output: 8,
+											cacheRead: 0,
+											cacheWrite: 0,
+											cost: 0.02,
+											contextTokens: 20,
+											turns: 1,
+										},
+										sessionPath: alphaSession,
+										isNewThread: false,
+									},
+								},
+								{
+									thread: "beta",
+									action: "Inspect beta",
+									episode: "beta ready",
+									episodeNumber: 1,
+									result: {
+										exitCode: 0,
+										stderr: "",
+										messages: [{ role: "assistant", content: [{ type: "text", text: "beta ready" }] }],
+										usage: {
+											input: 12,
+											output: 8,
+											cacheRead: 0,
+											cacheWrite: 0,
+											cost: 0.02,
+											contextTokens: 20,
+											turns: 1,
+										},
+										sessionPath: betaSession,
+										isNewThread: false,
+									},
+								},
+							],
+						},
+					},
+				}],
+			},
+		} as any);
+
+		assert.ok(customRenderer, "/subagents should invoke ctx.ui.custom()");
+
+		const keybindingCalls: Array<{ keyData: string; command: string }> = [];
+		let selectedThread: string | undefined;
+		const browser = customRenderer!(
+			undefined,
+			makeTheme(),
+			{
+				matches(keyData: string, command: string) {
+					keybindingCalls.push({ keyData, command });
+					return (
+						(keyData === "custom-next" && command === "tui.select.down") ||
+						(keyData === "custom-open" && command === "tui.select.confirm")
+					);
+				},
+			},
+			(result: { thread?: string } | undefined) => {
+				selectedThread = result?.thread;
+			},
+		) as { handleInput?: (keyData: string) => void };
+
+		assert.equal(typeof browser.handleInput, "function", "custom view should return an interactive browser with input handling");
+
+		browser.handleInput!("custom-next");
+		browser.handleInput!("custom-open");
+
+		assert.deepEqual(
+			keybindingCalls,
+			[
+				{ keyData: "custom-next", command: "tui.select.up" },
+				{ keyData: "custom-next", command: "tui.select.down" },
+				{ keyData: "custom-open", command: "tui.select.up" },
+				{ keyData: "custom-open", command: "tui.select.down" },
+				{ keyData: "custom-open", command: "tui.select.confirm" },
+			],
+			"the standalone browser should query the ctx.ui.custom() keybindings object for its navigation commands",
+		);
+		assert.equal(
+			selectedThread,
+			"beta",
+			"the standalone browser should navigate and confirm using the supplied keybindings instead of a separate global keybinding export",
+		);
+	} finally {
+		fs.rmSync(projectDir, { recursive: true, force: true });
+	}
+});
+
+test("ctrl+o should route into the standalone /subagents browser when shortcuts are available", async () => {
+	const projectDir = makeTempProject();
+	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
+	const alphaSession = path.join(projectDir, ".pi", "threads", "alpha.jsonl");
+
+	try {
+		writeThreadSession(parentSession, [{ type: "session", version: 3, cwd: projectDir }]);
+		writeThreadSession(alphaSession, [
+			{ type: "session", version: 3, cwd: projectDir },
+			{
+				type: "message",
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "Inspect alpha" }],
+				},
+			},
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "alpha ready" }],
+				},
+			},
+		]);
+
+		const fakePi = makeFakePi();
+		registerExtension(fakePi as any);
+
+		const shortcut = fakePi.shortcuts.get("ctrl+o");
+		assert.ok(shortcut, "ctrl+o should be registered as a /subagents browser entry path");
+
+		let customRenderer: ((...args: any[]) => unknown) | undefined;
+		let customOptions: Record<string, unknown> | undefined;
+
+		await shortcut!.handler({
+			cwd: projectDir,
+			hasUI: true,
+			switchSession: async () => ({ cancelled: false }),
+			ui: {
+				notify: () => {},
+				custom: async (renderer: (...args: any[]) => unknown, options?: Record<string, unknown>) => {
+					customRenderer = renderer;
+					customOptions = options;
+					return undefined;
+				},
+			},
+			sessionManager: {
+				getSessionFile: () => parentSession,
+				getBranch: () => [{
+					type: "message",
+					message: {
+						role: "toolResult",
+						toolName: "dispatch",
+						details: {
+							mode: "single",
+							items: [{
+								thread: "alpha",
+								action: "Inspect alpha",
+								episode: "alpha ready",
+								episodeNumber: 1,
+								result: {
+									exitCode: 0,
+									stderr: "",
+									messages: [{ role: "assistant", content: [{ type: "text", text: "alpha ready" }] }],
+									usage: {
+										input: 12,
+										output: 8,
+										cacheRead: 0,
+										cacheWrite: 0,
+										cost: 0.02,
+										contextTokens: 20,
+										turns: 1,
+									},
+									sessionPath: alphaSession,
+									isNewThread: false,
+								},
+							}],
+						},
+					},
+				}],
+			},
+		} as any);
+
+		assert.ok(customRenderer, "ctrl+o should open the subagent browser");
+		assert.notEqual(
+			customOptions?.overlay,
+			true,
+			"ctrl+o should enter the standalone browser rather than opening an overlay modal",
+		);
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });
 	}
