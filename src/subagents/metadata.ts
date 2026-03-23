@@ -1,8 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { loadThreadsState } from "./state";
-
 export type SubagentStatus = "done" | "escalated" | "aborted" | "unknown";
 
 export interface SubagentCard {
@@ -13,7 +11,6 @@ export interface SubagentCard {
 	toolPreview: string;
 	accumulatedCost: number;
 	status: SubagentStatus;
-	parentSessionFile?: string;
 }
 
 interface SessionMessageContentPart {
@@ -150,7 +147,7 @@ export function loadSessionBranchFromFile(sessionPath: string): SessionLine[] {
 	return branch.reverse();
 }
 
-function summarizeThreadSession(sessionPath: string, parentSessionFile?: string): SubagentCard {
+function summarizeThreadSession(sessionPath: string): SubagentCard {
 	const thread = getThreadName(sessionPath);
 	let latestAction = "";
 	let outputPreview = "";
@@ -179,7 +176,6 @@ function summarizeThreadSession(sessionPath: string, parentSessionFile?: string)
 		toolPreview,
 		accumulatedCost: 0,
 		status: "unknown",
-		parentSessionFile,
 	};
 }
 
@@ -254,27 +250,6 @@ function resolveDispatchSessionPath(threadsDir: string, item: DispatchItem): str
 	return undefined;
 }
 
-function collectPersistedCurrentParentSessions(
-	threadsDir: string,
-	parentBySession: Record<string, string>,
-	currentParentSessionFile?: string,
-): Map<string, string> {
-	if (!currentParentSessionFile) return new Map<string, string>();
-
-	const resolvedParentSessionFile = path.resolve(currentParentSessionFile);
-	const sessions = new Map<string, string>();
-
-	for (const [childSessionPath, parentSessionPath] of Object.entries(parentBySession)) {
-		if (path.resolve(parentSessionPath) !== resolvedParentSessionFile) continue;
-		if (!isThreadSessionFile(threadsDir, childSessionPath)) continue;
-
-		const resolvedChildSessionPath = path.resolve(childSessionPath);
-		sessions.set(getThreadName(resolvedChildSessionPath), resolvedChildSessionPath);
-	}
-
-	return sessions;
-}
-
 function collectCurrentBranchSessions(threadsDir: string, parentBranchEntries: unknown[]): Map<string, string> {
 	const sessions = new Map<string, string>();
 
@@ -301,25 +276,19 @@ function collectCurrentBranchSessions(threadsDir: string, parentBranchEntries: u
 export function collectSubagentCards(
 	cwd: string,
 	parentBranchEntries: unknown[],
-	currentParentSessionFile?: string,
+	runtimeSessions: ReadonlyMap<string, string> = new Map<string, string>(),
 ): SubagentCard[] {
 	const threadsDir = path.join(cwd, ".pi", "threads");
-	const state = loadThreadsState(cwd);
 	const cards = new Map<string, SubagentCard>();
 
-	for (const [thread, sessionPath] of collectPersistedCurrentParentSessions(
-		threadsDir,
-		state.parentBySession,
-		currentParentSessionFile,
-	)) {
-		const parentSessionFile = state.parentBySession[path.resolve(sessionPath)];
-		const card = summarizeThreadSession(sessionPath, parentSessionFile);
+	for (const [thread, sessionPath] of runtimeSessions) {
+		if (!isThreadSessionFile(threadsDir, sessionPath)) continue;
+		const card = summarizeThreadSession(path.resolve(sessionPath));
 		cards.set(thread, { ...card, thread });
 	}
 
 	for (const [thread, sessionPath] of collectCurrentBranchSessions(threadsDir, parentBranchEntries)) {
-		const parentSessionFile = state.parentBySession[path.resolve(sessionPath)];
-		const card = summarizeThreadSession(sessionPath, parentSessionFile);
+		const card = summarizeThreadSession(sessionPath);
 		cards.set(thread, { ...card, thread });
 	}
 

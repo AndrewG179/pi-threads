@@ -26,7 +26,7 @@ import { PiActorRuntime } from "./src/runtime/pi-actor";
 import { ThreadSupervisor } from "./src/runtime/thread-supervisor";
 import { collectSubagentCards, loadSessionBranchFromFile, type SubagentCard } from "./src/subagents/metadata";
 import { deriveSessionBehavior, resolveActiveToolsForBehavior } from "./src/subagents/mode";
-import { loadThreadsState, rememberParentSession, saveThreadsState } from "./src/subagents/state";
+import { loadThreadsState, saveThreadsState } from "./src/subagents/state";
 import { SubagentBrowser } from "./src/subagents/view";
 import { wrapText } from "./src/text/wrap";
 
@@ -423,9 +423,35 @@ export default function (pi: ExtensionAPI) {
 	let defaultActiveTools: string[] | null = null;
 	let lastSessionSwitchSession: ((sessionPath: string) => Promise<{ cancelled: boolean }>) | null = null;
 	let releaseSubagentBackListener: (() => void) | null = null;
+	const runtimeParentByChildSession = new Map<string, string>();
+	const runtimeChildrenByParentSession = new Map<string, Map<string, string>>();
 
 	const arraysEqual = (left: string[], right: string[]) =>
 		left.length === right.length && left.every((value, index) => value === right[index]);
+
+	const normalizeSessionPath = (sessionPath: string | undefined): string | undefined =>
+		sessionPath ? path.resolve(sessionPath) : undefined;
+
+	const rememberRuntimeSubagent = (parentSessionFile: string, thread: string, childSessionFile: string) => {
+		const resolvedParent = path.resolve(parentSessionFile);
+		const resolvedChild = path.resolve(childSessionFile);
+		runtimeParentByChildSession.set(resolvedChild, resolvedParent);
+
+		const currentChildren = runtimeChildrenByParentSession.get(resolvedParent) ?? new Map<string, string>();
+		currentChildren.set(thread, resolvedChild);
+		runtimeChildrenByParentSession.set(resolvedParent, currentChildren);
+	};
+
+	const getRuntimeParentSession = (sessionFile: string | undefined): string | undefined => {
+		const resolvedSession = normalizeSessionPath(sessionFile);
+		return resolvedSession ? runtimeParentByChildSession.get(resolvedSession) : undefined;
+	};
+
+	const getRuntimeSessionsForParent = (parentSessionFile: string | undefined): Map<string, string> => {
+		const resolvedParent = normalizeSessionPath(parentSessionFile);
+		if (!resolvedParent) return new Map<string, string>();
+		return new Map(runtimeChildrenByParentSession.get(resolvedParent) ?? []);
+	};
 
 	const rebuildEpisodeCounts = (sessionManager: { getBranch(): Array<{ type: string; message: { role: string; toolName?: string; details?: unknown } }> }) => {
 		episodeCounts.clear();
@@ -448,22 +474,28 @@ export default function (pi: ExtensionAPI) {
 		sessionManager: { getSessionFile(): string | undefined };
 	}) => {
 		const state = loadThreadsState(ctx.cwd);
+		const sessionFile = normalizeSessionPath(ctx.sessionManager.getSessionFile());
 		const behavior = deriveSessionBehavior({
 			cwd: ctx.cwd,
-			sessionFile: ctx.sessionManager.getSessionFile(),
+			sessionFile,
 			state,
 		});
-		return { state, behavior };
+		const runtimeParentSessionFile = behavior.kind === "subagent" ? getRuntimeParentSession(sessionFile) : undefined;
+		return { state, behavior, sessionFile, runtimeParentSessionFile };
 	};
 
-	const renderSubagentBanner = (ctx: { ui: { theme: any; setWidget: (key: string, content: unknown, options?: unknown) => void } }, behavior: ReturnType<typeof deriveSessionBehavior>) => {
+	const renderSubagentBanner = (
+		ctx: { ui: { theme: any; setWidget: (key: string, content: unknown, options?: unknown) => void } },
+		behavior: ReturnType<typeof deriveSessionBehavior>,
+		runtimeParentSessionFile?: string,
+	) => {
 		if (behavior.kind !== "subagent") {
 			ctx.ui.setWidget("pi-threads-subagent-banner", undefined);
 			return;
 		}
 
-		const parentLabel = behavior.parentSessionFile ? path.basename(behavior.parentSessionFile) : "unknown";
-		const navigationHint = behavior.parentSessionFile
+		const parentLabel = runtimeParentSessionFile ? path.basename(runtimeParentSessionFile) : "current runtime only";
+		const navigationHint = runtimeParentSessionFile
 			? "Ctrl+B or /subagents-back to return · /subagents to switch threads"
 			: "/subagents to switch threads";
 		ctx.ui.setWidget(
@@ -487,7 +519,7 @@ export default function (pi: ExtensionAPI) {
 			setWidget: (key: string, content: unknown, options?: unknown) => void;
 		};
 	}) => {
-		const { state, behavior } = resolveSessionContext(ctx);
+		const { behavior, runtimeParentSessionFile } = resolveSessionContext(ctx);
 		const currentActiveTools = pi.getActiveTools().filter((tool) => tool !== "dispatch");
 		const allToolNames = pi.getAllTools().map((tool) => tool.name);
 
@@ -511,7 +543,7 @@ export default function (pi: ExtensionAPI) {
 
 		releaseSubagentBackListener?.();
 		releaseSubagentBackListener = null;
-		if (behavior.kind === "subagent" && behavior.parentSessionFile && ctx.hasUI && typeof ctx.ui.onTerminalInput === "function") {
+		if (behavior.kind === "subagent" && runtimeParentSessionFile && ctx.hasUI && typeof ctx.ui.onTerminalInput === "function") {
 			releaseSubagentBackListener = ctx.ui.onTerminalInput((data) => {
 				if (data !== CTRL_B_INPUT) return undefined;
 				return { data: "/subagents-back\n" };
@@ -526,7 +558,7 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.setStatus("pi-threads", undefined);
 		}
 
-		renderSubagentBanner(ctx, behavior);
+		renderSubagentBanner(ctx, behavior, runtimeParentSessionFile);
 		rebuildEpisodeCounts(ctx.sessionManager);
 		return behavior;
 	};
@@ -546,8 +578,8 @@ export default function (pi: ExtensionAPI) {
 		ui: { notify: (message: string, level?: string) => void };
 		switchSession?: (sessionPath: string) => Promise<{ cancelled: boolean }>;
 	}) => {
-		const { behavior } = resolveSessionContext(ctx);
-		if (behavior.kind !== "subagent" || !behavior.parentSessionFile) {
+		const { behavior, runtimeParentSessionFile } = resolveSessionContext(ctx);
+		if (behavior.kind !== "subagent" || !runtimeParentSessionFile) {
 			ctx.ui.notify("No remembered parent session for this thread.", "warning");
 			return;
 		}
@@ -558,7 +590,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		await switchSession(behavior.parentSessionFile);
+		await switchSession(runtimeParentSessionFile);
 	};
 
 	const openSubagentsBrowser = async (ctx: {
@@ -583,17 +615,17 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		const { state, behavior } = resolveSessionContext(ctx);
-		const parentSessionFile = behavior.parentSessionFile ?? behavior.sessionFile;
+		const { behavior, sessionFile, runtimeParentSessionFile } = resolveSessionContext(ctx);
+		const parentSessionFile = behavior.kind === "subagent" ? runtimeParentSessionFile : sessionFile;
 		if (!parentSessionFile) {
 			ctx.ui.notify("Current session is not persisted, so parent navigation cannot be remembered.", "warning");
 			return;
 		}
 
-		const parentEntries = behavior.parentSessionFile
-			? loadSessionBranchFromFile(behavior.parentSessionFile)
+		const parentEntries = behavior.kind === "subagent" && runtimeParentSessionFile
+			? loadSessionBranchFromFile(runtimeParentSessionFile)
 			: ctx.sessionManager.getBranch();
-		const cards = collectSubagentCards(ctx.cwd, parentEntries, parentSessionFile);
+		const cards = collectSubagentCards(ctx.cwd, parentEntries, getRuntimeSessionsForParent(parentSessionFile));
 		const selected = await ctx.ui.custom<SubagentCard | undefined>(
 			(tui, theme, keybindings, done) => new SubagentBrowser(cards, tui, theme, keybindings, done),
 			{
@@ -618,8 +650,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		const nextState = rememberParentSession(state, selected.sessionPath, parentSessionFile);
-		saveThreadsState(ctx.cwd, nextState);
+		rememberRuntimeSubagent(parentSessionFile, selected.thread, selected.sessionPath);
 		await switchSession(selected.sessionPath);
 	};
 
@@ -733,9 +764,9 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 			const sessionContext = resolveSessionContext(ctx);
-			let threadsState = sessionContext.state;
-			const dispatchBehavior = sessionContext.behavior;
-			const rememberedParentSession = dispatchBehavior.parentSessionFile ?? dispatchBehavior.sessionFile;
+			const rememberedParentSession = sessionContext.behavior.kind === "subagent"
+				? sessionContext.runtimeParentSessionFile
+				: sessionContext.sessionFile;
 			const taskList = params.tasks?.length
 				? params.tasks
 				: params.thread && params.action
@@ -768,9 +799,8 @@ export default function (pi: ExtensionAPI) {
 				for (const task of taskList) {
 					const sessionPath = taskSessionPaths.get(task.thread);
 					if (!sessionPath) continue;
-					threadsState = rememberParentSession(threadsState, sessionPath, rememberedParentSession);
+					rememberRuntimeSubagent(rememberedParentSession, task.thread, sessionPath);
 				}
-				saveThreadsState(ctx.cwd, threadsState);
 			}
 
 			const runOne = async (task: { thread: string; action: string }, index: number): Promise<SingleDispatchResult> => {

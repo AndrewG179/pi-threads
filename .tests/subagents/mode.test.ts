@@ -16,12 +16,11 @@ test("deriveSessionBehavior keeps normal sessions normal when thread mode is off
 	const behavior = deriveSessionBehavior({
 		cwd,
 		sessionFile,
-		state: { enabled: false, parentBySession: {} },
+		state: { enabled: false },
 	});
 
 	assert.equal(behavior.kind, "normal");
 	assert.equal(behavior.shouldAppendOrchestratorPrompt, false);
-	assert.equal(behavior.parentSessionFile, undefined);
 });
 
 test("deriveSessionBehavior treats enabled non-thread sessions as orchestrators", () => {
@@ -31,33 +30,26 @@ test("deriveSessionBehavior treats enabled non-thread sessions as orchestrators"
 	const behavior = deriveSessionBehavior({
 		cwd,
 		sessionFile,
-		state: { enabled: true, parentBySession: {} },
+		state: { enabled: true },
 	});
 
 	assert.equal(behavior.kind, "orchestrator");
 	assert.equal(behavior.shouldAppendOrchestratorPrompt, true);
-	assert.equal(behavior.parentSessionFile, undefined);
 });
 
-test("deriveSessionBehavior keeps thread sessions normal and remembers their parent", () => {
+test("deriveSessionBehavior treats thread sessions as subagents by path alone", () => {
 	const cwd = "/tmp/pi-threads-subagent";
 	const sessionFile = path.join(cwd, ".pi", "threads", "worker.jsonl");
-	const parentSession = path.join(cwd, ".pi", "sessions", "parent.jsonl");
 
 	const behavior = deriveSessionBehavior({
 		cwd,
 		sessionFile,
-		state: {
-			enabled: true,
-			parentBySession: {
-				[sessionFile]: parentSession,
-			},
-		},
+		state: { enabled: true },
 	});
 
 	assert.equal(behavior.kind, "subagent");
 	assert.equal(behavior.shouldAppendOrchestratorPrompt, false);
-	assert.equal(behavior.parentSessionFile, parentSession);
+	assert.equal(behavior.threadName, "worker");
 });
 
 test("resolveActiveToolsForBehavior strips built-in file/shell tools only in orchestrator mode", () => {

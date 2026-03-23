@@ -9,7 +9,6 @@ export interface SessionBehavior {
 	sessionFile?: string;
 	threadName?: string;
 	shouldAppendOrchestratorPrompt: boolean;
-	parentSessionFile?: string;
 }
 
 export interface DeriveSessionBehaviorInput {
@@ -39,7 +38,6 @@ function extractToolName(tool: string | { name: string }): string {
 export function deriveSessionBehavior(input: DeriveSessionBehaviorInput): SessionBehavior {
 	const sessionFile = input.sessionFile ? normalizeSessionPath(input.sessionFile) : undefined;
 	const threadsDir = path.join(input.cwd, ".pi", "threads");
-	const parentSessionFile = sessionFile ? input.state.parentBySession[sessionFile] : undefined;
 	const isThreadSession = isSessionUnderDir(sessionFile, threadsDir);
 
 	if (isThreadSession) {
@@ -48,7 +46,6 @@ export function deriveSessionBehavior(input: DeriveSessionBehaviorInput): Sessio
 			sessionFile,
 			threadName: sessionFile ? path.basename(sessionFile, ".jsonl") : undefined,
 			shouldAppendOrchestratorPrompt: false,
-			parentSessionFile,
 		};
 	}
 

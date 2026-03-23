@@ -61,10 +61,18 @@ function makeFakePi() {
 	};
 }
 
-test("dispatch should remember the parent session for spawned thread sessions", async () => {
+function writeThreadSession(filePath: string, lines: unknown[]): void {
+	fs.mkdirSync(path.dirname(filePath), { recursive: true });
+	fs.writeFileSync(
+		filePath,
+		lines.map((line) => JSON.stringify(line)).join("\n") + "\n",
+		"utf8",
+	);
+}
+
+test("dispatch should not persist parent linkage in state.json", async () => {
 	const projectDir = makeTempProject();
 	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
-	const threadSession = path.join(projectDir, ".pi", "threads", "smoke-fast.jsonl");
 
 	try {
 		fs.mkdirSync(path.dirname(parentSession), { recursive: true });
@@ -111,9 +119,7 @@ test("dispatch should remember the parent session for spawned thread sessions", 
 				{
 					cwd: projectDir,
 					hasUI: true,
-					ui: {
-						notify: () => {},
-					},
+					ui: { notify: () => {} },
 					sessionManager: {
 						getSessionFile: () => parentSession,
 						getBranch: () => [],
@@ -125,163 +131,164 @@ test("dispatch should remember the parent session for spawned thread sessions", 
 			ThreadSupervisor.prototype.invoke = originalInvoke;
 		}
 
-		const statePath = path.join(projectDir, ".pi", "threads", "state.json");
-		const state = loadThreadsState(projectDir);
-		assert.equal(fs.existsSync(statePath), true);
-		assert.deepEqual(state.parentBySession[threadSession], parentSession);
+		assert.deepEqual(loadThreadsState(projectDir), { enabled: false });
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });
 	}
 });
 
-test("/subagents-back should work from a plain command ExtensionContext shape", async () => {
+test("/subagents should establish runtime-only back navigation for the opened subagent", async () => {
 	const projectDir = makeTempProject();
 	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
-	const threadSession = path.join(projectDir, ".pi", "threads", "smoke-fast.jsonl");
+	const alphaSession = path.join(projectDir, ".pi", "threads", "alpha.jsonl");
 
 	try {
-		fs.mkdirSync(path.dirname(parentSession), { recursive: true });
-		fs.writeFileSync(parentSession, "{\"type\":\"session\"}\n", "utf8");
-		fs.mkdirSync(path.dirname(threadSession), { recursive: true });
-		fs.writeFileSync(threadSession, "{\"type\":\"session\"}\n", "utf8");
-		fs.mkdirSync(path.join(projectDir, ".pi", "threads"), { recursive: true });
-		fs.writeFileSync(
-			path.join(projectDir, ".pi", "threads", "state.json"),
-			JSON.stringify(
-				{
-					enabled: true,
-					parentBySession: {
-						[path.resolve(threadSession)]: path.resolve(parentSession),
-					},
+		writeThreadSession(parentSession, [{ type: "session", version: 3, cwd: projectDir }]);
+		writeThreadSession(alphaSession, [
+			{ type: "session", version: 3, cwd: projectDir },
+			{
+				type: "message",
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "Inspect alpha" }],
 				},
-				null,
-				2,
-			) + "\n",
-			"utf8",
-		);
+			},
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "alpha ready" }],
+				},
+			},
+		]);
 
 		const fakePi = makeFakePi();
 		registerExtension(fakePi as any);
 
+		const subagents = fakePi.commands.get("subagents");
 		const backCommand = fakePi.commands.get("subagents-back");
-		assert.ok(backCommand, "/subagents-back command should be registered");
-
-		await assert.doesNotReject(async () => {
-			await backCommand!.handler("", {
-				cwd: projectDir,
-				hasUI: true,
-				ui: { notify: () => {} },
-				sessionManager: {
-					getSessionFile: () => threadSession,
-					getBranch: () => [],
-				},
-				modelRegistry: {},
-				model: undefined,
-				isIdle: () => true,
-				abort: () => {},
-				hasPendingMessages: () => false,
-				shutdown: () => {},
-				getContextUsage: () => undefined,
-				compact: () => {},
-				getSystemPrompt: () => "",
-			} as any);
-		});
-	} finally {
-		fs.rmSync(projectDir, { recursive: true, force: true });
-	}
-});
-
-test("fresh runtime should install restart-safe ctrl+b back navigation for remembered subagent sessions", async () => {
-	const projectDir = makeTempProject();
-	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
-	const threadSession = path.join(projectDir, ".pi", "threads", "smoke-fast.jsonl");
-
-	try {
-		fs.mkdirSync(path.dirname(parentSession), { recursive: true });
-		fs.writeFileSync(parentSession, "{\"type\":\"session\"}\n", "utf8");
-		fs.mkdirSync(path.dirname(threadSession), { recursive: true });
-		fs.writeFileSync(threadSession, "{\"type\":\"session\"}\n", "utf8");
-		fs.mkdirSync(path.join(projectDir, ".pi", "threads"), { recursive: true });
-		fs.writeFileSync(
-			path.join(projectDir, ".pi", "threads", "state.json"),
-			JSON.stringify(
-				{
-					enabled: true,
-					parentBySession: {
-						[path.resolve(threadSession)]: path.resolve(parentSession),
-					},
-				},
-				null,
-				2,
-			) + "\n",
-			"utf8",
-		);
-
-		const fakePi = makeFakePi();
-		registerExtension(fakePi as any);
-
 		const sessionStartHandlers = fakePi.events.get("session_start") ?? [];
-		assert.equal(sessionStartHandlers.length > 0, true, "session_start handler should be registered");
+		assert.ok(subagents, "/subagents should be registered");
+		assert.ok(backCommand, "/subagents-back should be registered");
+		assert.equal(fakePi.shortcuts.get("ctrl+b"), undefined, "ctrl+b should not be registered through the shortcut API");
+
+		const switchedSessions: string[] = [];
+		await subagents!.handler("", {
+			cwd: projectDir,
+			hasUI: true,
+			switchSession: async (sessionPath: string) => {
+				switchedSessions.push(sessionPath);
+				return { cancelled: false };
+			},
+			ui: {
+				notify: () => {},
+				custom: async () => ({
+					thread: "alpha",
+					sessionPath: alphaSession,
+					latestAction: "Inspect alpha",
+					outputPreview: "alpha ready",
+					toolPreview: "",
+					accumulatedCost: 0.02,
+					status: "done",
+				}),
+			},
+			sessionManager: {
+				getSessionFile: () => parentSession,
+				getBranch: () => [{
+					type: "message",
+					message: {
+						role: "toolResult",
+						toolName: "dispatch",
+						details: {
+							mode: "single",
+							items: [{
+								thread: "alpha",
+								action: "Inspect alpha",
+								episode: "alpha ready",
+								episodeNumber: 1,
+								result: {
+									exitCode: 0,
+									stderr: "",
+									messages: [{ role: "assistant", content: [{ type: "text", text: "alpha ready" }] }],
+									usage: {
+										input: 12,
+										output: 8,
+										cacheRead: 0,
+										cacheWrite: 0,
+										cost: 0.02,
+										contextTokens: 20,
+										turns: 1,
+									},
+									sessionPath: alphaSession,
+									isNewThread: false,
+								},
+							}],
+						},
+					},
+				}],
+			},
+		} as any);
+
+		assert.deepEqual(switchedSessions, [alphaSession]);
 
 		let terminalInputHandler: ((data: string) => { consume?: boolean; data?: string } | undefined) | undefined;
-		const ui = {
-			notify: () => {},
-			setStatus: () => {},
-			setWidget: () => {},
-			theme: {
-				fg: (_color: string, text: string) => text,
-			},
-			onTerminalInput(handler: (data: string) => { consume?: boolean; data?: string } | undefined) {
-				terminalInputHandler = handler;
-				return () => {
-					if (terminalInputHandler === handler) {
-						terminalInputHandler = undefined;
-					}
-				};
-			},
-		};
-
 		for (const handler of sessionStartHandlers) {
 			await handler({}, {
 				cwd: projectDir,
 				hasUI: true,
-				ui,
+				ui: {
+					notify: () => {},
+					setStatus: () => {},
+					setWidget: () => {},
+					theme: {
+						fg: (_color: string, text: string) => text,
+					},
+					onTerminalInput(handlerFn: (data: string) => { consume?: boolean; data?: string } | undefined) {
+						terminalInputHandler = handlerFn;
+						return () => {
+							if (terminalInputHandler === handlerFn) {
+								terminalInputHandler = undefined;
+							}
+						};
+					},
+				},
 				sessionManager: {
-					getSessionFile: () => threadSession,
+					getSessionFile: () => alphaSession,
 					getBranch: () => [],
 				},
 			} as any);
 		}
 
-		assert.ok(
-			terminalInputHandler,
-			"fresh runtimes should install a restart-safe terminal-input back-navigation path",
-		);
+		assert.ok(terminalInputHandler, "opening a subagent through /subagents should enable runtime ctrl+b back navigation");
 		assert.deepEqual(terminalInputHandler!("\u0002"), { data: "/subagents-back\n" });
+
+		await backCommand!.handler("", {
+			cwd: projectDir,
+			hasUI: true,
+			switchSession: async (sessionPath: string) => {
+				switchedSessions.push(sessionPath);
+				return { cancelled: false };
+			},
+			ui: { notify: () => {} },
+			sessionManager: {
+				getSessionFile: () => alphaSession,
+				getBranch: () => [],
+			},
+		} as any);
+
+		assert.deepEqual(switchedSessions, [alphaSession, parentSession]);
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });
 	}
 });
 
-test("subagent sessions without remembered parents should not install a ctrl+b terminal rewrite", async () => {
+test("fresh runtime in a thread session should not install ctrl+b back navigation without runtime parent context", async () => {
 	const projectDir = makeTempProject();
 	const threadSession = path.join(projectDir, ".pi", "threads", "orphan.jsonl");
 
 	try {
 		fs.mkdirSync(path.dirname(threadSession), { recursive: true });
 		fs.writeFileSync(threadSession, "{\"type\":\"session\"}\n", "utf8");
-		fs.writeFileSync(
-			path.join(projectDir, ".pi", "threads", "state.json"),
-			JSON.stringify(
-				{
-					enabled: true,
-					parentBySession: {},
-				},
-				null,
-				2,
-			) + "\n",
-			"utf8",
-		);
 
 		const fakePi = makeFakePi();
 		registerExtension(fakePi as any);
@@ -322,102 +329,11 @@ test("subagent sessions without remembered parents should not install a ctrl+b t
 			} as any);
 		}
 
-		assert.equal(
-			terminalInputHandler,
-			undefined,
-			"subagent sessions without remembered parents should not advertise an unusable terminal-input ctrl+b path",
-		);
+		assert.equal(terminalInputHandler, undefined);
 		assert.deepEqual(widgets.get("pi-threads-subagent-banner"), [
-			"Subagent [orphan]  parent unknown",
+			"Subagent [orphan]  parent current runtime only",
 			"/subagents to switch threads",
 		]);
-	} finally {
-		fs.rmSync(projectDir, { recursive: true, force: true });
-	}
-});
-
-test("BR-010 should route back navigation through /subagents-back only", async () => {
-	const projectDir = makeTempProject();
-	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
-	const threadSession = path.join(projectDir, ".pi", "threads", "child.jsonl");
-
-	try {
-		fs.mkdirSync(path.dirname(parentSession), { recursive: true });
-		fs.writeFileSync(parentSession, "{\"type\":\"session\"}\n", "utf8");
-		fs.mkdirSync(path.dirname(threadSession), { recursive: true });
-		fs.writeFileSync(threadSession, "{\"type\":\"session\"}\n", "utf8");
-		fs.writeFileSync(
-			path.join(projectDir, ".pi", "threads", "state.json"),
-			JSON.stringify(
-				{
-					enabled: true,
-					parentBySession: {
-						[path.resolve(threadSession)]: path.resolve(parentSession),
-					},
-				},
-				null,
-				2,
-			) + "\n",
-			"utf8",
-		);
-
-		const fakePi = makeFakePi();
-		registerExtension(fakePi as any);
-
-		const sessionStartHandlers = fakePi.events.get("session_start") ?? [];
-		const backCommand = fakePi.commands.get("subagents-back");
-		assert.ok(backCommand, "/subagents-back command should be registered");
-		assert.equal(fakePi.shortcuts.get("ctrl+b"), undefined, "ctrl+b should not be registered twice through the shortcut API");
-
-		const notifications: Array<{ message: string; level?: string }> = [];
-		let terminalInputHandler: ((data: string) => { consume?: boolean; data?: string } | undefined) | undefined;
-		const ctx = {
-			cwd: projectDir,
-			hasUI: true,
-			ui: {
-				notify: (message: string, level?: string) => {
-					notifications.push({ message, level });
-				},
-				setStatus: () => {},
-				setWidget: () => {},
-				theme: {
-					fg: (_color: string, text: string) => text,
-				},
-				onTerminalInput(handler: (data: string) => { consume?: boolean; data?: string } | undefined) {
-					terminalInputHandler = handler;
-					return () => {
-						if (terminalInputHandler === handler) {
-							terminalInputHandler = undefined;
-						}
-					};
-				},
-			},
-			sessionManager: {
-				getSessionFile: () => threadSession,
-				getBranch: () => [],
-			},
-			switchSession: async () => ({ cancelled: false }),
-			modelRegistry: {},
-			model: undefined,
-			isIdle: () => true,
-			abort: () => {},
-			hasPendingMessages: () => false,
-			shutdown: () => {},
-			getContextUsage: () => undefined,
-			compact: () => {},
-			getSystemPrompt: () => "",
-		};
-
-		for (const handler of sessionStartHandlers) {
-			await handler({}, ctx as any);
-		}
-
-		assert.ok(terminalInputHandler, "remembered subagent sessions should still install the terminal ctrl+b rewrite");
-		assert.deepEqual(terminalInputHandler!("\u0002"), { data: "/subagents-back\n" });
-		await assert.doesNotReject(async () => {
-			await backCommand.handler("", ctx as any);
-		});
-		assert.deepEqual(notifications, []);
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });
 	}

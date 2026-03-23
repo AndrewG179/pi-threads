@@ -17,7 +17,7 @@ function writeThreadsState(cwd: string, enabled: boolean): void {
 	fs.mkdirSync(path.dirname(statePath), { recursive: true });
 	fs.writeFileSync(
 		statePath,
-		JSON.stringify({ enabled, parentBySession: {} }, null, 2) + "\n",
+		JSON.stringify({ enabled }, null, 2) + "\n",
 		"utf8",
 	);
 }

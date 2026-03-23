@@ -183,10 +183,6 @@ export class SubagentBrowser {
 			}
 		}
 
-		if (selected.parentSessionFile && lines.length < height) {
-			lines.push(this.theme.fg("dim", `Parent ${selected.parentSessionFile}`));
-		}
-
 		return finalizePane(lines, width, height);
 	}
 

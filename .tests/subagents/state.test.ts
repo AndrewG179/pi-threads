@@ -6,44 +6,28 @@ import test from "node:test";
 
 import {
 	loadThreadsState,
-	rememberParentSession,
 	saveThreadsState,
 } from "../../src/subagents/state";
 
-test("loadThreadsState defaults to disabled mode with no remembered parents", () => {
+test("loadThreadsState defaults to disabled mode", () => {
 	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-state-default-"));
 
 	try {
-		assert.deepEqual(loadThreadsState(tmpDir), {
-			enabled: false,
-			parentBySession: {},
-		});
+		assert.deepEqual(loadThreadsState(tmpDir), { enabled: false });
 	} finally {
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 	}
 });
 
-test("saveThreadsState persists enabled mode and parent-session mappings", () => {
+test("saveThreadsState persists only enabled mode", () => {
 	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-state-roundtrip-"));
-	const childSession = path.join(tmpDir, ".pi", "threads", "worker.jsonl");
-	const parentSession = path.join(tmpDir, ".pi", "sessions", "parent.jsonl");
 
 	try {
-		const withParent = rememberParentSession(
-			{ enabled: true, parentBySession: {} },
-			childSession,
-			parentSession,
-		);
+		saveThreadsState(tmpDir, { enabled: true });
 
-		saveThreadsState(tmpDir, withParent);
-
-		assert.deepEqual(loadThreadsState(tmpDir), {
-			enabled: true,
-			parentBySession: {
-				[childSession]: parentSession,
-			},
-		});
-		assert.equal(fs.existsSync(path.join(tmpDir, ".pi", "threads", "state.json")), true);
+		assert.deepEqual(loadThreadsState(tmpDir), { enabled: true });
+		const persisted = JSON.parse(fs.readFileSync(path.join(tmpDir, ".pi", "threads", "state.json"), "utf8"));
+		assert.deepEqual(persisted, { enabled: true });
 	} finally {
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 	}

@@ -90,7 +90,6 @@ test("collectSubagentCards combines thread transcript previews with current-pare
 			toolPreview: "$ echo hello",
 			accumulatedCost: 0.25,
 			status: "done",
-			parentSessionFile: undefined,
 		});
 	} finally {
 		fs.rmSync(cwd, { recursive: true, force: true });
@@ -230,7 +229,46 @@ test("collectSubagentCards only includes threads from the current parent branch 
 			toolPreview: "",
 			accumulatedCost: 0.25,
 			status: "done",
-			parentSessionFile: undefined,
+		});
+	} finally {
+		fs.rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+test("collectSubagentCards includes runtime-known in-flight sessions for the current parent context", () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-runtime-parent-"));
+	const alphaSession = path.join(cwd, ".pi", "threads", "alpha.jsonl");
+
+	try {
+		writeThreadSession(alphaSession, [
+			{ type: "session", version: 3, cwd },
+			{
+				type: "message",
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "Inspect alpha while it is still running" }],
+				},
+			},
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "partial progress" }],
+				},
+			},
+		]);
+
+		const cards = collectSubagentCards(cwd, [], new Map([["alpha", alphaSession]]));
+
+		assert.equal(cards.length, 1);
+		assert.deepEqual(cards[0], {
+			thread: "alpha",
+			sessionPath: alphaSession,
+			latestAction: "Inspect alpha while it is still running",
+			outputPreview: "partial progress",
+			toolPreview: "",
+			accumulatedCost: 0,
+			status: "unknown",
 		});
 	} finally {
 		fs.rmSync(cwd, { recursive: true, force: true });

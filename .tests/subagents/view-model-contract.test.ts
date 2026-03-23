@@ -7,6 +7,7 @@ import test from "node:test";
 import { Container, Text } from "@mariozechner/pi-tui";
 
 import { default as registerExtension } from "../../index";
+import { ThreadSupervisor } from "../../src/runtime/thread-supervisor";
 
 type RegisteredTool = {
 	name: string;
@@ -209,7 +210,7 @@ test("/subagents should open an independent custom view instead of a modal overl
 	}
 });
 
-test("/subagents should list a persisted current-context thread even before the parent branch records a completed dispatch toolResult", async () => {
+test("/subagents should list a just-dispatched in-flight thread from same-runtime registry data before a completed toolResult exists", async () => {
 	const projectDir = makeTempProject();
 	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
 	const alphaSession = path.join(projectDir, ".pi", "threads", "alpha.jsonl");
@@ -233,68 +234,94 @@ test("/subagents should list a persisted current-context thread even before the 
 				},
 			},
 		]);
-		fs.mkdirSync(path.join(projectDir, ".pi", "threads"), { recursive: true });
-		fs.writeFileSync(
-			path.join(projectDir, ".pi", "threads", "state.json"),
-			JSON.stringify(
-				{
-					enabled: true,
-					parentBySession: {
-						[path.resolve(alphaSession)]: path.resolve(parentSession),
-					},
-				},
-				null,
-				2,
-			) + "\n",
-			"utf8",
-		);
-
 		const fakePi = makeFakePi();
 		registerExtension(fakePi as any);
 
+		const dispatch = fakePi.tools.get("dispatch");
 		const subagents = fakePi.commands.get("subagents");
+		assert.ok(dispatch, "dispatch should be registered");
 		assert.ok(subagents, "/subagents should be registered");
 
 		let customRenderer: ((...args: any[]) => unknown) | undefined;
+		let resolveRun: ((value: unknown) => void) | undefined;
+		const originalInvoke = ThreadSupervisor.prototype.invoke;
+		ThreadSupervisor.prototype.invoke = function () {
+			return {
+				runId: "run-1",
+				thread: "alpha",
+				result: new Promise((resolve) => {
+					resolveRun = resolve;
+				}),
+				cancel: async () => {},
+				subscribe: () => () => {},
+				getSnapshot: () => ({
+					runId: "run-1",
+					thread: "alpha",
+					pid: undefined,
+					startedAt: Date.now(),
+					state: { tag: "running" },
+				}),
+			} as any;
+		};
 
-		await subagents!.handler("", {
-			cwd: projectDir,
-			hasUI: true,
-			switchSession: async () => ({ cancelled: false }),
-			ui: {
-				notify: () => {},
-				custom: async (renderer: (...args: any[]) => unknown) => {
-					customRenderer = renderer;
-					return undefined;
+		const execution = dispatch!.execute(
+			"tool-call-1",
+			{ thread: "alpha", action: "Inspect alpha while it is still running" },
+			undefined,
+			undefined,
+			{
+				cwd: projectDir,
+				hasUI: true,
+				ui: { notify: () => {} },
+				sessionManager: {
+					getSessionFile: () => parentSession,
+					getBranch: () => [],
 				},
-			},
-			sessionManager: {
-				getSessionFile: () => parentSession,
-				getBranch: () => [{
-					type: "message",
-					message: {
-						role: "assistant",
-						content: [{
-							type: "toolCall",
-							name: "dispatch",
-							arguments: {
-								thread: "alpha",
-								action: "Inspect alpha while it is still running",
-							},
-						}],
-					},
-				}],
-			},
-		} as any);
-
-		assert.ok(customRenderer, "/subagents should invoke ctx.ui.custom()");
-
-		const rendered = flattenRenderedLines(customRenderer!(undefined, makeTheme(), undefined, () => {}), 80).join("\n");
-		assert.match(
-			rendered,
-			/\[alpha\]/,
-			"known persisted subagent sessions for the current parent context should remain visible before a completed dispatch toolResult is written",
+				model: { provider: "openai-codex", id: "gpt-5.4" },
+			} as any,
 		);
+
+		try {
+			await Promise.resolve();
+
+			await subagents!.handler("", {
+				cwd: projectDir,
+				hasUI: true,
+				switchSession: async () => ({ cancelled: false }),
+				ui: {
+					notify: () => {},
+					custom: async (renderer: (...args: any[]) => unknown) => {
+						customRenderer = renderer;
+						return undefined;
+					},
+				},
+				sessionManager: {
+					getSessionFile: () => parentSession,
+					getBranch: () => [],
+				},
+			} as any);
+
+			assert.ok(customRenderer, "/subagents should invoke ctx.ui.custom()");
+
+			const rendered = flattenRenderedLines(customRenderer!(undefined, makeTheme(), undefined, () => {}), 80).join("\n");
+			assert.match(
+				rendered,
+				/\[alpha\]/,
+				"a same-runtime in-flight dispatch should remain visible in /subagents before a completed toolResult is written",
+			);
+		} finally {
+			resolveRun?.({
+				runId: "run-1",
+				thread: "alpha",
+				finalState: { tag: "exited", exitCode: 0, signal: null },
+				messages: [],
+				stderr: "",
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+				model: "openai-codex/gpt-5.4",
+			});
+			await execution;
+			ThreadSupervisor.prototype.invoke = originalInvoke;
+		}
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });
 	}

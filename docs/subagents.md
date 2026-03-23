@@ -22,10 +22,17 @@ When thread mode is **off**:
 - the session behaves like a normal pi session
 
 The on/off state is stored per-project in `.pi/threads/state.json`.
+That file is only for thread mode enablement; it does not persist parent/subagent navigation relationships.
 
 ## `/subagents`
 
-`/subagents` opens an interactive selector overlay that lists known thread sessions from `.pi/threads/*.jsonl`.
+`/subagents` opens an interactive selector overlay for the current parent context.
+
+The browser lists subagents known to the current parent session:
+- completed `dispatch` records already present in the current parent branch
+- in-flight subagents registered by the current runtime before a completed `toolResult` is written
+
+Thread `.jsonl` files are used to summarize the selected subagent, but they are not the canonical source of parent/session relationships.
 
 The selector should show a compact card per subagent with the information this extension actually has:
 - subagent/thread name
@@ -44,11 +51,13 @@ Keyboard behavior:
 
 Opening a subagent switches the current pi session to that thread session file.
 
-Once opened, the subagent is just a **normal pi chat session**. The only extra UI is a small banner that says it is a subagent session and shows the remembered parent session.
+Once opened, the subagent is just a **normal pi chat session**. The only extra UI is a small banner that says it is a subagent session and shows the current-runtime parent when one is known.
 
 While inside a subagent session:
-- `Ctrl+B` should return to the remembered parent session
-- `/subagents-back` should also return to the remembered parent session
+- `Ctrl+B` should return to the parent session when that parent was established in the current runtime
+- `/subagents-back` should also return to that current-runtime parent session
 - `/subagents` can be used again to jump to another subagent
 
 Returning to the parent restores the parent chat session rather than opening a copy.
+
+If a thread session is opened directly in a fresh runtime, there is no persisted remembered parent. In that case the session is still treated as a subagent by path, but back-navigation is unavailable until the thread is opened from a parent context in the current runtime.
