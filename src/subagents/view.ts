@@ -16,102 +16,43 @@ type TuiLike = {
 const WIDE_LAYOUT_MIN_WIDTH = 56;
 const MIN_BROWSER_ROWS = 18;
 const SESSION_CARD_ROWS = 2;
+const EMPTY_SESSION = "No subagent runs in this session.";
 const EMPTY_ACTION = "(no action)";
 const EMPTY_OUTPUT = "(no output yet)";
 const EMPTY_TOOL = "(no recent tool calls)";
-const EMPTY_SESSION_MESSAGE = "No subagent runs in this session.";
 
 function formatCost(cost: number): string {
 	if (cost <= 0) return "$0";
-	if (cost < 0.01) return `$${cost.toFixed(4)}`;
-	return `$${cost.toFixed(2)}`;
+	return cost < 0.01 ? `$${cost.toFixed(4)}` : `$${cost.toFixed(2)}`;
 }
 
 function formatStatus(status: SubagentCard["status"]): string {
-	switch (status) {
-		case "done":
-			return "Done";
-		case "escalated":
-			return "Escalated";
-		case "aborted":
-			return "Aborted";
-		default:
-			return "Unknown";
-	}
+	return status === "done" ? "Done" : status === "escalated" ? "Escalated" : status === "aborted" ? "Aborted" : "Unknown";
 }
 
-function padToWidth(input: string, width: number): string {
+function pad(input: string, width: number): string {
 	const clipped = truncateToWidth(input, width);
-	const padding = Math.max(0, width - visibleWidth(clipped));
-	return clipped + " ".repeat(padding);
+	return clipped + " ".repeat(Math.max(0, width - visibleWidth(clipped)));
 }
 
-function combineColumns(leftLines: string[], rightLines: string[], leftWidth: number, rightWidth: number, rows: number): string[] {
-	const lines: string[] = [];
-	for (let i = 0; i < rows; i++) {
-		const left = padToWidth(leftLines[i] ?? "", leftWidth);
-		const right = padToWidth(rightLines[i] ?? "", rightWidth);
-		lines.push(`${left} | ${right}`);
-	}
-	return lines;
+function frame(lines: string[], width: number, height: number): string[] {
+	const filled = lines.slice(0, height);
+	while (filled.length < height) filled.push("");
+	return filled.map((line) => truncateToWidth(pad(line, width), width));
 }
 
-function clampWrapped(text: string, width: number, maxLines: number): string[] {
-	return wrapText(text || "(none)", Math.max(12, width), { minWidth: 12 }).slice(0, maxLines);
+function wrapLines(text: string, width: number, maxLines: number, fallback = "(none)"): string[] {
+	return wrapText(text || fallback, Math.max(12, width), { minWidth: 12 }).slice(0, maxLines);
 }
 
-function formatCardHeader(card: SubagentCard, selected: boolean, theme: any): string {
-	const marker = selected ? ">" : " ";
-	return `${marker} ${theme.fg("accent", `[${card.thread}]`)} ${theme.fg("dim", `${formatStatus(card.status)} ${formatCost(card.accumulatedCost)}`)}`;
+function highlight(theme: any, line: string, selected: boolean, width: number): string {
+	const padded = pad(line, width);
+	return selected && typeof theme.bg === "function" ? theme.bg("selectedBg", padded) : padded;
 }
 
-function finalizePane(lines: string[], width: number, height: number): string[] {
-	const output = lines.slice(0, height).map((line) => padToWidth(line, width));
-	while (output.length < height) {
-		output.push(" ".repeat(width));
-	}
-	return output;
-}
-
-function renderFrame(lines: string[], width: number, height: number): string[] {
-	return finalizePane(lines, width, height).map((line) => truncateToWidth(line, width));
-}
-
-function getWindowStart(total: number, capacity: number, selectedIndex: number): number {
-	if (total <= capacity) return 0;
-	const maxStart = Math.max(0, total - capacity);
-	const centered = selectedIndex - Math.floor(capacity / 2);
-	return Math.max(0, Math.min(centered, maxStart));
-}
-
-function maybeHighlight(theme: any, line: string, selected: boolean): string {
-	if (!selected || typeof theme.bg !== "function") return line;
-	return theme.bg("selectedBg", line);
-}
-
-function formatSelectedHeader(card: SubagentCard, title: string, theme: any): string {
-	return `${theme.fg("accent", title)} ${theme.fg("dim", `${formatStatus(card.status)} ${formatCost(card.accumulatedCost)}`)}`;
-}
-
-function appendSection(params: {
-	lines: string[];
-	height: number;
-	theme: any;
-	width: number;
-	label: string;
-	entries: readonly string[];
-	color: string;
-	maxLines: number;
-}): void {
-	const { lines, height, theme, width, label, entries, color, maxLines } = params;
-	if (lines.length >= height) return;
-	lines.push(theme.fg("muted", label));
-	for (const entry of entries) {
-		for (const line of clampWrapped(entry, width, maxLines)) {
-			if (lines.length >= height) return;
-			lines.push(theme.fg(color, line));
-		}
-	}
+function headerLine(card: SubagentCard, theme: any, selected = false, title = `[${card.thread}]`): string {
+	const prefix = selected ? "> " : "";
+	return `${prefix}${theme.fg("accent", title)} ${theme.fg("dim", `${formatStatus(card.status)} ${formatCost(card.accumulatedCost)}`)}`;
 }
 
 export class SubagentBrowser {
@@ -129,189 +70,126 @@ export class SubagentBrowser {
 	handleInput(keyData: string): void {
 		const kb = this.keybindings;
 		if (!kb) return;
-		const cards = this.getCurrentCards();
+		const cards = this.cards();
 		if (kb.matches(keyData, "tui.select.cancel")) {
-			if (this.mode === "inspector") {
-				this.mode = "browser";
-				return;
-			}
-			this.done(undefined);
+			if (this.mode === "inspector") this.mode = "browser";
+			else this.done(undefined);
 			return;
 		}
-		if (this.mode === "inspector") {
-			return;
-		}
+		if (this.mode === "inspector") return;
 		if (kb.matches(keyData, "tui.select.up")) {
-			if (cards.length === 0) return;
-			this.selectedIndex = this.selectedIndex === 0 ? cards.length - 1 : this.selectedIndex - 1;
+			if (cards.length > 0) this.selectedIndex = this.selectedIndex === 0 ? cards.length - 1 : this.selectedIndex - 1;
 			return;
 		}
 		if (kb.matches(keyData, "tui.select.down")) {
-			if (cards.length === 0) return;
-			this.selectedIndex = this.selectedIndex === cards.length - 1 ? 0 : this.selectedIndex + 1;
+			if (cards.length > 0) this.selectedIndex = this.selectedIndex === cards.length - 1 ? 0 : this.selectedIndex + 1;
 			return;
 		}
-		if (kb.matches(keyData, "tui.select.confirm")) {
-			this.confirmSelection();
-			return;
+		if (kb.matches(keyData, "tui.select.confirm") && cards.length > 0) {
+			this.mode = "inspector";
 		}
 	}
 
 	invalidate(): void {
-		this.clampSelection(this.getCurrentCards());
+		this.cards();
 	}
 
-	private confirmSelection(): void {
-		const cards = this.getCurrentCards();
-		if (cards.length === 0) return;
-		this.mode = "inspector";
-	}
-
-	private clampSelection(cards: SubagentCard[]): void {
-		if (cards.length === 0) {
-			this.selectedIndex = 0;
-			return;
-		}
-		this.selectedIndex = Math.max(0, Math.min(this.selectedIndex, cards.length - 1));
-	}
-
-	private getCurrentCards(): SubagentCard[] {
+	private cards(): SubagentCard[] {
 		const cards = this.getCards();
-		this.clampSelection(cards);
+		this.selectedIndex = cards.length === 0 ? 0 : Math.max(0, Math.min(this.selectedIndex, cards.length - 1));
 		return cards;
 	}
 
-	private getSelectedCard(cards: SubagentCard[]): SubagentCard | undefined {
-		return cards[this.selectedIndex] ?? cards[0];
-	}
-
-	private getViewportHeight(): number {
+	private height(): number {
 		return Math.max(MIN_BROWSER_ROWS, this.tui?.terminal?.rows ?? 0);
 	}
 
-	private renderSessionsPane(cards: SubagentCard[], width: number, height: number): string[] {
+	private selected(cards: SubagentCard[]): SubagentCard | undefined {
+		return cards[this.selectedIndex] ?? cards[0];
+	}
+
+	private renderSessions(cards: SubagentCard[], width: number, height: number): string[] {
 		const lines = [this.theme.fg("muted", "Sessions")];
+		if (cards.length === 0) return frame([...lines, this.theme.fg("muted", EMPTY_SESSION)], width, height);
 
-		if (cards.length === 0) {
-			lines.push(this.theme.fg("muted", EMPTY_SESSION_MESSAGE));
-			return finalizePane(lines, width, height);
-		}
+		const visible = Math.max(1, Math.floor((height - 1) / SESSION_CARD_ROWS));
+		const maxStart = Math.max(0, cards.length - visible);
+		const start = Math.max(0, Math.min(this.selectedIndex - Math.floor(visible / 2), maxStart));
+		const end = Math.min(cards.length, start + visible);
 
-		const visibleCards = Math.max(1, Math.floor((height - 1) / SESSION_CARD_ROWS));
-		const start = getWindowStart(cards.length, visibleCards, this.selectedIndex);
-		const end = Math.min(cards.length, start + visibleCards);
-
-		for (let index = start; index < end; index++) {
+		for (let index = start; index < end && lines.length < height; index++) {
 			const card = cards[index];
 			const selected = index === this.selectedIndex;
-			lines.push(maybeHighlight(this.theme, padToWidth(formatCardHeader(card, selected, this.theme), width), selected));
+			lines.push(highlight(this.theme, headerLine(card, this.theme, selected), selected, width));
 			if (lines.length >= height) break;
-
-			const preview = clampWrapped(card.latestAction || "(no action)", width - 2, 1)[0] ?? "(no action)";
-			lines.push(maybeHighlight(this.theme, padToWidth(`  ${this.theme.fg("dim", preview)}`, width), selected));
-			if (lines.length >= height) break;
+			lines.push(highlight(this.theme, `  ${this.theme.fg("dim", wrapLines(card.latestAction, width - 2, 1, EMPTY_ACTION)[0] ?? EMPTY_ACTION)}`, selected, width));
 		}
 
-		const hiddenCount = cards.length - end;
-		if (hiddenCount > 0 && lines.length < height) {
-			lines.push(this.theme.fg("dim", `... ${hiddenCount} more`));
+		if (end < cards.length && lines.length < height) {
+			lines.push(this.theme.fg("dim", `... ${cards.length - end} more`));
 		}
-
-		return finalizePane(lines, width, height);
+		return frame(lines, width, height);
 	}
 
-	private renderSelectedPane(cards: SubagentCard[], width: number, height: number, mode: "detail" | "inspector"): string[] {
-		const lines = mode === "detail" ? [this.theme.fg("muted", "Selected")] : [];
-		const selected = this.getSelectedCard(cards);
-		if (!selected) {
-			lines.push(this.theme.fg("muted", EMPTY_SESSION_MESSAGE));
-			return finalizePane(lines, width, height);
-		}
+	private renderSelected(card: SubagentCard | undefined, width: number, height: number, inspector: boolean): string[] {
+		if (!card) return frame([this.theme.fg("muted", EMPTY_SESSION)], width, height);
 
-		if (mode === "inspector") {
-			lines.push(formatSelectedHeader(selected, `Subagent [${selected.thread}]`, this.theme));
-			lines.push(this.theme.fg("dim", selected.sessionPath));
-			lines.push("");
-		} else {
-			lines.push(formatSelectedHeader(selected, `[${selected.thread}]`, this.theme));
-		}
-
+		const output = inspector && card.outputTail.length > 0 ? card.outputTail : [card.outputPreview || EMPTY_OUTPUT];
+		const lines = inspector
+			? [headerLine(card, this.theme, false, `Subagent [${card.thread}]`), this.theme.fg("dim", card.sessionPath), ""]
+			: [this.theme.fg("muted", "Selected"), headerLine(card, this.theme)];
 		const sections = [
-			{ label: "Action", entries: [selected.latestAction || EMPTY_ACTION], color: "text", maxLines: mode === "inspector" ? 3 : 2 },
-			{
-				label: "Output",
-				entries: mode === "inspector" ? (selected.outputTail.length > 0 ? selected.outputTail : [selected.outputPreview || EMPTY_OUTPUT]) : [selected.outputPreview || EMPTY_OUTPUT],
-				color: "text",
-				maxLines: 2,
-			},
-			{ label: "Recent Tool", entries: [selected.toolPreview || EMPTY_TOOL], color: "dim", maxLines: mode === "inspector" ? 2 : 1 },
+			["Action", [card.latestAction || EMPTY_ACTION], "text", inspector ? 3 : 2],
+			["Output", output, "text", 2],
+			["Recent Tool", [card.toolPreview || EMPTY_TOOL], "dim", inspector ? 2 : 1],
 		] as const;
 
-		for (const [index, section] of sections.entries()) {
-			if (mode === "inspector" && index > 0 && lines.length < height) {
-				lines.push("");
+		for (const [index, [label, entries, color, maxLines]] of sections.entries()) {
+			if (inspector && index > 0 && lines.length < height) lines.push("");
+			if (lines.length >= height) break;
+			lines.push(this.theme.fg("muted", label));
+			for (const entry of entries) {
+				for (const line of wrapLines(entry, width, maxLines)) {
+					if (lines.length >= height) break;
+					lines.push(this.theme.fg(color, line));
+				}
 			}
-			appendSection({
-				lines,
-				height,
-				theme: this.theme,
-				width,
-				label: section.label,
-				entries: section.entries,
-				color: section.color,
-				maxLines: section.maxLines,
-			});
+		}
+		return frame(lines, width, height);
+	}
+
+	private renderBrowser(cards: SubagentCard[], width: number, height: number): string[] {
+		const selected = this.selected(cards);
+		if (width < WIDE_LAYOUT_MIN_WIDTH) {
+			const sessionsHeight = Math.max(4, Math.floor((height - 1) * 0.4));
+			return [
+				...this.renderSessions(cards, width, sessionsHeight),
+				"",
+				...this.renderSelected(selected, width, Math.max(4, height - 1 - sessionsHeight), false),
+			];
 		}
 
-		return finalizePane(lines, width, height);
-	}
-
-	private renderWide(cards: SubagentCard[], width: number, height: number): string[] {
-		const innerWidth = Math.max(24, width - 3);
-		const leftWidth = Math.max(24, Math.floor(innerWidth * 0.42));
-		const rightWidth = Math.max(24, innerWidth - leftWidth);
-		return combineColumns(
-			this.renderSessionsPane(cards, leftWidth, height),
-			this.renderSelectedPane(cards, rightWidth, height, "detail"),
-			leftWidth,
-			rightWidth,
-			height,
-		);
-	}
-
-	private renderNarrow(cards: SubagentCard[], width: number, height: number): string[] {
-		const sessionsHeight = Math.max(4, Math.floor((height - 1) * 0.4));
-		const detailHeight = Math.max(4, height - 1 - sessionsHeight);
-		return [
-			...this.renderSessionsPane(cards, width, sessionsHeight),
-			"",
-			...this.renderSelectedPane(cards, width, detailHeight, "detail"),
-		];
+		const leftWidth = Math.max(24, Math.floor((Math.max(24, width - 3)) * 0.42));
+		const rightWidth = Math.max(24, Math.max(24, width - 3) - leftWidth);
+		const left = this.renderSessions(cards, leftWidth, height);
+		const right = this.renderSelected(selected, rightWidth, height, false);
+		return Array.from({ length: height }, (_, index) => `${pad(left[index] ?? "", leftWidth)} | ${pad(right[index] ?? "", rightWidth)}`);
 	}
 
 	render(width: number): string[] {
-		const cards = this.getCurrentCards();
-		const headerLines = [
+		const cards = this.cards();
+		const height = this.height();
+		const header = [
 			this.theme.fg("toolTitle", "Subagents"),
-			this.theme.fg(
-				"dim",
-				this.mode === "inspector"
-					? "Live inspector. Esc back to the browser"
-					: "Current session only. Up/Down browse, Enter inspect, Esc close",
-			),
+			this.theme.fg("dim", this.mode === "inspector" ? "Live inspector. Esc back to the browser" : "Current session only. Up/Down browse, Enter inspect, Esc close"),
 			"",
 		];
-		const viewportHeight = this.getViewportHeight();
-		const bodyHeight = Math.max(6, viewportHeight - headerLines.length);
-
-		const bodyLines = cards.length === 0
-			? [this.theme.fg("muted", EMPTY_SESSION_MESSAGE)]
+		const bodyHeight = Math.max(6, height - header.length);
+		const body = cards.length === 0
+			? [this.theme.fg("muted", EMPTY_SESSION)]
 			: this.mode === "inspector"
-				? this.renderSelectedPane(cards, width, bodyHeight, "inspector")
-				: width >= WIDE_LAYOUT_MIN_WIDTH
-					? this.renderWide(cards, width, bodyHeight)
-					: this.renderNarrow(cards, width, bodyHeight);
-
-		return renderFrame([...headerLines, ...bodyLines], width, viewportHeight);
+				? this.renderSelected(this.selected(cards), width, bodyHeight, true)
+				: this.renderBrowser(cards, width, bodyHeight);
+		return frame([...header, ...body], width, height);
 	}
 }
