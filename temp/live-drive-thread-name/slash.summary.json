@@ -1,0 +1,10 @@
+{
+  "requestedThreadInPrompt": "nested/bugslash-probe",
+  "toolCallThread": "nested/bugslash-probe",
+  "resultThread": "nested/bugslash-probe",
+  "sessionPath": "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/nested_bugslash-probe.jsonl",
+  "isNewThread": true,
+  "exitCode": 0,
+  "stopReason": "stop",
+  "toolResultText": "[nested/bugslash-probe] THREAD RESPONSE:\nESCAPE_OK"
+}

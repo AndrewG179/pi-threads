@@ -1,0 +1,7 @@
+2026-03-23T01:56:52Z starting outer pi process
+2026-03-23T01:56:52Z outer pid 225704 started
+2026-03-23T01:57:04Z observed 3 direct children for outer pid 225704: 225978 225979 225980
+2026-03-23T01:57:04Z sending SIGINT to outer pid 225704
+2026-03-23T01:57:05Z outer pid 225704 exited with status 130
+2026-03-23T01:57:06Z no cleanup kill needed for recorded pids
+2026-03-23T01:57:06Z run complete
