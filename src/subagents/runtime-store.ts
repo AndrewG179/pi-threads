@@ -3,10 +3,12 @@ import type { Message } from "@mariozechner/pi-ai";
 
 import {
 	getThreadSessionPath,
+	normalizeSessionPath,
 	summarizeOutputPreview,
 	summarizeOutputTail,
 	summarizeRecentTool,
 	summarizeToolCall,
+	toSubagentStatus,
 	type SubagentCard,
 	type SubagentStatus,
 } from "./metadata";
@@ -76,10 +78,6 @@ interface FinishRunInput {
 	messages: readonly Message[];
 }
 
-function normalizeSessionPath(sessionPath: string | undefined): string | undefined {
-	return sessionPath ? path.resolve(sessionPath) : undefined;
-}
-
 function extractUsageCost(cost: unknown): number {
 	if (typeof cost === "number" && Number.isFinite(cost)) return cost;
 	if (typeof cost === "object" && cost !== null) {
@@ -87,15 +85,6 @@ function extractUsageCost(cost: unknown): number {
 		return typeof total === "number" && Number.isFinite(total) ? total : 0;
 	}
 	return 0;
-}
-
-function getDispatchStatus(result: DispatchItem["result"]): SubagentStatus {
-	if (!result) return "unknown";
-	if (result.stopReason === "escalated") return "escalated";
-	if (result.stopReason === "aborted" || result.stopReason === "error" || (typeof result.exitCode === "number" && result.exitCode !== 0)) {
-		return "aborted";
-	}
-	return result.exitCode === 0 ? "done" : "unknown";
 }
 
 function createEmptyRecord(thread: string, sessionPath: string): SubagentRunRecord {
@@ -127,6 +116,12 @@ function toCard(record: SubagentRunRecord): SubagentCard {
 
 function getResultKey(item: { thread: string; action: string; episodeNumber: number; sessionPath: string }): string {
 	return `${item.thread}:${item.episodeNumber}:${item.action}:${item.sessionPath}`;
+}
+
+function applyMessageSummary(record: SubagentRunRecord, messages: readonly Message[]): void {
+	record.outputTail = summarizeOutputTail(messages);
+	record.outputPreview = summarizeOutputPreview(messages);
+	record.toolPreview = summarizeRecentTool(messages);
 }
 
 export class SubagentRunStore {
@@ -197,14 +192,10 @@ export class SubagentRunStore {
 				if (!record) continue;
 
 				record.latestAction = item.action;
-				record.status = getDispatchStatus(item.result);
+				record.status = toSubagentStatus(item.result);
 
 				const messages = Array.isArray(item.result?.messages) ? item.result.messages : [];
-				if (messages.length > 0) {
-					record.outputTail = summarizeOutputTail(messages);
-					record.outputPreview = summarizeOutputPreview(messages);
-					record.toolPreview = summarizeRecentTool(messages);
-				}
+				if (messages.length > 0) applyMessageSummary(record, messages);
 
 				const resultKey = getResultKey({
 					thread: item.thread,
@@ -260,9 +251,7 @@ export class SubagentRunStore {
 		record.status = input.status;
 		record.liveCost = 0;
 		record.activeRunId = undefined;
-		record.outputTail = summarizeOutputTail(input.messages);
-		record.outputPreview = summarizeOutputPreview(input.messages);
-		record.toolPreview = summarizeRecentTool(input.messages);
+		applyMessageSummary(record, input.messages);
 
 		const normalizedSessionPath = normalizeSessionPath(input.sessionPath);
 		if (!normalizedSessionPath) return;
@@ -278,13 +267,6 @@ export class SubagentRunStore {
 			seenResultKeys.add(resultKey);
 			record.persistedCost += input.usageCost;
 		}
-	}
-
-	getCard(parentSessionFile: string | undefined, thread: string): SubagentCard | undefined {
-		const normalizedParent = normalizeSessionPath(parentSessionFile);
-		if (!normalizedParent) return undefined;
-		const record = this.recordsByParentSession.get(normalizedParent)?.get(thread);
-		return record ? toCard(record) : undefined;
 	}
 
 	getCards(parentSessionFile: string | undefined): SubagentCard[] {

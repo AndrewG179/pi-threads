@@ -1,14 +1,13 @@
 import * as path from "node:path";
 
+import { normalizeSessionPath } from "./metadata";
 import type { ThreadsState } from "./state";
 
 export type SessionBehaviorKind = "normal" | "orchestrator" | "subagent";
 
 export interface SessionBehavior {
 	kind: SessionBehaviorKind;
-	sessionFile?: string;
 	threadName?: string;
-	shouldAppendOrchestratorPrompt: boolean;
 }
 
 export interface DeriveSessionBehaviorInput {
@@ -18,10 +17,6 @@ export interface DeriveSessionBehaviorInput {
 }
 
 export const BUILTIN_FILE_SHELL_TOOLS = ["read", "write", "edit", "bash", "grep", "find", "ls"] as const;
-
-function normalizeSessionPath(sessionPath: string): string {
-	return path.resolve(sessionPath);
-}
 
 function isSessionUnderDir(sessionFile: string | undefined, dir: string): boolean {
 	if (!sessionFile) return false;
@@ -43,25 +38,15 @@ export function deriveSessionBehavior(input: DeriveSessionBehaviorInput): Sessio
 	if (isThreadSession) {
 		return {
 			kind: "subagent",
-			sessionFile,
 			threadName: sessionFile ? path.basename(sessionFile, ".jsonl") : undefined,
-			shouldAppendOrchestratorPrompt: false,
 		};
 	}
 
 	if (input.state.enabled && !isThreadSession) {
-		return {
-			kind: "orchestrator",
-			sessionFile,
-			shouldAppendOrchestratorPrompt: true,
-		};
+		return { kind: "orchestrator" };
 	}
 
-	return {
-		kind: "normal",
-		sessionFile,
-		shouldAppendOrchestratorPrompt: false,
-	};
+	return { kind: "normal" };
 }
 
 export function resolveActiveToolsForBehavior(

@@ -20,7 +20,6 @@ test("deriveSessionBehavior keeps normal sessions normal when thread mode is off
 	});
 
 	assert.equal(behavior.kind, "normal");
-	assert.equal(behavior.shouldAppendOrchestratorPrompt, false);
 });
 
 test("deriveSessionBehavior treats enabled non-thread sessions as orchestrators", () => {
@@ -34,7 +33,6 @@ test("deriveSessionBehavior treats enabled non-thread sessions as orchestrators"
 	});
 
 	assert.equal(behavior.kind, "orchestrator");
-	assert.equal(behavior.shouldAppendOrchestratorPrompt, true);
 });
 
 test("deriveSessionBehavior treats thread sessions as subagents by path alone", () => {
@@ -48,7 +46,6 @@ test("deriveSessionBehavior treats thread sessions as subagents by path alone", 
 	});
 
 	assert.equal(behavior.kind, "subagent");
-	assert.equal(behavior.shouldAppendOrchestratorPrompt, false);
 	assert.equal(behavior.threadName, "worker");
 });
 

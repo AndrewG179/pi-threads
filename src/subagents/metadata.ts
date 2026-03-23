@@ -14,6 +14,12 @@ export interface SubagentCard {
 	status: SubagentStatus;
 }
 
+export function normalizeSessionPath(sessionPath: string): string;
+export function normalizeSessionPath(sessionPath: string | undefined): string | undefined;
+export function normalizeSessionPath(sessionPath: string | undefined): string | undefined {
+	return sessionPath ? path.resolve(sessionPath) : undefined;
+}
+
 function normalizeText(text: string): string {
 	return text.replace(/\s+/g, " ").trim();
 }
@@ -37,6 +43,15 @@ function extractTextLines(parts: Message["content"] | undefined): string[] {
 export function getThreadSessionPath(threadsDir: string, thread: string): string {
 	const safeThread = thread.replace(/[^\w.-]+/g, "_");
 	return path.join(threadsDir, `${safeThread}.jsonl`);
+}
+
+export function toSubagentStatus(result: { exitCode?: number | null; stopReason?: string } | undefined): SubagentStatus {
+	if (!result) return "unknown";
+	if (result.stopReason === "escalated") return "escalated";
+	if (result.stopReason === "aborted" || result.stopReason === "error" || (typeof result.exitCode === "number" && result.exitCode !== 0)) {
+		return "aborted";
+	}
+	return result.exitCode === 0 ? "done" : "unknown";
 }
 
 export function summarizeToolCall(parts: Message["content"] | undefined): string {
@@ -87,17 +102,4 @@ export function summarizeRecentTool(messages: readonly Message[]): string {
 		if (preview) return preview;
 	}
 	return "";
-}
-
-export function mergeMessageSummary(card: SubagentCard, messages: readonly Message[]): SubagentCard {
-	const outputTail = summarizeOutputTail(messages);
-	const outputPreview = outputTail.at(-1) ?? card.outputPreview;
-	const toolPreview = summarizeRecentTool(messages) || card.toolPreview;
-
-	return {
-		...card,
-		outputPreview,
-		outputTail,
-		toolPreview,
-	};
 }

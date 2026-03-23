@@ -16,6 +16,10 @@ type TuiLike = {
 const WIDE_LAYOUT_MIN_WIDTH = 56;
 const MIN_BROWSER_ROWS = 18;
 const SESSION_CARD_ROWS = 2;
+const EMPTY_ACTION = "(no action)";
+const EMPTY_OUTPUT = "(no output yet)";
+const EMPTY_TOOL = "(no recent tool calls)";
+const EMPTY_SESSION_MESSAGE = "No subagent runs in this session.";
 
 function formatCost(cost: number): string {
 	if (cost <= 0) return "$0";
@@ -69,6 +73,10 @@ function finalizePane(lines: string[], width: number, height: number): string[] 
 	return output;
 }
 
+function renderFrame(lines: string[], width: number, height: number): string[] {
+	return finalizePane(lines, width, height).map((line) => truncateToWidth(line, width));
+}
+
 function getWindowStart(total: number, capacity: number, selectedIndex: number): number {
 	if (total <= capacity) return 0;
 	const maxStart = Math.max(0, total - capacity);
@@ -79,6 +87,31 @@ function getWindowStart(total: number, capacity: number, selectedIndex: number):
 function maybeHighlight(theme: any, line: string, selected: boolean): string {
 	if (!selected || typeof theme.bg !== "function") return line;
 	return theme.bg("selectedBg", line);
+}
+
+function formatSelectedHeader(card: SubagentCard, title: string, theme: any): string {
+	return `${theme.fg("accent", title)} ${theme.fg("dim", `${formatStatus(card.status)} ${formatCost(card.accumulatedCost)}`)}`;
+}
+
+function appendSection(params: {
+	lines: string[];
+	height: number;
+	theme: any;
+	width: number;
+	label: string;
+	entries: readonly string[];
+	color: string;
+	maxLines: number;
+}): void {
+	const { lines, height, theme, width, label, entries, color, maxLines } = params;
+	if (lines.length >= height) return;
+	lines.push(theme.fg("muted", label));
+	for (const entry of entries) {
+		for (const line of clampWrapped(entry, width, maxLines)) {
+			if (lines.length >= height) return;
+			lines.push(theme.fg(color, line));
+		}
+	}
 }
 
 export class SubagentBrowser {
@@ -160,7 +193,7 @@ export class SubagentBrowser {
 		const lines = [this.theme.fg("muted", "Sessions")];
 
 		if (cards.length === 0) {
-			lines.push(this.theme.fg("muted", "No current-branch sessions."));
+			lines.push(this.theme.fg("muted", EMPTY_SESSION_MESSAGE));
 			return finalizePane(lines, width, height);
 		}
 
@@ -187,65 +220,47 @@ export class SubagentBrowser {
 		return finalizePane(lines, width, height);
 	}
 
-	private renderDetailPane(cards: SubagentCard[], width: number, height: number): string[] {
-		const lines = [this.theme.fg("muted", "Selected")];
+	private renderSelectedPane(cards: SubagentCard[], width: number, height: number, mode: "detail" | "inspector"): string[] {
+		const lines = mode === "detail" ? [this.theme.fg("muted", "Selected")] : [];
 		const selected = this.getSelectedCard(cards);
 		if (!selected) {
-			lines.push(this.theme.fg("muted", "No subagent sessions on the current branch."));
+			lines.push(this.theme.fg("muted", EMPTY_SESSION_MESSAGE));
 			return finalizePane(lines, width, height);
 		}
 
-		lines.push(`${this.theme.fg("accent", `[${selected.thread}]`)} ${this.theme.fg("dim", `${formatStatus(selected.status)} ${formatCost(selected.accumulatedCost)}`)}`);
+		if (mode === "inspector") {
+			lines.push(formatSelectedHeader(selected, `Subagent [${selected.thread}]`, this.theme));
+			lines.push(this.theme.fg("dim", selected.sessionPath));
+			lines.push("");
+		} else {
+			lines.push(formatSelectedHeader(selected, `[${selected.thread}]`, this.theme));
+		}
 
-		const sections: Array<{ label: string; text: string; maxLines: number; color: string }> = [
-			{ label: "Action", text: selected.latestAction || "(no action)", maxLines: 2, color: "text" },
-			{ label: "Output", text: selected.outputPreview || "(no output yet)", maxLines: 2, color: "text" },
-			{ label: "Recent Tool", text: selected.toolPreview || "(no recent tool calls)", maxLines: 1, color: "dim" },
-		];
+		const sections = [
+			{ label: "Action", entries: [selected.latestAction || EMPTY_ACTION], color: "text", maxLines: mode === "inspector" ? 3 : 2 },
+			{
+				label: "Output",
+				entries: mode === "inspector" ? (selected.outputTail.length > 0 ? selected.outputTail : [selected.outputPreview || EMPTY_OUTPUT]) : [selected.outputPreview || EMPTY_OUTPUT],
+				color: "text",
+				maxLines: 2,
+			},
+			{ label: "Recent Tool", entries: [selected.toolPreview || EMPTY_TOOL], color: "dim", maxLines: mode === "inspector" ? 2 : 1 },
+		] as const;
 
-		for (const section of sections) {
-			if (lines.length >= height) break;
-			lines.push(this.theme.fg("muted", section.label));
-			if (lines.length >= height) break;
-
-			for (const line of clampWrapped(section.text, width, section.maxLines)) {
-				if (lines.length >= height) break;
-				lines.push(this.theme.fg(section.color, line));
+		for (const [index, section] of sections.entries()) {
+			if (mode === "inspector" && index > 0 && lines.length < height) {
+				lines.push("");
 			}
-		}
-
-		return finalizePane(lines, width, height);
-	}
-
-	private renderInspectorPane(cards: SubagentCard[], width: number, height: number): string[] {
-		const selected = this.getSelectedCard(cards);
-		if (!selected) {
-			return finalizePane([this.theme.fg("muted", "No subagent runs in this session.")], width, height);
-		}
-
-		const lines = [
-			`${this.theme.fg("accent", `Subagent [${selected.thread}]`)} ${this.theme.fg("dim", `${formatStatus(selected.status)} ${formatCost(selected.accumulatedCost)}`)}`,
-			this.theme.fg("dim", selected.sessionPath),
-			"",
-			this.theme.fg("muted", "Action"),
-			...clampWrapped(selected.latestAction || "(no action)", width, 3).map((line) => this.theme.fg("text", line)),
-			"",
-			this.theme.fg("muted", "Output"),
-		];
-
-		const outputLines = selected.outputTail.length > 0
-			? selected.outputTail
-			: [selected.outputPreview || "(no output yet)"];
-		for (const outputLine of outputLines) {
-			for (const line of clampWrapped(outputLine, width, 2)) {
-				lines.push(this.theme.fg("text", line));
-			}
-		}
-
-		lines.push("");
-		lines.push(this.theme.fg("muted", "Recent Tool"));
-		for (const line of clampWrapped(selected.toolPreview || "(no recent tool calls)", width, 2)) {
-			lines.push(this.theme.fg("dim", line));
+			appendSection({
+				lines,
+				height,
+				theme: this.theme,
+				width,
+				label: section.label,
+				entries: section.entries,
+				color: section.color,
+				maxLines: section.maxLines,
+			});
 		}
 
 		return finalizePane(lines, width, height);
@@ -257,7 +272,7 @@ export class SubagentBrowser {
 		const rightWidth = Math.max(24, innerWidth - leftWidth);
 		return combineColumns(
 			this.renderSessionsPane(cards, leftWidth, height),
-			this.renderDetailPane(cards, rightWidth, height),
+			this.renderSelectedPane(cards, rightWidth, height, "detail"),
 			leftWidth,
 			rightWidth,
 			height,
@@ -270,7 +285,7 @@ export class SubagentBrowser {
 		return [
 			...this.renderSessionsPane(cards, width, sessionsHeight),
 			"",
-			...this.renderDetailPane(cards, width, detailHeight),
+			...this.renderSelectedPane(cards, width, detailHeight, "detail"),
 		];
 	}
 
@@ -289,29 +304,14 @@ export class SubagentBrowser {
 		const viewportHeight = this.getViewportHeight();
 		const bodyHeight = Math.max(6, viewportHeight - headerLines.length);
 
-		if (cards.length === 0) {
-			return finalizePane(
-				[...headerLines, this.theme.fg("muted", "No subagent runs in this session.")],
-				width,
-				viewportHeight,
-			).map((line) => truncateToWidth(line, width));
-		}
+		const bodyLines = cards.length === 0
+			? [this.theme.fg("muted", EMPTY_SESSION_MESSAGE)]
+			: this.mode === "inspector"
+				? this.renderSelectedPane(cards, width, bodyHeight, "inspector")
+				: width >= WIDE_LAYOUT_MIN_WIDTH
+					? this.renderWide(cards, width, bodyHeight)
+					: this.renderNarrow(cards, width, bodyHeight);
 
-		if (this.mode === "inspector") {
-			return finalizePane(
-				[...headerLines, ...this.renderInspectorPane(cards, width, bodyHeight)],
-				width,
-				viewportHeight,
-			).map((line) => truncateToWidth(line, width));
-		}
-
-		return finalizePane(
-			[
-				...headerLines,
-				...(width >= WIDE_LAYOUT_MIN_WIDTH ? this.renderWide(cards, width, bodyHeight) : this.renderNarrow(cards, width, bodyHeight)),
-			],
-			width,
-			viewportHeight,
-		).map((line) => truncateToWidth(line, width));
+		return renderFrame([...headerLines, ...bodyLines], width, viewportHeight);
 	}
 }

@@ -24,7 +24,7 @@ import { Type } from "@sinclair/typebox";
 import { buildEpisode as buildThreadEpisode } from "./src/episode/builder";
 import { PiActorRuntime } from "./src/runtime/pi-actor";
 import { ThreadSupervisor } from "./src/runtime/thread-supervisor";
-import type { SubagentStatus } from "./src/subagents/metadata";
+import { getThreadSessionPath, normalizeSessionPath, toSubagentStatus } from "./src/subagents/metadata";
 import { deriveSessionBehavior, resolveActiveToolsForBehavior } from "./src/subagents/mode";
 import { SubagentRunStore } from "./src/subagents/runtime-store";
 import { loadThreadsState, saveThreadsState } from "./src/subagents/state";
@@ -155,11 +155,6 @@ function getThreadsDir(cwd: string): string {
 	return path.join(cwd, THREADS_DIR);
 }
 
-function getThreadSessionPath(cwd: string, threadName: string): string {
-	const safe = threadName.replace(/[^\w.-]+/g, "_");
-	return path.join(getThreadsDir(cwd), `${safe}.jsonl`);
-}
-
 function listThreads(cwd: string): string[] {
 	const dir = getThreadsDir(cwd);
 	if (!fs.existsSync(dir)) return [];
@@ -272,7 +267,7 @@ async function runThreadAction(
 	onRuntimeMessage?: (message: Message, liveCost: number) => void,
 ): Promise<ThreadActionResult> {
 	ensureThreadsDir(cwd);
-	const sessionPath = getThreadSessionPath(cwd, threadName);
+	const sessionPath = getThreadSessionPath(getThreadsDir(cwd), threadName);
 	const isNewThread = !fs.existsSync(sessionPath);
 
 	const result = createEmptyThreadActionResult({
@@ -429,9 +424,6 @@ export default function (pi: ExtensionAPI) {
 	const arraysEqual = (left: string[], right: string[]) =>
 		left.length === right.length && left.every((value, index) => value === right[index]);
 
-	const normalizeSessionPath = (sessionPath: string | undefined): string | undefined =>
-		sessionPath ? path.resolve(sessionPath) : undefined;
-
 	const rebuildEpisodeCounts = (sessionManager: { getBranch(): Array<{ type: string; message: { role: string; toolName?: string; details?: unknown } }> }) => {
 		episodeCounts.clear();
 		for (const entry of sessionManager.getBranch()) {
@@ -460,12 +452,6 @@ export default function (pi: ExtensionAPI) {
 			state,
 		});
 		return { behavior, sessionFile };
-	};
-
-	const getSubagentStatus = (result: Pick<ThreadActionResult, "exitCode" | "stopReason">): SubagentStatus => {
-		if (result.stopReason === "escalated") return "escalated";
-		if (result.stopReason === "aborted" || result.stopReason === "error" || result.exitCode !== 0) return "aborted";
-		return "done";
 	};
 
 	const syncSessionMode = (ctx: {
@@ -539,7 +525,6 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		subagentRunStore.seedCompletedFromParent(sessionFile, ctx.cwd, ctx.sessionManager.getBranch());
 		await ctx.ui.custom<void | undefined>(
 			(tui, theme, keybindings, done) =>
 				new SubagentBrowser(() => {
@@ -572,7 +557,7 @@ export default function (pi: ExtensionAPI) {
 	// Inject orchestrator system prompt
 	pi.on("before_agent_start", async (event, ctx) => {
 		const { behavior } = resolveSessionContext(ctx);
-		if (!behavior.shouldAppendOrchestratorPrompt) return;
+		if (behavior.kind !== "orchestrator") return;
 
 		let extra = ORCHESTRATOR_PROMPT;
 
@@ -667,7 +652,8 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 			const mode = taskList.length > 1 ? "batch" : "single";
-			const taskSessionPaths = new Map(taskList.map((task) => [task.thread, getThreadSessionPath(ctx.cwd, task.thread)]));
+			const threadsDir = getThreadsDir(ctx.cwd);
+			const taskSessionPaths = new Map(taskList.map((task) => [task.thread, getThreadSessionPath(threadsDir, task.thread)]));
 			const allItems: (SingleDispatchResult | null)[] = taskList.map(() => null);
 			if (parentSessionFile) {
 				subagentRunStore.seedCompletedFromParent(parentSessionFile, ctx.cwd, ctx.sessionManager.getBranch());
@@ -697,7 +683,7 @@ export default function (pi: ExtensionAPI) {
 							}
 						: undefined;
 
-				const sessionPath = taskSessionPaths.get(task.thread) ?? getThreadSessionPath(ctx.cwd, task.thread);
+				const sessionPath = taskSessionPaths.get(task.thread) ?? getThreadSessionPath(threadsDir, task.thread);
 				const runId = `${task.thread}:${episodeNumber}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
 
 				const pendingItem: SingleDispatchResult = {
@@ -761,7 +747,7 @@ export default function (pi: ExtensionAPI) {
 						sessionPath: result.sessionPath,
 						action: task.action,
 						episodeNumber,
-						status: getSubagentStatus(result),
+						status: toSubagentStatus(result),
 						usageCost: result.usage.cost,
 						messages: result.messages,
 					});
