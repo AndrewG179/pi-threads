@@ -705,18 +705,20 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// Register /subagents before /subagents-back so an exact "/subagents" input
+	// wins the host autocomplete tie instead of selecting the back command first.
+	pi.registerCommand("subagents", {
+		description: "Browse and open current-branch subagent thread sessions",
+		handler: async (_args, ctx) => {
+			await openSubagentsBrowser(ctx);
+		},
+	});
+
 	pi.registerCommand("subagents-back", {
 		description: "Return from the current subagent session to its remembered parent session",
 		handler: async (_args, ctx) => {
 			rememberSessionSwitcher(ctx);
 			await switchToRememberedParent(ctx);
-		},
-	});
-
-	pi.registerCommand("subagents", {
-		description: "Browse and open current-branch subagent thread sessions",
-		handler: async (_args, ctx) => {
-			await openSubagentsBrowser(ctx);
 		},
 	});
 
