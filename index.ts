@@ -24,8 +24,9 @@ import { Type } from "@sinclair/typebox";
 import { buildEpisode as buildThreadEpisode } from "./src/episode/builder";
 import { PiActorRuntime } from "./src/runtime/pi-actor";
 import { ThreadSupervisor } from "./src/runtime/thread-supervisor";
-import { collectSubagentCards, loadSessionBranchFromFile, type SubagentCard } from "./src/subagents/metadata";
+import type { SubagentStatus } from "./src/subagents/metadata";
 import { deriveSessionBehavior, resolveActiveToolsForBehavior } from "./src/subagents/mode";
+import { SubagentRunStore } from "./src/subagents/runtime-store";
 import { loadThreadsState, saveThreadsState } from "./src/subagents/state";
 import { SubagentBrowser } from "./src/subagents/view";
 import { wrapText } from "./src/text/wrap";
@@ -187,7 +188,6 @@ function formatTokens(count: number): string {
 }
 
 const MAX_COLUMNS = 3;
-const CTRL_B_INPUT = "\u0002";
 
 /**
  * Render items in rows of up to MAX_COLUMNS columns.
@@ -266,9 +266,10 @@ async function runThreadAction(
 	threadName: string,
 	action: string,
 	model: string | undefined,
-	signal: AbortSignal | undefined,
 	onUpdate: ((partial: AgentToolResult<DispatchDetails>) => void) | undefined,
 	episodeNumber: number,
+	runId: string,
+	onRuntimeMessage?: (message: Message, liveCost: number) => void,
 ): Promise<ThreadActionResult> {
 	ensureThreadsDir(cwd);
 	const sessionPath = getThreadSessionPath(cwd, threadName);
@@ -318,7 +319,9 @@ async function runThreadAction(
 		});
 	};
 
-	const runId = `${threadName}:${episodeNumber}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+	// Thread work is background execution and must survive view/session switches.
+	// The host tool AbortSignal can fire for session-switch lifecycle reasons, so
+	// it is not a safe ownership boundary for worker lifetime here.
 	const handle = threadSupervisor.invoke(
 		{
 			runId,
@@ -329,7 +332,6 @@ async function runThreadAction(
 			sessionPath,
 			systemPrompt: THREAD_WORKER_PROMPT,
 		},
-		{ signal },
 	);
 
 	const unsubscribe = handle.subscribe((event) => {
@@ -338,6 +340,7 @@ async function runThreadAction(
 			result.messages.push(threadedMessage);
 			trackUsage(threadedMessage);
 			emitUpdate();
+			onRuntimeMessage?.(threadedMessage, result.usage.cost);
 		}
 		if (event.type === "stderr") {
 			result.stderr += event.chunk;
@@ -421,61 +424,13 @@ export default function (pi: ExtensionAPI) {
 	// Track episode counts per thread (reconstructed from session)
 	const episodeCounts = new Map<string, number>();
 	let defaultActiveTools: string[] | null = null;
-	let lastSessionSwitchSession: ((sessionPath: string) => Promise<{ cancelled: boolean }>) | null = null;
-	let releaseSubagentBackListener: (() => void) | null = null;
-	const runtimeParentByChildSession = new Map<string, string>();
-	const runtimeChildrenByParentSession = new Map<string, Map<string, string>>();
-	const activeParentDispatchCounts = new Map<string, number>();
+	const subagentRunStore = new SubagentRunStore();
 
 	const arraysEqual = (left: string[], right: string[]) =>
 		left.length === right.length && left.every((value, index) => value === right[index]);
 
 	const normalizeSessionPath = (sessionPath: string | undefined): string | undefined =>
 		sessionPath ? path.resolve(sessionPath) : undefined;
-
-	const rememberRuntimeSubagent = (parentSessionFile: string, thread: string, childSessionFile: string) => {
-		const resolvedParent = path.resolve(parentSessionFile);
-		const resolvedChild = path.resolve(childSessionFile);
-		runtimeParentByChildSession.set(resolvedChild, resolvedParent);
-
-		const currentChildren = runtimeChildrenByParentSession.get(resolvedParent) ?? new Map<string, string>();
-		currentChildren.set(thread, resolvedChild);
-		runtimeChildrenByParentSession.set(resolvedParent, currentChildren);
-	};
-
-	const getRuntimeParentSession = (sessionFile: string | undefined): string | undefined => {
-		const resolvedSession = normalizeSessionPath(sessionFile);
-		return resolvedSession ? runtimeParentByChildSession.get(resolvedSession) : undefined;
-	};
-
-	const getRuntimeSessionsForParent = (parentSessionFile: string | undefined): Map<string, string> => {
-		const resolvedParent = normalizeSessionPath(parentSessionFile);
-		if (!resolvedParent) return new Map<string, string>();
-		return new Map(runtimeChildrenByParentSession.get(resolvedParent) ?? []);
-	};
-
-	const trackActiveParentDispatch = (sessionFile: string | undefined, behaviorKind: ReturnType<typeof deriveSessionBehavior>["kind"]) => {
-		const resolvedSessionFile = normalizeSessionPath(sessionFile);
-		if (behaviorKind !== "orchestrator" || !resolvedSessionFile) {
-			return () => {};
-		}
-
-		activeParentDispatchCounts.set(resolvedSessionFile, (activeParentDispatchCounts.get(resolvedSessionFile) ?? 0) + 1);
-		return () => {
-			const currentCount = activeParentDispatchCounts.get(resolvedSessionFile) ?? 0;
-			if (currentCount <= 1) {
-				activeParentDispatchCounts.delete(resolvedSessionFile);
-				return;
-			}
-			activeParentDispatchCounts.set(resolvedSessionFile, currentCount - 1);
-		};
-	};
-
-	const hasActiveParentDispatch = (sessionFile: string | undefined): boolean => {
-		const resolvedSessionFile = normalizeSessionPath(sessionFile);
-		if (!resolvedSessionFile) return false;
-		return (activeParentDispatchCounts.get(resolvedSessionFile) ?? 0) > 0;
-	};
 
 	const rebuildEpisodeCounts = (sessionManager: { getBranch(): Array<{ type: string; message: { role: string; toolName?: string; details?: unknown } }> }) => {
 		episodeCounts.clear();
@@ -504,88 +459,13 @@ export default function (pi: ExtensionAPI) {
 			sessionFile,
 			state,
 		});
-		const runtimeParentSessionFile = behavior.kind === "subagent" ? getRuntimeParentSession(sessionFile) : undefined;
-		return { state, behavior, sessionFile, runtimeParentSessionFile };
+		return { behavior, sessionFile };
 	};
 
-	const getUnsafeSubagentSwitchParentSession = (
-		ctx: {
-			cwd: string;
-			sessionManager: { getSessionFile(): string | undefined };
-		},
-		targetSessionFile: string | undefined,
-	): string | undefined => {
-		const { state, behavior, sessionFile, runtimeParentSessionFile } = resolveSessionContext(ctx);
-		const normalizedTargetSessionFile = normalizeSessionPath(targetSessionFile);
-		if (!normalizedTargetSessionFile || normalizedTargetSessionFile === sessionFile) {
-			return undefined;
-		}
-
-		const targetBehavior = deriveSessionBehavior({
-			cwd: ctx.cwd,
-			sessionFile: normalizedTargetSessionFile,
-			state,
-		});
-
-		if (behavior.kind === "orchestrator" && targetBehavior.kind === "subagent" && hasActiveParentDispatch(sessionFile)) {
-			return sessionFile;
-		}
-
-		if (behavior.kind === "subagent" && runtimeParentSessionFile && hasActiveParentDispatch(runtimeParentSessionFile)) {
-			return runtimeParentSessionFile;
-		}
-
-		return undefined;
-	};
-
-	const formatUnsafeSubagentSwitchMessage = (parentSessionFile: string): string =>
-		`Blocked session switch: parent dispatch is still running in ${path.basename(parentSessionFile)}. ` +
-		"Switching into or out of a subagent now would stop that in-flight dispatch. Wait for the dispatch to finish, then try again.";
-
-	const notifyIfUnsafeSubagentSwitchWasCancelled = (
-		ctx: {
-			cwd: string;
-			sessionManager: { getSessionFile(): string | undefined };
-			ui: { notify: (message: string, level?: string) => void };
-		},
-		targetSessionFile: string,
-		switchResult: { cancelled: boolean } | undefined,
-	): boolean => {
-		if (!switchResult?.cancelled) {
-			return false;
-		}
-
-		const parentSessionFile = getUnsafeSubagentSwitchParentSession(ctx, targetSessionFile);
-		if (!parentSessionFile) {
-			return false;
-		}
-
-		ctx.ui.notify(formatUnsafeSubagentSwitchMessage(parentSessionFile), "warning");
-		return true;
-	};
-
-	const renderSubagentBanner = (
-		ctx: { ui: { theme: any; setWidget: (key: string, content: unknown, options?: unknown) => void } },
-		behavior: ReturnType<typeof deriveSessionBehavior>,
-		runtimeParentSessionFile?: string,
-	) => {
-		if (behavior.kind !== "subagent") {
-			ctx.ui.setWidget("pi-threads-subagent-banner", undefined);
-			return;
-		}
-
-		const parentLabel = runtimeParentSessionFile ? path.basename(runtimeParentSessionFile) : "current runtime only";
-		const navigationHint = runtimeParentSessionFile
-			? "Ctrl+B or /subagents-back to return · /subagents to switch threads"
-			: "/subagents to switch threads";
-		ctx.ui.setWidget(
-			"pi-threads-subagent-banner",
-			[
-				ctx.ui.theme.fg("warning", `Subagent [${behavior.threadName ?? "thread"}]`) + ctx.ui.theme.fg("dim", `  parent ${parentLabel}`),
-				ctx.ui.theme.fg("dim", navigationHint),
-			],
-			{ placement: "aboveEditor" },
-		);
+	const getSubagentStatus = (result: Pick<ThreadActionResult, "exitCode" | "stopReason">): SubagentStatus => {
+		if (result.stopReason === "escalated") return "escalated";
+		if (result.stopReason === "aborted" || result.stopReason === "error" || result.exitCode !== 0) return "aborted";
+		return "done";
 	};
 
 	const syncSessionMode = (ctx: {
@@ -593,13 +473,12 @@ export default function (pi: ExtensionAPI) {
 		cwd: string;
 		sessionManager: { getSessionFile(): string | undefined; getBranch(): Array<{ type: string; message: { role: string; toolName?: string; details?: unknown } }> };
 		ui: {
-			onTerminalInput?: (handler: (data: string) => { consume?: boolean; data?: string } | undefined) => () => void;
 			theme: any;
 			setStatus: (key: string, text: string | undefined) => void;
 			setWidget: (key: string, content: unknown, options?: unknown) => void;
 		};
 	}) => {
-		const { behavior, runtimeParentSessionFile } = resolveSessionContext(ctx);
+		const { behavior } = resolveSessionContext(ctx);
 		const currentActiveTools = pi.getActiveTools().filter((tool) => tool !== "dispatch");
 		const allToolNames = pi.getAllTools().map((tool) => tool.name);
 
@@ -621,15 +500,6 @@ export default function (pi: ExtensionAPI) {
 		);
 		pi.setActiveTools(nextActiveTools);
 
-		releaseSubagentBackListener?.();
-		releaseSubagentBackListener = null;
-		if (behavior.kind === "subagent" && runtimeParentSessionFile && ctx.hasUI && typeof ctx.ui.onTerminalInput === "function") {
-			releaseSubagentBackListener = ctx.ui.onTerminalInput((data) => {
-				if (data !== CTRL_B_INPUT) return undefined;
-				return { data: "/subagents-back\n" };
-			});
-		}
-
 		if (behavior.kind === "orchestrator") {
 			ctx.ui.setStatus("pi-threads", ctx.ui.theme.fg("accent", "threads:on"));
 		} else if (behavior.kind === "subagent") {
@@ -638,46 +508,9 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.setStatus("pi-threads", undefined);
 		}
 
-		renderSubagentBanner(ctx, behavior, runtimeParentSessionFile);
+		ctx.ui.setWidget("pi-threads-subagent-banner", undefined);
 		rebuildEpisodeCounts(ctx.sessionManager);
 		return behavior;
-	};
-
-	const rememberSessionSwitcher = (ctx: {
-		switchSession?: (sessionPath: string) => Promise<{ cancelled: boolean }>;
-	}) => {
-		if (typeof ctx.switchSession !== "function") {
-			return;
-		}
-		lastSessionSwitchSession = ctx.switchSession.bind(ctx);
-	};
-
-	const switchToRememberedParent = async (ctx: {
-		cwd: string;
-		sessionManager: { getSessionFile(): string | undefined };
-		ui: { notify: (message: string, level?: string) => void };
-		switchSession?: (sessionPath: string) => Promise<{ cancelled: boolean }>;
-	}) => {
-		const { behavior, runtimeParentSessionFile } = resolveSessionContext(ctx);
-		if (behavior.kind !== "subagent" || !runtimeParentSessionFile) {
-			ctx.ui.notify("No remembered parent session for this thread.", "warning");
-			return;
-		}
-
-		const switchSession = ctx.switchSession ?? lastSessionSwitchSession;
-		if (!switchSession) {
-			ctx.ui.notify("Ctrl+B cannot switch sessions yet in this runtime. Use /subagents-back.", "warning");
-			return;
-		}
-
-		const unsafeParentSessionFile = getUnsafeSubagentSwitchParentSession(ctx, runtimeParentSessionFile);
-		if (unsafeParentSessionFile) {
-			ctx.ui.notify(formatUnsafeSubagentSwitchMessage(unsafeParentSessionFile), "warning");
-			return;
-		}
-
-		const switchResult = await switchSession(runtimeParentSessionFile);
-		notifyIfUnsafeSubagentSwitchWasCancelled(ctx, runtimeParentSessionFile, switchResult);
 	};
 
 	const openSubagentsBrowser = async (ctx: {
@@ -694,67 +527,25 @@ export default function (pi: ExtensionAPI) {
 				options?: unknown,
 			): Promise<T>;
 		};
-		switchSession?: (sessionPath: string) => Promise<{ cancelled: boolean }>;
 	}) => {
-		rememberSessionSwitcher(ctx);
 		if (!ctx.hasUI) {
 			ctx.ui.notify("The /subagents browser requires the interactive UI.", "warning");
 			return;
 		}
 
-		const { behavior, sessionFile, runtimeParentSessionFile } = resolveSessionContext(ctx);
-		const parentSessionFile = behavior.kind === "subagent" ? runtimeParentSessionFile : sessionFile;
-		if (!parentSessionFile) {
-			ctx.ui.notify("Current session is not persisted, so parent navigation cannot be remembered.", "warning");
+		const { sessionFile } = resolveSessionContext(ctx);
+		if (!sessionFile) {
+			ctx.ui.notify("Current session is not persisted, so /subagents has no session-scoped run store yet.", "warning");
 			return;
 		}
 
-		const parentEntries = behavior.kind === "subagent" && runtimeParentSessionFile
-			? loadSessionBranchFromFile(runtimeParentSessionFile)
-			: ctx.sessionManager.getBranch();
-		const cards = collectSubagentCards(ctx.cwd, parentEntries, getRuntimeSessionsForParent(parentSessionFile));
-		const switchSession = ctx.switchSession ?? lastSessionSwitchSession;
-		const selected = await ctx.ui.custom<SubagentCard | undefined>(
+		subagentRunStore.seedCompletedFromParent(sessionFile, ctx.cwd, ctx.sessionManager.getBranch());
+		await ctx.ui.custom<void | undefined>(
 			(tui, theme, keybindings, done) =>
-				new SubagentBrowser(cards, tui, theme, keybindings, done, async (candidate) => {
-					if (candidate.sessionPath === ctx.sessionManager.getSessionFile()) {
-						return { kind: "stay" };
-					}
-
-					if (!switchSession) {
-						return {
-							kind: "blocked",
-							message: "This runtime cannot switch sessions from the subagent browser yet. Use /subagents.",
-						};
-					}
-
-					const unsafeParentSessionFile = getUnsafeSubagentSwitchParentSession(ctx, candidate.sessionPath);
-					if (unsafeParentSessionFile) {
-						return {
-							kind: "blocked",
-							message: formatUnsafeSubagentSwitchMessage(unsafeParentSessionFile),
-						};
-					}
-
-					const switchResult = await switchSession(candidate.sessionPath);
-					if (switchResult?.cancelled) {
-						const parentSessionFile = getUnsafeSubagentSwitchParentSession(ctx, candidate.sessionPath);
-						if (parentSessionFile) {
-							return {
-								kind: "blocked",
-								message: formatUnsafeSubagentSwitchMessage(parentSessionFile),
-							};
-						}
-
-						return {
-							kind: "blocked",
-							message: "Session switch was cancelled. Stay here and try again when the target session is available.",
-						};
-					}
-
-					rememberRuntimeSubagent(parentSessionFile, candidate.thread, candidate.sessionPath);
-					return { kind: "open" };
-				}),
+				new SubagentBrowser(() => {
+					subagentRunStore.seedCompletedFromParent(sessionFile, ctx.cwd, ctx.sessionManager.getBranch());
+					return subagentRunStore.getCards(sessionFile);
+				}, tui, theme, keybindings, done),
 			{
 				overlay: true,
 				overlayOptions: {
@@ -767,22 +558,11 @@ export default function (pi: ExtensionAPI) {
 				},
 			},
 		);
-
-		if (!selected) return;
 	};
 
 	// Reconstruct state on session load
 	pi.on("session_start", async (_event, ctx) => {
 		syncSessionMode(ctx);
-	});
-
-	pi.on("session_before_switch", async (event: { reason?: string; targetSessionFile?: string }, ctx) => {
-		if (event.reason !== "resume") return;
-
-		const parentSessionFile = getUnsafeSubagentSwitchParentSession(ctx, event.targetSessionFile);
-		if (!parentSessionFile) return;
-
-		return { cancel: true };
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
@@ -816,7 +596,6 @@ export default function (pi: ExtensionAPI) {
 			return values.length > 0 ? values.map((value) => ({ value, label: value })) : null;
 		},
 		handler: async (args, ctx) => {
-			rememberSessionSwitcher(ctx);
 			const nextMode = args.trim().toLowerCase();
 			if (nextMode !== "on" && nextMode !== "off") {
 				const state = loadThreadsState(ctx.cwd);
@@ -831,20 +610,10 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// Register /subagents before /subagents-back so an exact "/subagents" input
-	// wins the host autocomplete tie instead of selecting the back command first.
 	pi.registerCommand("subagents", {
-		description: "Browse and open current-branch subagent thread sessions",
+		description: "Browse live subagent runs for the current session",
 		handler: async (_args, ctx) => {
 			await openSubagentsBrowser(ctx);
-		},
-	});
-
-	pi.registerCommand("subagents-back", {
-		description: "Return from the current subagent session to its remembered parent session",
-		handler: async (_args, ctx) => {
-			rememberSessionSwitcher(ctx);
-			await switchToRememberedParent(ctx);
 		},
 	});
 
@@ -880,12 +649,10 @@ export default function (pi: ExtensionAPI) {
 			),
 		}),
 
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
 			const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 			const sessionContext = resolveSessionContext(ctx);
-			const rememberedParentSession = sessionContext.behavior.kind === "subagent"
-				? sessionContext.runtimeParentSessionFile
-				: sessionContext.sessionFile;
+			const parentSessionFile = sessionContext.sessionFile;
 			const taskList = params.tasks?.length
 				? params.tasks
 				: params.thread && params.action
@@ -899,100 +666,121 @@ export default function (pi: ExtensionAPI) {
 					isError: true,
 				};
 			}
+			const mode = taskList.length > 1 ? "batch" : "single";
+			const taskSessionPaths = new Map(taskList.map((task) => [task.thread, getThreadSessionPath(ctx.cwd, task.thread)]));
+			const allItems: (SingleDispatchResult | null)[] = taskList.map(() => null);
+			if (parentSessionFile) {
+				subagentRunStore.seedCompletedFromParent(parentSessionFile, ctx.cwd, ctx.sessionManager.getBranch());
+			}
 
-			const releaseActiveParentDispatch = trackActiveParentDispatch(
-				sessionContext.sessionFile,
-				sessionContext.behavior.kind,
-			);
+			const emitBatchUpdate = () => {
+				if (!onUpdate) return;
+				const currentItems = allItems.filter((i): i is SingleDispatchResult => i !== null);
+				if (currentItems.length === 0) return;
+				onUpdate({
+					content: [{ type: "text", text: currentItems.map((i) => `[${i.thread}] ${i.episode || "(running...)"}`).join("\n\n") }],
+					details: { mode, items: currentItems },
+				});
+			};
 
-			try {
-				const mode = taskList.length > 1 ? "batch" : "single";
-				const taskSessionPaths = new Map(taskList.map((task) => [task.thread, getThreadSessionPath(ctx.cwd, task.thread)]));
-				const allItems: (SingleDispatchResult | null)[] = taskList.map(() => null);
-
-				const emitBatchUpdate = () => {
-					if (!onUpdate) return;
-					const currentItems = allItems.filter((i): i is SingleDispatchResult => i !== null);
-					if (currentItems.length === 0) return;
-					onUpdate({
-						content: [{ type: "text", text: currentItems.map((i) => `[${i.thread}] ${i.episode || "(running...)"}`).join("\n\n") }],
-						details: { mode, items: currentItems },
-					});
-				};
-
-				if (rememberedParentSession) {
-					for (const task of taskList) {
-						const sessionPath = taskSessionPaths.get(task.thread);
-						if (!sessionPath) continue;
-						rememberRuntimeSubagent(rememberedParentSession, task.thread, sessionPath);
-					}
-				}
-
-				const runOne = async (task: { thread: string; action: string }, index: number): Promise<SingleDispatchResult> => {
-					const episodeNumber = (episodeCounts.get(task.thread) || 0) + 1;
-					const taskOnUpdate = mode === "single"
-						? onUpdate
-						: onUpdate
-							? (partial: AgentToolResult<DispatchDetails>) => {
-									const inProgress = partial.details?.items?.[0];
-									if (inProgress) allItems[index] = inProgress;
-									emitBatchUpdate();
+			const runOne = async (task: { thread: string; action: string }, index: number): Promise<SingleDispatchResult> => {
+				const episodeNumber = (episodeCounts.get(task.thread) || 0) + 1;
+				const taskOnUpdate = mode === "single"
+					? onUpdate
+					: onUpdate
+						? (partial: AgentToolResult<DispatchDetails>) => {
+								const inProgress = partial.details?.items?.[0];
+								if (inProgress) {
+									allItems[index] = inProgress;
 								}
-							: undefined;
+								emitBatchUpdate();
+							}
+						: undefined;
 
-					const sessionPath = taskSessionPaths.get(task.thread) ?? getThreadSessionPath(ctx.cwd, task.thread);
+				const sessionPath = taskSessionPaths.get(task.thread) ?? getThreadSessionPath(ctx.cwd, task.thread);
+				const runId = `${task.thread}:${episodeNumber}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
 
-					const pendingItem: SingleDispatchResult = {
+				const pendingItem: SingleDispatchResult = {
+					thread: task.thread,
+					action: task.action,
+					episode: "(running...)",
+					episodeNumber,
+					result: createEmptyThreadActionResult({
 						thread: task.thread,
 						action: task.action,
-						episode: "(running...)",
-						episodeNumber,
-						result: createEmptyThreadActionResult({
-							thread: task.thread,
-							action: task.action,
-							model,
-							sessionPath,
-							isNewThread: !fs.existsSync(sessionPath),
-						}),
-					};
-					allItems[index] = pendingItem;
-					taskOnUpdate?.({
-						content: [{ type: "text", text: "(running...)" }],
-						details: { mode: "single", items: [pendingItem] },
+						model,
+						sessionPath,
+						isNewThread: !fs.existsSync(sessionPath),
+					}),
+				};
+				allItems[index] = pendingItem;
+				if (parentSessionFile) {
+					subagentRunStore.startRun({
+						parentSessionFile,
+						runId,
+						thread: task.thread,
+						sessionPath,
+						action: task.action,
 					});
+				}
+				taskOnUpdate?.({
+					content: [{ type: "text", text: "(running...)" }],
+					details: { mode: "single", items: [pendingItem] },
+				});
 
-					const result = await runThreadAction(
-						ctx.cwd, task.thread, task.action, model, signal,
-						taskOnUpdate,
-						episodeNumber,
-					);
-
-					const episode = buildThreadEpisode(
-						result.messages as Parameters<typeof buildThreadEpisode>[0],
-						{ emptyFallback: getDispatchFailureSummary(result) },
-					);
-					episodeCounts.set(task.thread, episodeNumber);
-
-					const item: SingleDispatchResult = { thread: task.thread, action: task.action, episode, episodeNumber, result };
-					allItems[index] = item;
-					if (mode === "batch") emitBatchUpdate();
-					return item;
-				};
-
-				const items = await Promise.all(taskList.map((task, index) => runOne(task, index)));
-				const anyError = items.some(({ result }) =>
-					result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted",
+				const result = await runThreadAction(
+					ctx.cwd, task.thread, task.action, model,
+					taskOnUpdate,
+					episodeNumber,
+					runId,
+					(message, liveCost) => {
+						if (!parentSessionFile) return;
+						subagentRunStore.recordMessage({
+							parentSessionFile,
+							runId,
+							thread: task.thread,
+							message,
+							liveCost,
+						});
+					},
 				);
-				const contentText = items.map((i) => `[${i.thread}] ${i.episode}`).join("\n\n");
 
-				return {
-					content: [{ type: "text", text: contentText }],
-					details: { mode, items },
-					isError: anyError ? true : undefined,
-				};
-			} finally {
-				releaseActiveParentDispatch();
-			}
+				const episode = buildThreadEpisode(
+					result.messages as Parameters<typeof buildThreadEpisode>[0],
+					{ emptyFallback: getDispatchFailureSummary(result) },
+				);
+				episodeCounts.set(task.thread, episodeNumber);
+
+				const item: SingleDispatchResult = { thread: task.thread, action: task.action, episode, episodeNumber, result };
+				allItems[index] = item;
+				if (parentSessionFile) {
+					subagentRunStore.finishRun({
+						parentSessionFile,
+						runId,
+						thread: task.thread,
+						sessionPath: result.sessionPath,
+						action: task.action,
+						episodeNumber,
+						status: getSubagentStatus(result),
+						usageCost: result.usage.cost,
+						messages: result.messages,
+					});
+				}
+				if (mode === "batch") emitBatchUpdate();
+				return item;
+			};
+
+			const items = await Promise.all(taskList.map((task, index) => runOne(task, index)));
+			const anyError = items.some(({ result }) =>
+				result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted",
+			);
+			const contentText = items.map((i) => `[${i.thread}] ${i.episode}`).join("\n\n");
+
+			return {
+				content: [{ type: "text", text: contentText }],
+				details: { mode, items },
+				isError: anyError ? true : undefined,
+			};
 		},
 
 		// ─── Rendering ───

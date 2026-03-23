@@ -26,15 +26,23 @@ That file is only for thread mode enablement; it does not persist parent/subagen
 
 ## `/subagents`
 
-`/subagents` opens an interactive selector overlay for the current parent context.
+`/subagents` opens the subagent browser for the current parent context.
 
-The browser lists subagents known to the current parent session:
-- completed `dispatch` records already present in the current parent branch
-- in-flight subagents registered by the current runtime before a completed `toolResult` is written
+The browser is a live view, not a static snapshot.
 
-Thread `.jsonl` files are used to summarize the selected subagent, but they are not the canonical source of parent/session relationships.
+The browser must show subagents for the current parent session while they are still running:
+- newly spawned/in-flight subagents must appear before the parent `dispatch` finishes
+- card contents should update as new information arrives
+- the browser must not require the user to close and reopen it to discover new children or refreshed status
 
-The selector should show a compact card per subagent with the information this extension actually has:
+The browser is scoped to the current session context:
+- show only subagents belonging to the current session's runtime-owned run store
+- include completed subagents already recorded in the current session's `dispatch` toolResults
+- do not mix in historical or unrelated thread sessions from other sessions just because files exist on disk
+
+Thread `.jsonl` files are durable history for the worker sessions themselves. They are not the canonical source of live parent/child relationships.
+
+The browser should show a compact card per subagent with the information this extension actually has:
 - subagent/thread name
 - latest task/action
 - latest agent output preview
@@ -42,26 +50,31 @@ The selector should show a compact card per subagent with the information this e
 - accumulated cost seen in the current parent session
 - completion status (`Done`, `Escalated`, `Aborted`, or unknown)
 
+This is a view concern only. Whether the user is currently looking at the parent, a subagent, or the browser must not change whether work continues.
+
 Keyboard behavior:
 - arrow keys move selection
-- `Enter` opens the selected subagent session
-- `Esc` closes the selector
+- `Enter` opens the selected subagent inspector inside the same custom view
+- `Esc` backs out of the inspector, then closes the browser
 
 ## Opening a subagent
 
-Opening a subagent switches the current pi session to that thread session file.
+Inspecting a subagent changes what the user is looking at. It must not pause, kill, or block ongoing work in the parent or in any other subagent.
 
-If the current runtime still owns an in-flight parent `dispatch`, that session switch is blocked before it reaches `switchSession()`. In `/subagents`, the browser stays open and shows the block message inline instead of silently bouncing back to the parent view. This is a safety guard only: the extension does not claim to keep that dispatch alive across session switches.
+Required runtime behavior:
+- the parent session keeps running even if the user opens `/subagents`
+- the parent session keeps running even if the user opens a subagent inspector
+- subagents keep running even if the user leaves the inspector
+- main and subagent work continues regardless of which session/view the user is currently looking at
+- switching views is a UI/navigation action, not an execution-control action
 
-Once opened, the subagent is just a **normal pi chat session**. The only extra UI is a small banner that says it is a subagent session and shows the current-runtime parent when one is known.
+The browser and inspector are same-session view state over the extension-owned background run store. They must not call host `switchSession(...)` for in-flight inspection, and they must not depend on remembered-parent banner/back-navigation machinery.
 
-While inside a subagent session:
-- `Ctrl+B` should return to the parent session when that parent was established in the current runtime
-- `/subagents-back` should also return to that current-runtime parent session
-- `/subagents` can be used again to jump to another subagent
+## Non-negotiable invariants
 
-If that remembered parent still has an in-flight `dispatch` owned by the current runtime, leaving the subagent is also blocked with the same warning until the dispatch finishes.
-
-Returning to the parent restores the parent chat session rather than opening a copy.
-
-If a thread session is opened directly in a fresh runtime, there is no persisted remembered parent. In that case the session is still treated as a subagent by path, but back-navigation is unavailable until the thread is opened from a parent context in the current runtime.
+- Background execution is independent of the active view.
+- The browser is live and streaming.
+- The browser must not hide running children until completion.
+- Navigation must not be implemented by preemptively blocking or cancelling healthy background work.
+- UI state and execution state are separate concerns.
+- Live discovery comes from the runtime-owned store, not transcript scanning or persisted parent linkage.

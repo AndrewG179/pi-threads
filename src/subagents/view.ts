@@ -13,13 +13,6 @@ type TuiLike = {
 	};
 };
 
-type SelectionOutcome =
-	| { kind: "open" }
-	| { kind: "blocked"; message: string }
-	| { kind: "stay" };
-
-type SelectionHandlerResult = SelectionOutcome | Promise<SelectionOutcome>;
-
 const WIDE_LAYOUT_MIN_WIDTH = 56;
 const MIN_BROWSER_ROWS = 18;
 const SESSION_CARD_ROWS = 2;
@@ -90,84 +83,93 @@ function maybeHighlight(theme: any, line: string, selected: boolean): string {
 
 export class SubagentBrowser {
 	private selectedIndex = 0;
-	private statusMessage: string | null = null;
-	private selectionInFlight = false;
+	private mode: "browser" | "inspector" = "browser";
 
 	constructor(
-		private readonly cards: SubagentCard[],
+		private readonly getCards: () => SubagentCard[],
 		private readonly tui: TuiLike | undefined,
 		private readonly theme: any,
 		private readonly keybindings: KeybindingMatcher | undefined,
-		private readonly done: (result: SubagentCard | undefined) => void,
-		private readonly onSelect?: (card: SubagentCard) => SelectionHandlerResult,
+		private readonly done: (result: void | undefined) => void,
 	) {}
 
 	handleInput(keyData: string): void {
 		const kb = this.keybindings;
 		if (!kb) return;
+		const cards = this.getCurrentCards();
+		if (kb.matches(keyData, "tui.select.cancel")) {
+			if (this.mode === "inspector") {
+				this.mode = "browser";
+				return;
+			}
+			this.done(undefined);
+			return;
+		}
+		if (this.mode === "inspector") {
+			return;
+		}
 		if (kb.matches(keyData, "tui.select.up")) {
-			if (this.cards.length === 0) return;
-			this.selectedIndex = this.selectedIndex === 0 ? this.cards.length - 1 : this.selectedIndex - 1;
+			if (cards.length === 0) return;
+			this.selectedIndex = this.selectedIndex === 0 ? cards.length - 1 : this.selectedIndex - 1;
 			return;
 		}
 		if (kb.matches(keyData, "tui.select.down")) {
-			if (this.cards.length === 0) return;
-			this.selectedIndex = this.selectedIndex === this.cards.length - 1 ? 0 : this.selectedIndex + 1;
+			if (cards.length === 0) return;
+			this.selectedIndex = this.selectedIndex === cards.length - 1 ? 0 : this.selectedIndex + 1;
 			return;
 		}
 		if (kb.matches(keyData, "tui.select.confirm")) {
-			void this.confirmSelection();
+			this.confirmSelection();
 			return;
 		}
-		if (kb.matches(keyData, "tui.select.cancel")) {
-			this.done(undefined);
-		}
 	}
 
-	invalidate(): void {}
-
-	private async confirmSelection(): Promise<void> {
-		if (this.cards.length === 0 || this.selectionInFlight) return;
-		const selected = this.cards[this.selectedIndex];
-		this.selectionInFlight = true;
-
-		try {
-			const outcome = await (this.onSelect?.(selected) ?? { kind: "open" });
-			if (outcome.kind === "blocked") {
-				this.statusMessage = outcome.message;
-				return;
-			}
-			if (outcome.kind === "stay") {
-				return;
-			}
-			this.done(selected);
-		} finally {
-			this.selectionInFlight = false;
-		}
+	invalidate(): void {
+		this.clampSelection(this.getCurrentCards());
 	}
 
-	private getSelectedCard(): SubagentCard | undefined {
-		return this.cards[this.selectedIndex] ?? this.cards[0];
+	private confirmSelection(): void {
+		const cards = this.getCurrentCards();
+		if (cards.length === 0) return;
+		this.mode = "inspector";
+	}
+
+	private clampSelection(cards: SubagentCard[]): void {
+		if (cards.length === 0) {
+			this.selectedIndex = 0;
+			return;
+		}
+		this.selectedIndex = Math.max(0, Math.min(this.selectedIndex, cards.length - 1));
+	}
+
+	private getCurrentCards(): SubagentCard[] {
+		const cards = this.getCards();
+		this.clampSelection(cards);
+		return cards;
+	}
+
+	private getSelectedCard(cards: SubagentCard[]): SubagentCard | undefined {
+		return cards[this.selectedIndex] ?? cards[0];
 	}
 
 	private getViewportHeight(): number {
 		return Math.max(MIN_BROWSER_ROWS, this.tui?.terminal?.rows ?? 0);
 	}
 
-	private renderSessionsPane(width: number, height: number): string[] {
+	private renderSessionsPane(cards: SubagentCard[], width: number, height: number): string[] {
 		const lines = [this.theme.fg("muted", "Sessions")];
 
-		if (this.cards.length === 0) {
+		if (cards.length === 0) {
 			lines.push(this.theme.fg("muted", "No current-branch sessions."));
 			return finalizePane(lines, width, height);
 		}
 
 		const visibleCards = Math.max(1, Math.floor((height - 1) / SESSION_CARD_ROWS));
-		const start = getWindowStart(this.cards.length, visibleCards, this.selectedIndex);
-		const end = Math.min(this.cards.length, start + visibleCards);
+		const start = getWindowStart(cards.length, visibleCards, this.selectedIndex);
+		const end = Math.min(cards.length, start + visibleCards);
 
 		for (let index = start; index < end; index++) {
-			const card = this.cards[index];
+			const card = cards[index];
 			const selected = index === this.selectedIndex;
 			lines.push(maybeHighlight(this.theme, padToWidth(formatCardHeader(card, selected, this.theme), width), selected));
 			if (lines.length >= height) break;
@@ -177,7 +179,7 @@ export class SubagentBrowser {
 			if (lines.length >= height) break;
 		}
 
-		const hiddenCount = this.cards.length - end;
+		const hiddenCount = cards.length - end;
 		if (hiddenCount > 0 && lines.length < height) {
 			lines.push(this.theme.fg("dim", `... ${hiddenCount} more`));
 		}
@@ -185,9 +187,9 @@ export class SubagentBrowser {
 		return finalizePane(lines, width, height);
 	}
 
-	private renderDetailPane(width: number, height: number): string[] {
+	private renderDetailPane(cards: SubagentCard[], width: number, height: number): string[] {
 		const lines = [this.theme.fg("muted", "Selected")];
-		const selected = this.getSelectedCard();
+		const selected = this.getSelectedCard(cards);
 		if (!selected) {
 			lines.push(this.theme.fg("muted", "No subagent sessions on the current branch."));
 			return finalizePane(lines, width, height);
@@ -215,47 +217,89 @@ export class SubagentBrowser {
 		return finalizePane(lines, width, height);
 	}
 
-	private renderWide(width: number, height: number): string[] {
+	private renderInspectorPane(cards: SubagentCard[], width: number, height: number): string[] {
+		const selected = this.getSelectedCard(cards);
+		if (!selected) {
+			return finalizePane([this.theme.fg("muted", "No subagent runs in this session.")], width, height);
+		}
+
+		const lines = [
+			`${this.theme.fg("accent", `Subagent [${selected.thread}]`)} ${this.theme.fg("dim", `${formatStatus(selected.status)} ${formatCost(selected.accumulatedCost)}`)}`,
+			this.theme.fg("dim", selected.sessionPath),
+			"",
+			this.theme.fg("muted", "Action"),
+			...clampWrapped(selected.latestAction || "(no action)", width, 3).map((line) => this.theme.fg("text", line)),
+			"",
+			this.theme.fg("muted", "Output"),
+		];
+
+		const outputLines = selected.outputTail.length > 0
+			? selected.outputTail
+			: [selected.outputPreview || "(no output yet)"];
+		for (const outputLine of outputLines) {
+			for (const line of clampWrapped(outputLine, width, 2)) {
+				lines.push(this.theme.fg("text", line));
+			}
+		}
+
+		lines.push("");
+		lines.push(this.theme.fg("muted", "Recent Tool"));
+		for (const line of clampWrapped(selected.toolPreview || "(no recent tool calls)", width, 2)) {
+			lines.push(this.theme.fg("dim", line));
+		}
+
+		return finalizePane(lines, width, height);
+	}
+
+	private renderWide(cards: SubagentCard[], width: number, height: number): string[] {
 		const innerWidth = Math.max(24, width - 3);
 		const leftWidth = Math.max(24, Math.floor(innerWidth * 0.42));
 		const rightWidth = Math.max(24, innerWidth - leftWidth);
 		return combineColumns(
-			this.renderSessionsPane(leftWidth, height),
-			this.renderDetailPane(rightWidth, height),
+			this.renderSessionsPane(cards, leftWidth, height),
+			this.renderDetailPane(cards, rightWidth, height),
 			leftWidth,
 			rightWidth,
 			height,
 		);
 	}
 
-	private renderNarrow(width: number, height: number): string[] {
+	private renderNarrow(cards: SubagentCard[], width: number, height: number): string[] {
 		const sessionsHeight = Math.max(4, Math.floor((height - 1) * 0.4));
 		const detailHeight = Math.max(4, height - 1 - sessionsHeight);
 		return [
-			...this.renderSessionsPane(width, sessionsHeight),
+			...this.renderSessionsPane(cards, width, sessionsHeight),
 			"",
-			...this.renderDetailPane(width, detailHeight),
+			...this.renderDetailPane(cards, width, detailHeight),
 		];
 	}
 
 	render(width: number): string[] {
-		const statusLines = this.statusMessage
-			? wrapText(this.statusMessage, Math.max(12, width), { minWidth: 12 })
-				.slice(0, 2)
-				.map((line) => this.theme.fg("warning", line))
-			: [];
+		const cards = this.getCurrentCards();
 		const headerLines = [
 			this.theme.fg("toolTitle", "Subagents"),
-			this.theme.fg("dim", "Current branch only. Up/Down browse, Enter open, Esc close"),
-			...statusLines,
+			this.theme.fg(
+				"dim",
+				this.mode === "inspector"
+					? "Live inspector. Esc back to the browser"
+					: "Current session only. Up/Down browse, Enter inspect, Esc close",
+			),
 			"",
 		];
 		const viewportHeight = this.getViewportHeight();
 		const bodyHeight = Math.max(6, viewportHeight - headerLines.length);
 
-		if (this.cards.length === 0) {
+		if (cards.length === 0) {
 			return finalizePane(
-				[...headerLines, this.theme.fg("muted", "No subagent sessions on the current branch.")],
+				[...headerLines, this.theme.fg("muted", "No subagent runs in this session.")],
+				width,
+				viewportHeight,
+			).map((line) => truncateToWidth(line, width));
+		}
+
+		if (this.mode === "inspector") {
+			return finalizePane(
+				[...headerLines, ...this.renderInspectorPane(cards, width, bodyHeight)],
 				width,
 				viewportHeight,
 			).map((line) => truncateToWidth(line, width));
@@ -264,7 +308,7 @@ export class SubagentBrowser {
 		return finalizePane(
 			[
 				...headerLines,
-				...(width >= WIDE_LAYOUT_MIN_WIDTH ? this.renderWide(width, bodyHeight) : this.renderNarrow(width, bodyHeight)),
+				...(width >= WIDE_LAYOUT_MIN_WIDTH ? this.renderWide(cards, width, bodyHeight) : this.renderNarrow(cards, width, bodyHeight)),
 			],
 			width,
 			viewportHeight,

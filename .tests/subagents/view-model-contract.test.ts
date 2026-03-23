@@ -327,7 +327,7 @@ test("/subagents should list a just-dispatched in-flight thread from same-runtim
 	}
 });
 
-test("/subagents should list a persisted current-branch child session while the parent dispatch is still in flight before completion metadata exists", async () => {
+test("/subagents should ignore stale state.json parent linkage when no same-runtime run or completed dispatch result exists", async () => {
 	const projectDir = makeTempProject();
 	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
 	const alphaSession = path.join(projectDir, ".pi", "threads", "alpha.jsonl");
@@ -410,8 +410,8 @@ test("/subagents should list a persisted current-branch child session while the 
 		const rendered = flattenRenderedLines(customRenderer!(undefined, makeTheme(), undefined, () => {}), 80).join("\n");
 		assert.match(
 			rendered,
-			/\[alpha\]/,
-			"known current-branch child sessions should remain visible while the dispatch is still in flight, not only after a completed dispatch toolResult is written",
+			/No subagent runs in this session\./,
+			"live /subagents discovery should come from the runtime-owned run store or completed parent dispatch metadata, not stale parent linkage persisted in state.json",
 		);
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });
@@ -735,7 +735,7 @@ test("standalone /subagents browser should use the keybindings object supplied b
 		assert.ok(customRenderer, "/subagents should invoke ctx.ui.custom()");
 
 		const keybindingCalls: Array<{ keyData: string; command: string }> = [];
-		let selectedThread: string | undefined;
+		let closed = false;
 		const browser = customRenderer!(
 			undefined,
 			makeTheme(),
@@ -744,14 +744,15 @@ test("standalone /subagents browser should use the keybindings object supplied b
 					keybindingCalls.push({ keyData, command });
 					return (
 						(keyData === "custom-next" && command === "tui.select.down") ||
-						(keyData === "custom-open" && command === "tui.select.confirm")
+						(keyData === "custom-open" && command === "tui.select.confirm") ||
+						(keyData === "custom-close" && command === "tui.select.cancel")
 					);
 				},
 			},
-			(result: { thread?: string } | undefined) => {
-				selectedThread = result?.thread;
+			() => {
+				closed = true;
 			},
-		) as { handleInput?: (keyData: string) => void };
+		) as { handleInput?: (keyData: string) => void; render?: (width: number) => string[] };
 
 		assert.equal(typeof browser.handleInput, "function", "custom view should return an interactive browser with input handling");
 
@@ -761,19 +762,28 @@ test("standalone /subagents browser should use the keybindings object supplied b
 		assert.deepEqual(
 			keybindingCalls,
 			[
+				{ keyData: "custom-next", command: "tui.select.cancel" },
 				{ keyData: "custom-next", command: "tui.select.up" },
 				{ keyData: "custom-next", command: "tui.select.down" },
+				{ keyData: "custom-open", command: "tui.select.cancel" },
 				{ keyData: "custom-open", command: "tui.select.up" },
 				{ keyData: "custom-open", command: "tui.select.down" },
 				{ keyData: "custom-open", command: "tui.select.confirm" },
 			],
 			"the standalone browser should query the ctx.ui.custom() keybindings object for its navigation commands",
 		);
-		assert.equal(
-			selectedThread,
-			"beta",
-			"the standalone browser should navigate and confirm using the supplied keybindings instead of a separate global keybinding export",
+		assert.match(browser.render!(80).join("\n"), /Subagent \[beta\]/, "confirm should open the same-session inspector for the selected thread");
+		browser.handleInput!("custom-close");
+		browser.handleInput!("custom-close");
+		assert.deepEqual(
+			keybindingCalls.slice(-2),
+			[
+				{ keyData: "custom-close", command: "tui.select.cancel" },
+				{ keyData: "custom-close", command: "tui.select.cancel" },
+			],
+			"cancel should also flow through the supplied keybindings object",
 		);
+		assert.equal(closed, true, "cancel should back out of the inspector and then close the browser");
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });
 	}
