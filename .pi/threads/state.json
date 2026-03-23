@@ -1,7 +1,7 @@
 {
   "enabled": true,
   "parentBySession": {
-    "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/repo-survey.jsonl": "/home/bitzaven/.pi/agent/sessions/--home-bitzaven-CodingProjects-pi-threads--/2026-03-23T01-33-28-368Z_d1faa511-5a2f-4a4e-9b3b-e9be5fb96fb9.jsonl",
+    "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/repo-survey.jsonl": "/home/bitzaven/.pi/agent/sessions/--home-bitzaven-CodingProjects-pi-threads--/2026-03-23T04-22-02-322Z_94e77849-2e42-4634-9007-3ff499144a52.jsonl",
     "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/issue-scan.jsonl": "/home/bitzaven/.pi/agent/sessions/--home-bitzaven-CodingProjects-pi-threads--/2026-03-23T01-33-28-368Z_d1faa511-5a2f-4a4e-9b3b-e9be5fb96fb9.jsonl",
     "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/pi-loading.jsonl": "/home/bitzaven/.pi/agent/sessions/--home-bitzaven-CodingProjects-pi-threads--/2026-03-23T01-33-28-368Z_d1faa511-5a2f-4a4e-9b3b-e9be5fb96fb9.jsonl",
     "/home/bitzaven/CodingProjects/pi-threads/.pi/threads/repro-harness.jsonl": "/home/bitzaven/.pi/agent/sessions/--home-bitzaven-CodingProjects-pi-threads--/2026-03-23T01-33-28-368Z_d1faa511-5a2f-4a4e-9b3b-e9be5fb96fb9.jsonl",
