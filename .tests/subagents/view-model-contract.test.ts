@@ -209,6 +209,97 @@ test("/subagents should open an independent custom view instead of a modal overl
 	}
 });
 
+test("/subagents should list a persisted current-context thread even before the parent branch records a completed dispatch toolResult", async () => {
+	const projectDir = makeTempProject();
+	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
+	const alphaSession = path.join(projectDir, ".pi", "threads", "alpha.jsonl");
+
+	try {
+		writeThreadSession(parentSession, [{ type: "session", version: 3, cwd: projectDir }]);
+		writeThreadSession(alphaSession, [
+			{ type: "session", version: 3, cwd: projectDir },
+			{
+				type: "message",
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "Inspect alpha while it is still running" }],
+				},
+			},
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "partial progress" }],
+				},
+			},
+		]);
+		fs.mkdirSync(path.join(projectDir, ".pi", "threads"), { recursive: true });
+		fs.writeFileSync(
+			path.join(projectDir, ".pi", "threads", "state.json"),
+			JSON.stringify(
+				{
+					enabled: true,
+					parentBySession: {
+						[path.resolve(alphaSession)]: path.resolve(parentSession),
+					},
+				},
+				null,
+				2,
+			) + "\n",
+			"utf8",
+		);
+
+		const fakePi = makeFakePi();
+		registerExtension(fakePi as any);
+
+		const subagents = fakePi.commands.get("subagents");
+		assert.ok(subagents, "/subagents should be registered");
+
+		let customRenderer: ((...args: any[]) => unknown) | undefined;
+
+		await subagents!.handler("", {
+			cwd: projectDir,
+			hasUI: true,
+			switchSession: async () => ({ cancelled: false }),
+			ui: {
+				notify: () => {},
+				custom: async (renderer: (...args: any[]) => unknown) => {
+					customRenderer = renderer;
+					return undefined;
+				},
+			},
+			sessionManager: {
+				getSessionFile: () => parentSession,
+				getBranch: () => [{
+					type: "message",
+					message: {
+						role: "assistant",
+						content: [{
+							type: "toolCall",
+							name: "dispatch",
+							arguments: {
+								thread: "alpha",
+								action: "Inspect alpha while it is still running",
+							},
+						}],
+					},
+				}],
+			},
+		} as any);
+
+		assert.ok(customRenderer, "/subagents should invoke ctx.ui.custom()");
+
+		const rendered = flattenRenderedLines(customRenderer!(undefined, makeTheme(), undefined, () => {}), 80).join("\n");
+		assert.match(
+			rendered,
+			/\[alpha\]/,
+			"known persisted subagent sessions for the current parent context should remain visible before a completed dispatch toolResult is written",
+		);
+	} finally {
+		fs.rmSync(projectDir, { recursive: true, force: true });
+	}
+});
+
 test("/subagents browser should keep navigation and selected-detail panes visible together above the fold instead of stacking the full list first", async () => {
 	const projectDir = makeTempProject();
 	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
