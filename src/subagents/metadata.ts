@@ -102,6 +102,11 @@ function getThreadName(sessionPath: string): string {
 	return path.basename(sessionPath, ".jsonl");
 }
 
+function getThreadSessionPath(threadsDir: string, thread: string): string {
+	const safeThread = thread.replace(/[^\w.-]+/g, "_");
+	return path.join(threadsDir, `${safeThread}.jsonl`);
+}
+
 function parseJsonLines(filePath: string): SessionLine[] {
 	const content = fs.readFileSync(filePath, "utf8");
 	const lines: SessionLine[] = [];
@@ -238,7 +243,7 @@ function isThreadSessionFile(threadsDir: string, sessionPath: string): boolean {
 function resolveDispatchSessionPath(threadsDir: string, item: DispatchItem): string | undefined {
 	const candidateSessionPaths = [
 		typeof item.result?.sessionPath === "string" ? item.result.sessionPath : undefined,
-		item.thread ? path.join(threadsDir, `${item.thread}.jsonl`) : undefined,
+		item.thread ? getThreadSessionPath(threadsDir, item.thread) : undefined,
 	];
 
 	for (const candidateSessionPath of candidateSessionPaths) {
@@ -250,23 +255,57 @@ function resolveDispatchSessionPath(threadsDir: string, item: DispatchItem): str
 	return undefined;
 }
 
+function collectDispatchToolCallThreads(parts: SessionMessageContentPart[] | undefined): string[] {
+	if (!parts || parts.length === 0) return [];
+
+	const threads = new Set<string>();
+	for (const part of parts) {
+		if (part.type !== "toolCall" || part.name !== "dispatch") continue;
+
+		const singleThread = part.arguments?.thread;
+		if (typeof singleThread === "string" && singleThread.length > 0) {
+			threads.add(singleThread);
+		}
+
+		const tasks = part.arguments?.tasks;
+		if (!Array.isArray(tasks)) continue;
+		for (const task of tasks) {
+			if (typeof task !== "object" || task === null) continue;
+			const thread = (task as { thread?: unknown }).thread;
+			if (typeof thread === "string" && thread.length > 0) {
+				threads.add(thread);
+			}
+		}
+	}
+
+	return [...threads];
+}
+
 function collectCurrentBranchSessions(threadsDir: string, parentBranchEntries: unknown[]): Map<string, string> {
 	const sessions = new Map<string, string>();
 
 	for (const entry of parentBranchEntries) {
 		if (typeof entry !== "object" || entry === null) continue;
 		const line = entry as SessionLine & { message?: SessionMessage };
-		if (line.type !== "message" || line.message?.role !== "toolResult") continue;
-		if (line.message.toolName !== "dispatch") continue;
+		if (line.type !== "message" || !line.message) continue;
 
-		const details = line.message.details as { items?: DispatchItem[] } | undefined;
-		if (!details?.items) continue;
+		if (line.message.role === "toolResult" && line.message.toolName === "dispatch") {
+			const details = line.message.details as { items?: DispatchItem[] } | undefined;
+			if (!details?.items) continue;
 
-		for (const item of details.items) {
-			if (!item.thread) continue;
-			const sessionPath = resolveDispatchSessionPath(threadsDir, item);
-			if (!sessionPath) continue;
-			sessions.set(item.thread, sessionPath);
+			for (const item of details.items) {
+				if (!item.thread) continue;
+				const sessionPath = resolveDispatchSessionPath(threadsDir, item);
+				if (!sessionPath) continue;
+				sessions.set(item.thread, sessionPath);
+			}
+			continue;
+		}
+
+		for (const thread of collectDispatchToolCallThreads(line.message.content)) {
+			const sessionPath = getThreadSessionPath(threadsDir, thread);
+			if (!isThreadSessionFile(threadsDir, sessionPath)) continue;
+			sessions.set(thread, path.resolve(sessionPath));
 		}
 	}
 

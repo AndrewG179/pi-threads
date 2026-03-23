@@ -327,6 +327,97 @@ test("/subagents should list a just-dispatched in-flight thread from same-runtim
 	}
 });
 
+test("/subagents should list a persisted current-branch child session while the parent dispatch is still in flight before completion metadata exists", async () => {
+	const projectDir = makeTempProject();
+	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
+	const alphaSession = path.join(projectDir, ".pi", "threads", "alpha.jsonl");
+
+	try {
+		writeThreadSession(parentSession, [{ type: "session", version: 3, cwd: projectDir }]);
+		writeThreadSession(alphaSession, [
+			{ type: "session", version: 3, cwd: projectDir },
+			{
+				type: "message",
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "Inspect alpha while it is still running" }],
+				},
+			},
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "partial progress" }],
+				},
+			},
+		]);
+		fs.mkdirSync(path.join(projectDir, ".pi", "threads"), { recursive: true });
+		fs.writeFileSync(
+			path.join(projectDir, ".pi", "threads", "state.json"),
+			JSON.stringify(
+				{
+					enabled: true,
+					parentBySession: {
+						[path.resolve(alphaSession)]: path.resolve(parentSession),
+					},
+				},
+				null,
+				2,
+			) + "\n",
+			"utf8",
+		);
+
+		const fakePi = makeFakePi();
+		registerExtension(fakePi as any);
+
+		const subagents = fakePi.commands.get("subagents");
+		assert.ok(subagents, "/subagents should be registered");
+
+		let customRenderer: ((...args: any[]) => unknown) | undefined;
+
+		await subagents!.handler("", {
+			cwd: projectDir,
+			hasUI: true,
+			switchSession: async () => ({ cancelled: false }),
+			ui: {
+				notify: () => {},
+				custom: async (renderer: (...args: any[]) => unknown) => {
+					customRenderer = renderer;
+					return undefined;
+				},
+			},
+			sessionManager: {
+				getSessionFile: () => parentSession,
+				getBranch: () => [{
+					type: "message",
+					message: {
+						role: "assistant",
+						content: [{
+							type: "toolCall",
+							name: "dispatch",
+							arguments: {
+								thread: "alpha",
+								action: "Inspect alpha while it is still running",
+							},
+						}],
+					},
+				}],
+			},
+		} as any);
+
+		assert.ok(customRenderer, "/subagents should invoke ctx.ui.custom()");
+
+		const rendered = flattenRenderedLines(customRenderer!(undefined, makeTheme(), undefined, () => {}), 80).join("\n");
+		assert.match(
+			rendered,
+			/\[alpha\]/,
+			"known current-branch child sessions should remain visible while the dispatch is still in flight, not only after a completed dispatch toolResult is written",
+		);
+	} finally {
+		fs.rmSync(projectDir, { recursive: true, force: true });
+	}
+});
+
 test("/subagents browser should keep navigation and selected-detail panes visible together above the fold instead of stacking the full list first", async () => {
 	const projectDir = makeTempProject();
 	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
@@ -688,94 +779,15 @@ test("standalone /subagents browser should use the keybindings object supplied b
 	}
 });
 
-test("ctrl+o should route into the standalone /subagents browser when shortcuts are available", async () => {
-	const projectDir = makeTempProject();
-	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
-	const alphaSession = path.join(projectDir, ".pi", "threads", "alpha.jsonl");
+test("ctrl+o shortcut conflict should not be part of the extension contract", () => {
+	const fakePi = makeFakePi();
+	registerExtension(fakePi as any);
 
-	try {
-		writeThreadSession(parentSession, [{ type: "session", version: 3, cwd: projectDir }]);
-		writeThreadSession(alphaSession, [
-			{ type: "session", version: 3, cwd: projectDir },
-			{
-				type: "message",
-				message: {
-					role: "user",
-					content: [{ type: "text", text: "Inspect alpha" }],
-				},
-			},
-			{
-				type: "message",
-				message: {
-					role: "assistant",
-					content: [{ type: "text", text: "alpha ready" }],
-				},
-			},
-		]);
-
-		const fakePi = makeFakePi();
-		registerExtension(fakePi as any);
-
-		const shortcut = fakePi.shortcuts.get("ctrl+o");
-		assert.ok(shortcut, "ctrl+o should be registered as a /subagents browser entry path");
-
-		let customRenderer: ((...args: any[]) => unknown) | undefined;
-		let customOptions: Record<string, unknown> | undefined;
-
-		await shortcut!.handler({
-			cwd: projectDir,
-			hasUI: true,
-			switchSession: async () => ({ cancelled: false }),
-			ui: {
-				notify: () => {},
-				custom: async (renderer: (...args: any[]) => unknown, options?: Record<string, unknown>) => {
-					customRenderer = renderer;
-					customOptions = options;
-					return undefined;
-				},
-			},
-			sessionManager: {
-				getSessionFile: () => parentSession,
-				getBranch: () => [{
-					type: "message",
-					message: {
-						role: "toolResult",
-						toolName: "dispatch",
-						details: {
-							mode: "single",
-							items: [{
-								thread: "alpha",
-								action: "Inspect alpha",
-								episode: "alpha ready",
-								episodeNumber: 1,
-								result: {
-									exitCode: 0,
-									stderr: "",
-									messages: [{ role: "assistant", content: [{ type: "text", text: "alpha ready" }] }],
-									usage: {
-										input: 12,
-										output: 8,
-										cacheRead: 0,
-										cacheWrite: 0,
-										cost: 0.02,
-										contextTokens: 20,
-										turns: 1,
-									},
-									sessionPath: alphaSession,
-									isNewThread: false,
-								},
-							}],
-						},
-					},
-				}],
-			},
-		} as any);
-
-		assert.ok(customRenderer, "ctrl+o should open the subagent browser");
-		assert.equal(customOptions?.overlay, true, "ctrl+o should open the fullscreen browser overlay");
-	} finally {
-		fs.rmSync(projectDir, { recursive: true, force: true });
-	}
+	assert.equal(
+		fakePi.shortcuts.get("ctrl+o"),
+		undefined,
+		"the extension should not hard-register ctrl+o because the host already reserves that keybinding; /subagents should remain available through the explicit command contract instead",
+	);
 });
 
 test("collapsed single dispatch chat rendering should stay lightweight and reject inline Ctrl+O expansion prompts", () => {

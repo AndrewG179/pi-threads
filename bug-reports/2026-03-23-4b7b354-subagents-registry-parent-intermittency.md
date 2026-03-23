@@ -1,85 +1,79 @@
-# `/subagents` Can Intermittently Show No Current-Branch Sessions And No Remembered Parent Before Registry/State Synchronize
+# `/subagents` Still Hides Live Current-Branch Child Sessions Until Completion Metadata Lands
 
 Date: 2026-03-23
-Git revision: `4b7b354cd4b8b8b25b1e5a00befe05272dc5d342` (`4b7b354`)
-Evidence basis: static inspection of [index.ts](/home/bitzaven/CodingProjects/pi-threads/index.ts#L446), [index.ts](/home/bitzaven/CodingProjects/pi-threads/index.ts#L549), [index.ts](/home/bitzaven/CodingProjects/pi-threads/index.ts#L593), [index.ts](/home/bitzaven/CodingProjects/pi-threads/index.ts#L621), [index.ts](/home/bitzaven/CodingProjects/pi-threads/index.ts#L767), [src/subagents/metadata.ts](/home/bitzaven/CodingProjects/pi-threads/src/subagents/metadata.ts#L257), [src/subagents/state.ts](/home/bitzaven/CodingProjects/pi-threads/src/subagents/state.ts#L26), and [src/subagents/mode.ts](/home/bitzaven/CodingProjects/pi-threads/src/subagents/mode.ts#L39), plus user-supplied observation from a real run. No independent live-drive run was performed for this report.
+Evidence basis: static inspection of the current `collectSubagentCards()` implementation in [src/subagents/metadata.ts](/home/bitzaven/CodingProjects/pi-threads/src/subagents/metadata.ts#L253), the current `/subagents` entry path in [index.ts](/home/bitzaven/CodingProjects/pi-threads/index.ts), the saved reproducer note at [/tmp/subagents-registry-test.txt](/tmp/subagents-registry-test.txt), and the failing contract test in [.tests/subagents/view-model-contract.test.ts](/home/bitzaven/CodingProjects/pi-threads/.tests/subagents/view-model-contract.test.ts). No independent live-drive run was performed for this update.
 
 ## Assumptions
 
-- The user-reported run happened on this branch or a materially equivalent build.
-- The user observation provided with this task is accurate: a real run showed the two intermittent symptoms this report describes, namely `/subagents` appearing to have no current-branch subagents during an active dispatch window, and parent/back-navigation initially reporting no remembered parent before a later retry worked.
-- No terminal transcript or screenshot for that run is stored in this repository, so the runtime symptom evidence here is limited to the user report plus the cited code.
-
-## Scope
-
-This report is about selector data availability and parent-session lookup timing. It is not the fullscreen-clearing/rendering issue documented separately in [bug-reports/2026-03-23-77ba46b-subagents-browser-fullscreen-clearing-regression.md](/home/bitzaven/CodingProjects/pi-threads/bug-reports/2026-03-23-77ba46b-subagents-browser-fullscreen-clearing-regression.md).
+- A child transcript already present under `.pi/threads/*.jsonl` and mapped back to the active parent session is sufficient evidence that the child belongs to the current parent context, even if the parent has not yet written a completed `dispatch` `toolResult`.
+- The saved note in [/tmp/subagents-registry-test.txt](/tmp/subagents-registry-test.txt) accurately captures a previously observed failure shape for this repo.
+- This report is only about current-branch child-session visibility while work is still live. It is not the separate remembered-parent/back-navigation timing issue discussed in earlier iterations of this file.
 
 ## Summary
 
-On the current branch, `/subagents` reconstructs its current-branch cards only from completed parent-branch `toolResult` entries for `dispatch`, and subagent parent lookup reads only persisted `state.parentBySession`. That means the reader side depends on asynchronous artifacts that may lag behind live execution:
-
-- if a dispatch is still running and has not yet emitted a completed `toolResult`, `/subagents` can legitimately reconstruct zero cards and appear to have "no subagents";
-- if parent-session state has been written but the active session context has not yet synchronized with that persisted state, the first parent lookup can report no remembered parent and a later retry can succeed.
-
-The user reported exactly those two symptoms in a real run, and the current read paths match them.
+The current implementation partially supports live/in-flight child visibility, but only when the browser is given an explicit same-runtime registry map. Without that in-memory registry, `/subagents` still derives current-branch children only from completed `dispatch` `toolResult` entries. That means a real child session can already exist on disk, belong to the current parent, and still remain invisible in `/subagents` until completion metadata lands.
 
 ## Expected
 
-- While a dispatch is in flight for the current parent session, `/subagents` should continue to expose the relevant current-branch thread sessions rather than transiently appearing empty just because completion metadata has not landed yet.
-- A subagent session that already has a known parent in the current runtime should not transiently lose back-navigation solely because persisted state/session context synchronization is one step behind.
-- These guarantees should hold independently of browser rendering behavior; this bug is about data/source timing, not about fullscreen clearing.
+- If a child session is already present under `.pi/threads` and belongs to the current parent branch, `/subagents` should continue to show it while the dispatch is still live/in-flight.
+- Live current-branch visibility should not depend solely on a same-runtime in-memory registry or on waiting for a completed `toolResult`.
 
 ## Actual
 
-- `/subagents` can transiently appear to have no current-branch subagents even though a dispatch from the current parent session is actively running.
-- Parent/back-navigation can transiently say there is no remembered parent on the first lookup, then succeed on a later retry after state/session context catches up.
-- The user observed exactly that pattern in a real run.
+- `/subagents` seeds cards from `runtimeSessions` when that map is explicitly provided, or from completed `dispatch` `toolResult` entries.
+- If neither of those sources is available yet, the browser renders no current-branch sessions even when a live child transcript already exists and is mapped to the current parent.
+- The saved repro note at [/tmp/subagents-registry-test.txt](/tmp/subagents-registry-test.txt) captured exactly that failure shape, and the new test now reproduces it as an expected failure.
 
 ## Concrete Evidence And Reasoning
 
-### 1. Current-branch card discovery only reads completed parent-branch `toolResult` entries
+### 1. Completed metadata is still the only branch-derived inclusion source
 
-In [src/subagents/metadata.ts](/home/bitzaven/CodingProjects/pi-threads/src/subagents/metadata.ts#L257), `collectCurrentBranchSessions()` iterates `parentBranchEntries`, but it keeps only entries where:
+In [src/subagents/metadata.ts](/home/bitzaven/CodingProjects/pi-threads/src/subagents/metadata.ts#L253), `collectCurrentBranchSessions()` only accepts parent-branch entries where:
 
-- `line.type === "message"` at line 263,
-- `line.message?.role === "toolResult"` at line 263,
-- `line.message.toolName === "dispatch"` at line 264.
+- `line.type === "message"`,
+- `line.message?.role === "toolResult"`, and
+- `line.message.toolName === "dispatch"`.
 
-It then requires `details.items` at line 267 and derives session paths from those completed dispatch result items at line 271 before inserting them into the session map at line 273.
+It then requires `details.items` and resolves session paths from those completed result items.
 
-In [src/subagents/metadata.ts](/home/bitzaven/CodingProjects/pi-threads/src/subagents/metadata.ts#L280), `collectSubagentCards()` builds cards only by iterating the map returned from `collectCurrentBranchSessions()` at line 285. There is no second source of current-branch sessions there. `mergeParentDispatchDetails()` does not create missing cards; it only mutates cards that already exist, as shown by the `if (!card) continue;` guard in [src/subagents/metadata.ts](/home/bitzaven/CodingProjects/pi-threads/src/subagents/metadata.ts#L215).
+So a parent branch that only has a live `dispatch` tool call, but no completed `toolResult`, contributes nothing to current-branch inclusion.
 
-Based on that code, a running dispatch with streamed progress but no completed parent-branch `toolResult` entry yet will produce zero current-branch cards. That exactly explains the intermittent "no subagents" symptom.
+### 2. Same-runtime registry support exists, but only when the caller already has it
 
-### 2. Parent lookup is read only from persisted `state.parentBySession`
+In [src/subagents/metadata.ts](/home/bitzaven/CodingProjects/pi-threads/src/subagents/metadata.ts#L276), `collectSubagentCards()` accepts an optional `runtimeSessions` map and seeds cards from it before it looks at completed branch metadata.
 
-In [src/subagents/state.ts](/home/bitzaven/CodingProjects/pi-threads/src/subagents/state.ts#L26), `loadThreadsState()` reads `.pi/threads/state.json` from disk. The only parent mapping it returns is `parentBySession`, populated from parsed persisted JSON at lines 39-44.
+That means the current implementation already has a same-runtime escape hatch for in-flight visibility, but it is not a general current-branch discovery mechanism. If the caller does not have a populated runtime registry, the browser still falls back to completed metadata only.
 
-In [src/subagents/mode.ts](/home/bitzaven/CodingProjects/pi-threads/src/subagents/mode.ts#L39), `deriveSessionBehavior()` computes `parentSessionFile` only from `input.state.parentBySession[sessionFile]` at line 42. There is no fallback to live dispatch context, recent browser selection context, or session-branch metadata.
+### 3. The saved repro and new failing test exercise that gap directly
 
-In [src/subagents/metadata.ts](/home/bitzaven/CodingProjects/pi-threads/src/subagents/metadata.ts#L280), each card's `parentSessionFile` is likewise read only from `state.parentBySession[path.resolve(sessionPath)]` at line 286.
+The note at [/tmp/subagents-registry-test.txt](/tmp/subagents-registry-test.txt) captures a reproducer where:
 
-In [index.ts](/home/bitzaven/CodingProjects/pi-threads/index.ts#L446), `resolveSessionContext()` reloads state from disk at line 450 and immediately derives behavior from that state at lines 451-455. In [index.ts](/home/bitzaven/CodingProjects/pi-threads/index.ts#L549), `switchToRememberedParent()` warns `No remembered parent session for this thread.` at line 551 whenever `behavior.parentSessionFile` is missing.
+- the parent branch contains only a live `dispatch` tool call;
+- the child transcript already exists under `.pi/threads/alpha.jsonl`;
+- the child is persisted as belonging to the current parent;
+- `/subagents` still renders `No current-branch sessions.` instead of listing `alpha`.
 
-That is enough to make the failure intermittent instead of permanent: the read side has no source other than persisted `state.parentBySession`, so any early/stale lookup will report no parent even if the runtime already "knows" the intended relationship elsewhere.
-
-### 3. A later retry can work because the write side exists, but the read side has no fallback
-
-This report is not claiming parent mappings are never written.
-
-- `/subagents` writes the mapping on session open via `rememberParentSession(...)` and `saveThreadsState(...)` in [index.ts](/home/bitzaven/CodingProjects/pi-threads/index.ts#L621) and [index.ts](/home/bitzaven/CodingProjects/pi-threads/index.ts#L622).
-- `dispatch` also writes parent mappings before worker execution in [index.ts](/home/bitzaven/CodingProjects/pi-threads/index.ts#L767) through [index.ts](/home/bitzaven/CodingProjects/pi-threads/index.ts#L773).
-
-Because those writes exist, a later retry can succeed once `.pi/threads/state.json` and the next `resolveSessionContext()` call are aligned. The intermittent bug is that the read paths cited above do not tolerate the window before that alignment is visible.
+That exact repro shape is now encoded as a failing test in [.tests/subagents/view-model-contract.test.ts](/home/bitzaven/CodingProjects/pi-threads/.tests/subagents/view-model-contract.test.ts).
 
 ## Impact
 
-- `/subagents` can look falsely empty during the exact period when the user most needs it for live dispatch monitoring.
-- Subagent sessions can transiently lose trusted back-navigation and emit a misleading "No remembered parent session for this thread." warning even though the relationship may become visible moments later.
-- The combined effect is a registry/parent-consistency failure that makes the feature feel unreliable and race-prone.
+- `/subagents` can still look falsely empty during the exact live/in-flight window where the user most needs to inspect or enter a child session.
+- Current-branch child visibility depends on completion timing or ephemeral runtime registry state instead of the child session actually existing and belonging to the parent context.
+
+## Reproducer
+
+- Failing contract test:
+  - [.tests/subagents/view-model-contract.test.ts](/home/bitzaven/CodingProjects/pi-threads/.tests/subagents/view-model-contract.test.ts)
+- Saved repro note:
+  - [/tmp/subagents-registry-test.txt](/tmp/subagents-registry-test.txt)
+
+Expected failure on the current tree:
+
+- rendered browser output contains `No current-branch sessions.`
+- the test expects the live `alpha` child card to remain visible before completion metadata exists
 
 ## Safest Fix Shape
 
-1. Make current-branch session discovery authoritative before completion. The least risky shape is to register thread/session membership when `dispatch` begins, using the already-known thread names and session paths from [index.ts](/home/bitzaven/CodingProjects/pi-threads/index.ts#L754), and let completion metadata enrich existing records later instead of being the only source of existence.
-2. Add a non-persisted fallback for parent resolution in the current runtime. Persisted `parentBySession` should remain the restart-safe source of truth, but read paths should also consult an in-memory/session-context parent mapping when present so the first lookup is not forced to wait for disk-backed synchronization.
-3. Keep this fix scoped to registry/parent data flow. Do not mix it with view clearing, overlay sizing, or fullscreen behavior changes.
+1. Treat existing current-branch child transcripts as inclusion candidates before completion, not only after a `toolResult` lands.
+2. Keep the same-runtime registry as a useful enrichment source, but do not make it the only non-completion path to live visibility.
+3. Keep this fix scoped to current-branch child discovery. Do not mix it with shortcut, fullscreen, or back-navigation behavior changes.

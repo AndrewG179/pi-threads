@@ -848,15 +848,6 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerShortcut("ctrl+o", {
-		description: "Browse current-branch subagent sessions",
-		handler: async (ctx) => {
-			await openSubagentsBrowser(ctx as typeof ctx & {
-				switchSession?: (sessionPath: string) => Promise<{ cancelled: boolean }>;
-			});
-		},
-	});
-
 	// Register the dispatch tool
 	pi.registerTool({
 		name: "dispatch",
