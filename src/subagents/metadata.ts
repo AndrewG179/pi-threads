@@ -45,6 +45,7 @@ interface DispatchItem {
 	action?: string;
 	episode?: string;
 	result?: {
+		sessionPath?: string;
 		exitCode?: number;
 		stopReason?: string;
 		errorMessage?: string;
@@ -223,18 +224,68 @@ function mergeParentDispatchDetails(cards: Map<string, SubagentCard>, parentBran
 	}
 }
 
+function isThreadSessionFile(threadsDir: string, sessionPath: string): boolean {
+	const resolvedThreadsDir = path.resolve(threadsDir);
+	const resolvedSessionPath = path.resolve(sessionPath);
+	const relativePath = path.relative(resolvedThreadsDir, resolvedSessionPath);
+
+	if (relativePath.startsWith("..") || path.isAbsolute(relativePath)) return false;
+	if (!resolvedSessionPath.endsWith(".jsonl") || path.basename(resolvedSessionPath) === "state.json") return false;
+
+	try {
+		return fs.statSync(resolvedSessionPath).isFile();
+	} catch {
+		return false;
+	}
+}
+
+function resolveDispatchSessionPath(threadsDir: string, item: DispatchItem): string | undefined {
+	const candidateSessionPaths = [
+		typeof item.result?.sessionPath === "string" ? item.result.sessionPath : undefined,
+		item.thread ? path.join(threadsDir, `${item.thread}.jsonl`) : undefined,
+	];
+
+	for (const candidateSessionPath of candidateSessionPaths) {
+		if (!candidateSessionPath) continue;
+		const resolvedSessionPath = path.resolve(candidateSessionPath);
+		if (isThreadSessionFile(threadsDir, resolvedSessionPath)) return resolvedSessionPath;
+	}
+
+	return undefined;
+}
+
+function collectCurrentBranchSessions(threadsDir: string, parentBranchEntries: unknown[]): Map<string, string> {
+	const sessions = new Map<string, string>();
+
+	for (const entry of parentBranchEntries) {
+		if (typeof entry !== "object" || entry === null) continue;
+		const line = entry as SessionLine & { message?: SessionMessage };
+		if (line.type !== "message" || line.message?.role !== "toolResult") continue;
+		if (line.message.toolName !== "dispatch") continue;
+
+		const details = line.message.details as { items?: DispatchItem[] } | undefined;
+		if (!details?.items) continue;
+
+		for (const item of details.items) {
+			if (!item.thread) continue;
+			const sessionPath = resolveDispatchSessionPath(threadsDir, item);
+			if (!sessionPath) continue;
+			sessions.set(item.thread, sessionPath);
+		}
+	}
+
+	return sessions;
+}
+
 export function collectSubagentCards(cwd: string, parentBranchEntries: unknown[]): SubagentCard[] {
 	const threadsDir = path.join(cwd, ".pi", "threads");
 	const state = loadThreadsState(cwd);
 	const cards = new Map<string, SubagentCard>();
 
-	if (fs.existsSync(threadsDir)) {
-		for (const entry of fs.readdirSync(threadsDir, { withFileTypes: true })) {
-			if (!entry.isFile() || !entry.name.endsWith(".jsonl") || entry.name === "state.json") continue;
-			const sessionPath = path.join(threadsDir, entry.name);
-			const thread = getThreadName(sessionPath);
-			cards.set(thread, summarizeThreadSession(sessionPath, state.parentBySession[path.resolve(sessionPath)]));
-		}
+	for (const [thread, sessionPath] of collectCurrentBranchSessions(threadsDir, parentBranchEntries)) {
+		const parentSessionFile = state.parentBySession[path.resolve(sessionPath)];
+		const card = summarizeThreadSession(sessionPath, parentSessionFile);
+		cards.set(thread, { ...card, thread });
 	}
 
 	mergeParentDispatchDetails(cards, parentBranchEntries);
