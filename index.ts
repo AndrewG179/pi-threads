@@ -14,12 +14,11 @@
  */
 
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { Message } from "@mariozechner/pi-ai";
-import { type ExtensionAPI, getMarkdownTheme } from "@mariozechner/pi-coding-agent";
-import { Container, Markdown, Spacer, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { type ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 
 import { buildEpisode as buildThreadEpisode } from "./src/episode/builder";
@@ -27,8 +26,8 @@ import { PiActorRuntime } from "./src/runtime/pi-actor";
 import { ThreadSupervisor } from "./src/runtime/thread-supervisor";
 import { collectSubagentCards, loadSessionBranchFromFile, type SubagentCard } from "./src/subagents/metadata";
 import { deriveSessionBehavior, resolveActiveToolsForBehavior } from "./src/subagents/mode";
-import { SubagentSelector } from "./src/subagents/selector";
 import { loadThreadsState, rememberParentSession, saveThreadsState } from "./src/subagents/state";
+import { SubagentBrowser } from "./src/subagents/view";
 import { wrapText } from "./src/text/wrap";
 
 // ─── Constants ───
@@ -385,53 +384,35 @@ function getDispatchFailureSummary(result: Pick<ThreadActionResult, "errorMessag
 
 // ─── Rendering Helpers ───
 
-function formatToolCall(
-	toolName: string,
-	args: Record<string, unknown>,
-	fg: (color: any, text: string) => string,
-): string {
-	const shorten = (p: string) => {
-		const home = os.homedir();
-		return p.startsWith(home) ? `~${p.slice(home.length)}` : p;
-	};
-	switch (toolName) {
-		case "bash": {
-			const cmd = ((args.command as string) || "...").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
-			const preview = cmd.length > 80 ? cmd.slice(0, 80) + "..." : cmd;
-			return fg("muted", "$ ") + fg("toolOutput", preview);
-		}
-		case "read": {
-			const filePath = shorten(((args.file_path || args.path || "...") as string));
-			return fg("muted", "read ") + fg("accent", filePath);
-		}
-		case "write": {
-			const filePath = shorten(((args.file_path || args.path || "...") as string));
-			return fg("muted", "write ") + fg("accent", filePath);
-		}
-		case "edit": {
-			const filePath = shorten(((args.file_path || args.path || "...") as string));
-			return fg("muted", "edit ") + fg("accent", filePath);
-		}
-		default: {
-			const s = JSON.stringify(args);
-			return fg("accent", toolName) + fg("dim", ` ${s.length > 60 ? s.slice(0, 60) + "..." : s}`);
-		}
+function summarizeDispatchItem(item: SingleDispatchResult, theme: any): string {
+	const { result } = item;
+	const isRunning = !item.episode || item.episode === "(running...)";
+	const isError = !isRunning && (result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted");
+	const icon = isRunning
+		? theme.fg("warning", "...")
+		: isError
+			? theme.fg("error", "x")
+			: theme.fg("success", "ok");
+	const headerParts = [
+		icon,
+		theme.fg("accent", `[${item.thread}]`),
+		theme.fg("muted", `ep${item.episodeNumber}`),
+		result.model ? theme.fg("dim", result.model) : "",
+		result.isNewThread ? theme.fg("warning", "new") : "",
+	].filter(Boolean);
+	const lines = [headerParts.join(" ")];
+	const summaryText = isRunning ? item.action : item.episode;
+	if (summaryText) {
+		lines.push(summaryText);
 	}
-}
-
-type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; name: string; args: Record<string, any> };
-
-function getDisplayItems(messages: Message[]): DisplayItem[] {
-	const items: DisplayItem[] = [];
-	for (const msg of messages) {
-		if (msg.role === "assistant") {
-			for (const part of msg.content) {
-				if (part.type === "text") items.push({ type: "text", text: part.text });
-				else if (part.type === "toolCall") items.push({ type: "toolCall", name: part.name, args: part.arguments });
-			}
-		}
+	if (isError && result.errorMessage) {
+		lines.push(theme.fg("error", result.errorMessage));
 	}
-	return items;
+	const usage = formatUsage(result.usage);
+	if (usage) {
+		lines.push(theme.fg("dim", usage));
+	}
+	return lines.join("\n");
 }
 
 // ─── Extension ───
@@ -440,7 +421,7 @@ export default function (pi: ExtensionAPI) {
 	// Track episode counts per thread (reconstructed from session)
 	const episodeCounts = new Map<string, number>();
 	let defaultActiveTools: string[] | null = null;
-	let lastCommandSwitchSession: ((sessionPath: string) => Promise<{ cancelled: boolean }>) | null = null;
+	let lastSessionSwitchSession: ((sessionPath: string) => Promise<{ cancelled: boolean }>) | null = null;
 	let releaseSubagentBackListener: (() => void) | null = null;
 
 	const arraysEqual = (left: string[], right: string[]) =>
@@ -550,13 +531,13 @@ export default function (pi: ExtensionAPI) {
 		return behavior;
 	};
 
-	const rememberCommandSessionSwitcher = (ctx: {
+	const rememberSessionSwitcher = (ctx: {
 		switchSession?: (sessionPath: string) => Promise<{ cancelled: boolean }>;
 	}) => {
 		if (typeof ctx.switchSession !== "function") {
 			return;
 		}
-		lastCommandSwitchSession = ctx.switchSession.bind(ctx);
+		lastSessionSwitchSession = ctx.switchSession.bind(ctx);
 	};
 
 	const switchToRememberedParent = async (ctx: {
@@ -571,13 +552,64 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		const switchSession = ctx.switchSession ?? lastCommandSwitchSession;
+		const switchSession = ctx.switchSession ?? lastSessionSwitchSession;
 		if (!switchSession) {
 			ctx.ui.notify("Ctrl+B cannot switch sessions yet in this runtime. Use /subagents-back.", "warning");
 			return;
 		}
 
 		await switchSession(behavior.parentSessionFile);
+	};
+
+	const openSubagentsBrowser = async (ctx: {
+		cwd: string;
+		hasUI: boolean;
+		sessionManager: {
+			getSessionFile(): string | undefined;
+			getBranch(): Array<{ type: string; message: { role: string; toolName?: string; details?: unknown } }>;
+		};
+		ui: {
+			notify: (message: string, level?: string) => void;
+			custom<T>(
+				factory: (tui: any, theme: any, keybindings: any, done: (result: T) => void) => unknown,
+				options?: unknown,
+			): Promise<T>;
+		};
+		switchSession?: (sessionPath: string) => Promise<{ cancelled: boolean }>;
+	}) => {
+		rememberSessionSwitcher(ctx);
+		if (!ctx.hasUI) {
+			ctx.ui.notify("The /subagents browser requires the interactive UI.", "warning");
+			return;
+		}
+
+		const { state, behavior } = resolveSessionContext(ctx);
+		const parentSessionFile = behavior.parentSessionFile ?? behavior.sessionFile;
+		if (!parentSessionFile) {
+			ctx.ui.notify("Current session is not persisted, so parent navigation cannot be remembered.", "warning");
+			return;
+		}
+
+		const parentEntries = behavior.parentSessionFile
+			? loadSessionBranchFromFile(behavior.parentSessionFile)
+			: ctx.sessionManager.getBranch();
+		const cards = collectSubagentCards(ctx.cwd, parentEntries);
+		const selected = await ctx.ui.custom<SubagentCard | undefined>(
+			(_tui, theme, keybindings, done) => new SubagentBrowser(cards, theme, keybindings, done),
+		);
+
+		if (!selected) return;
+		if (selected.sessionPath === ctx.sessionManager.getSessionFile()) return;
+
+		const switchSession = ctx.switchSession ?? lastSessionSwitchSession;
+		if (!switchSession) {
+			ctx.ui.notify("This runtime cannot switch sessions from the subagent browser yet. Use /subagents.", "warning");
+			return;
+		}
+
+		const nextState = rememberParentSession(state, selected.sessionPath, parentSessionFile);
+		saveThreadsState(ctx.cwd, nextState);
+		await switchSession(selected.sessionPath);
 	};
 
 	// Reconstruct state on session load
@@ -616,7 +648,7 @@ export default function (pi: ExtensionAPI) {
 			return values.length > 0 ? values.map((value) => ({ value, label: value })) : null;
 		},
 		handler: async (args, ctx) => {
-			rememberCommandSessionSwitcher(ctx);
+			rememberSessionSwitcher(ctx);
 			const nextMode = args.trim().toLowerCase();
 			if (nextMode !== "on" && nextMode !== "off") {
 				const state = loadThreadsState(ctx.cwd);
@@ -634,52 +666,24 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("subagents-back", {
 		description: "Return from the current subagent session to its remembered parent session",
 		handler: async (_args, ctx) => {
-			rememberCommandSessionSwitcher(ctx);
+			rememberSessionSwitcher(ctx);
 			await switchToRememberedParent(ctx);
 		},
 	});
 
 	pi.registerCommand("subagents", {
-		description: "Browse and open known subagent thread sessions",
+		description: "Browse and open current-branch subagent thread sessions",
 		handler: async (_args, ctx) => {
-			rememberCommandSessionSwitcher(ctx);
-			if (!ctx.hasUI) {
-				ctx.ui.notify("The /subagents selector requires the interactive UI.", "warning");
-				return;
-			}
+			await openSubagentsBrowser(ctx);
+		},
+	});
 
-			const { state, behavior } = resolveSessionContext(ctx);
-
-			const parentSessionFile = behavior.parentSessionFile ?? behavior.sessionFile;
-			if (!parentSessionFile) {
-				ctx.ui.notify("Current session is not persisted, so parent navigation cannot be remembered.", "warning");
-				return;
-			}
-
-			const parentEntries = behavior.parentSessionFile
-				? loadSessionBranchFromFile(behavior.parentSessionFile)
-				: ctx.sessionManager.getBranch();
-
-			const cards = collectSubagentCards(ctx.cwd, parentEntries);
-			const selected = await ctx.ui.custom<SubagentCard | undefined>(
-				(_tui, theme, _keybindings, done) => new SubagentSelector(cards, theme, done),
-				{
-					overlay: true,
-					overlayOptions: {
-						width: "90%",
-						maxHeight: "80%",
-						anchor: "center",
-						margin: 1,
-					},
-				},
-			);
-
-			if (!selected) return;
-			if (selected.sessionPath === ctx.sessionManager.getSessionFile()) return;
-
-			const nextState = rememberParentSession(state, selected.sessionPath, parentSessionFile);
-			saveThreadsState(ctx.cwd, nextState);
-			await ctx.switchSession(selected.sessionPath);
+	pi.registerShortcut("ctrl+o", {
+		description: "Browse current-branch subagent sessions",
+		handler: async (ctx) => {
+			await openSubagentsBrowser(ctx as typeof ctx & {
+				switchSession?: (sessionPath: string) => Promise<{ cancelled: boolean }>;
+			});
 		},
 	});
 
@@ -857,7 +861,7 @@ export default function (pi: ExtensionAPI) {
 			};
 		},
 
-		renderResult(result, { expanded }, theme) {
+		renderResult(result, _controls, theme) {
 			const details = result.details as DispatchDetails | undefined;
 
 			if (!details || details.items.length === 0) {
@@ -865,128 +869,7 @@ export default function (pi: ExtensionAPI) {
 				return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
 			}
 
-			const renderSingleItem = (item: SingleDispatchResult, isExpanded: boolean) => {
-				const r = item.result;
-				const isRunning = !item.episode || item.episode === "(running...)";
-				const isError = !isRunning && (r.exitCode !== 0 || r.stopReason === "error" || r.stopReason === "aborted");
-				const threadLabel = theme.fg("accent", theme.bold(`[${item.thread}]`));
-				const epLabel = theme.fg("muted", `ep${item.episodeNumber}`);
-				const modelLabel = r.model ? theme.fg("dim", r.model) : "";
-				const newBadge = r.isNewThread ? theme.fg("warning", " new") : "";
-
-				// ── Running state: action + live tool calls + stats ──
-				if (isRunning) {
-					return {
-						render(colWidth: number): string[] {
-							const lines: string[] = [];
-							lines.push(`${theme.fg("warning", "⏳")} ${threadLabel} ${epLabel} ${modelLabel}${newBadge}`.trim());
-
-							const maxActionLines = isExpanded ? 3 : 1;
-							const actionLines = wrapText(item.action, Math.max(10, colWidth - 2)).slice(0, maxActionLines);
-							lines.push(...actionLines.map((line) => `  ${theme.fg("dim", line)}`));
-
-							// Status line: ⏳ turns · cost · context
-							const statParts: string[] = [];
-							if (r.usage.turns) statParts.push(`${r.usage.turns} turn${r.usage.turns > 1 ? "s" : ""}`);
-							if (r.usage.cost) statParts.push(`$${r.usage.cost.toFixed(2)}`);
-							if (r.usage.contextTokens > 0) statParts.push(`ctx:${formatTokens(r.usage.contextTokens)}`);
-							if (statParts.length > 0) {
-								lines.push(theme.fg("dim", statParts.join(" · ")));
-							}
-
-							// Live tool calls
-							const displayItems = getDisplayItems(r.messages);
-							const toolCalls = displayItems.filter((i) => i.type === "toolCall");
-							for (const tc of toolCalls) {
-								if (tc.type === "toolCall") {
-									lines.push(theme.fg("muted", "→ ") + formatToolCall(tc.name, tc.args, theme.fg.bind(theme)));
-								}
-							}
-
-							if (toolCalls.length === 0) {
-								lines.push(theme.fg("muted", "starting..."));
-							}
-
-							return lines;
-						},
-						invalidate(): void {},
-					};
-				}
-
-				// ── Done state: episode ──
-				const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
-
-				if (isExpanded) {
-					const mdTheme = getMarkdownTheme();
-					const container = new Container();
-					container.addChild(new Text(`${icon} ${threadLabel} ${epLabel} ${modelLabel}${newBadge}`, 0, 0));
-					container.addChild(new Spacer(1));
-					container.addChild(new Text(theme.fg("muted", "─── Action ───"), 0, 0));
-					container.addChild(new Text(theme.fg("dim", item.action), 0, 0));
-
-					const displayItems = getDisplayItems(r.messages);
-					const toolCalls = displayItems.filter((i) => i.type === "toolCall");
-					if (toolCalls.length > 0) {
-						container.addChild(new Spacer(1));
-						container.addChild(new Text(theme.fg("muted", "─── Activity ───"), 0, 0));
-						for (const tc of toolCalls) {
-							if (tc.type === "toolCall") {
-								container.addChild(
-									new Text(theme.fg("muted", "→ ") + formatToolCall(tc.name, tc.args, theme.fg.bind(theme)), 0, 0),
-								);
-							}
-						}
-					}
-					container.addChild(new Spacer(1));
-					container.addChild(new Text(theme.fg("muted", "─── Episode ───"), 0, 0));
-					container.addChild(new Markdown(item.episode.trim(), 0, 0, mdTheme));
-
-					const usageStr = formatUsage(r.usage, r.model);
-					if (usageStr) {
-						container.addChild(new Spacer(1));
-						container.addChild(new Text(theme.fg("dim", usageStr), 0, 0));
-					}
-					return container;
-				}
-
-				// Collapsed done
-				let text = `${icon} ${threadLabel} ${epLabel} ${modelLabel}${newBadge}`;
-				if (isError && r.errorMessage) text += `\n${theme.fg("error", r.errorMessage)}`;
-				text += `\n${item.episode}`;
-				const usageStr = formatUsage(r.usage, r.model);
-				if (usageStr) text += `\n${theme.fg("dim", usageStr)}`;
-				return new Text(text, 0, 0);
-			};
-
-			// Single mode: render as before
-			if (details.mode === "single" || details.items.length === 1) {
-				const component = renderSingleItem(details.items[0], expanded);
-				if (!expanded) {
-					const container = new Container();
-					container.addChild(component);
-					container.addChild(new Text(theme.fg("muted", "(Ctrl+O to expand)"), 0, 0));
-					return container;
-				}
-				return component;
-			}
-
-			// Batch mode: render in columns
-			// Batch mode: render in rows of 3 columns
-			return {
-				render(width: number): string[] {
-					const lines = renderColumnsInRows(
-						details.items.map((item) => (colWidth: number) => {
-							const component = renderSingleItem(item, expanded);
-							return component.render(colWidth);
-						}),
-						width,
-						theme,
-					);
-					if (!expanded) lines.push(theme.fg("muted", "(Ctrl+O to expand)"));
-					return lines;
-				},
-				invalidate(): void {},
-			};
+			return new Text(details.items.map((item) => summarizeDispatchItem(item, theme)).join("\n\n"), 0, 0);
 		},
 	});
 }
