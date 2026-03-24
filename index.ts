@@ -291,8 +291,7 @@ async function runPiOnThread(
 	const args: string[] = ["--mode", "json", "-p", "--no-extensions", "--no-skills", "--no-prompt-templates"];
 	args.push("--session", sessionPath);
 	if (model) {
-		const modelArg = model.includes("/") ? model.substring(model.indexOf("/") + 1) : model;
-		args.push("--model", modelArg);
+		args.push("--model", model);
 	}
 	if (systemPromptFile) args.push("--append-system-prompt", systemPromptFile);
 	args.push(message);
@@ -650,7 +649,7 @@ export default function (pi: ExtensionAPI) {
 				});
 
 			const { DynamicBorder } = await import("@mariozechner/pi-coding-agent");
-			const { Container, Text, Input } = await import("@mariozechner/pi-tui");
+			const { Container, Text, Input, matchesKey, Key } = await import("@mariozechner/pi-tui");
 
 			const choice = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
 				const maxVisible = 10;
@@ -766,28 +765,22 @@ export default function (pi: ExtensionAPI) {
 					render: (w: number) => container.render(w),
 					invalidate: () => container.invalidate(),
 					handleInput: (data: string) => {
-						// Check for arrow keys and enter/escape before forwarding to search
-						if (data === "\x1b[A" || data === "\x1bOA") {
-							// Up arrow — wrap around
+						if (matchesKey(data, Key.up)) {
 							selectedIndex = selectedIndex <= 0 ? filtered.length - 1 : selectedIndex - 1;
 							renderList();
 							tui.requestRender();
-						} else if (data === "\x1b[B" || data === "\x1bOB") {
-							// Down arrow — wrap around
+						} else if (matchesKey(data, Key.down)) {
 							selectedIndex = selectedIndex >= filtered.length - 1 ? 0 : selectedIndex + 1;
 							renderList();
 							tui.requestRender();
-						} else if (data === "\r" || data === "\n") {
-							// Enter — select
+						} else if (matchesKey(data, Key.enter)) {
 							if (filtered.length > 0) {
 								const sel = filtered[selectedIndex];
 								done(`${sel.provider}/${sel.id}`);
 							}
-						} else if (data === "\x1b" || data === "\x03") {
-							// Escape or Ctrl+C — cancel
+						} else if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
 							done(null);
 						} else {
-							// Forward to search input
 							searchInput.handleInput(data);
 							renderList();
 							tui.requestRender();
