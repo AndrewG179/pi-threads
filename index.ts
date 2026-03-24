@@ -26,6 +26,7 @@ import { Type } from "@sinclair/typebox";
 // ─── Constants ───
 
 const THREADS_DIR = ".pi/threads";
+const MAX_CONCURRENCY = 4;
 
 const THREAD_WORKER_PROMPT = `You are a thread — an execution worker controlled by an orchestrator.
 
@@ -185,6 +186,39 @@ function cleanupTemp(dir: string | null, file: string | null): void {
 		}
 }
 
+async function mapWithConcurrencyLimit<TIn, TOut>(
+	items: TIn[],
+	concurrency: number,
+	fn: (item: TIn, index: number) => Promise<TOut>,
+): Promise<TOut[]> {
+	if (items.length === 0) return [];
+	const limit = Math.max(1, Math.min(concurrency, items.length));
+	const results: TOut[] = new Array(items.length);
+	let nextIndex = 0;
+	const workers = new Array(limit).fill(null).map(async () => {
+		while (true) {
+			const current = nextIndex++;
+			if (current >= items.length) return;
+			results[current] = await fn(items[current], current);
+		}
+	});
+	await Promise.all(workers);
+	return results;
+}
+
+function getPiInvocation(args: string[]): { command: string; args: string[] } {
+	const currentScript = process.argv[1];
+	if (currentScript && fs.existsSync(currentScript)) {
+		return { command: process.execPath, args: [currentScript, ...args] };
+	}
+	const execName = path.basename(process.execPath).toLowerCase();
+	const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
+	if (!isGenericRuntime) {
+		return { command: process.execPath, args };
+	}
+	return { command: "pi", args };
+}
+
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -322,7 +356,8 @@ async function runPiOnThread(
 	let compactionResult: { tokensBefore: number; tokensAfter: number } | undefined;
 
 	const exitCode = await new Promise<number>((resolve) => {
-		const proc = spawn("pi", args, { cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+		const invocation = getPiInvocation(args);
+		const proc = spawn(invocation.command, invocation.args, { cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] });
 		let buffer = "";
 
 		const processLine = (line: string) => {
@@ -935,6 +970,97 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("threads", {
+		description: "List all threads with stats",
+		handler: async (_args, ctx) => {
+			const threads = listThreads(ctx.cwd);
+			if (threads.length === 0) {
+				ctx.ui.notify("No threads yet", "info");
+				return;
+			}
+
+			const lines = threads.map((t) => {
+				const count = episodeCounts.get(t) || 0;
+				const stats = threadStats.get(t);
+				const sessionPath = getThreadSessionPath(ctx.cwd, t);
+
+				// File size and last modified
+				let sizeStr = "";
+				let mtimeStr = "";
+				try {
+					const stat = fs.statSync(sessionPath);
+					const kb = stat.size / 1024;
+					sizeStr = kb >= 1024 ? `${(kb / 1024).toFixed(1)}MB` : `${Math.round(kb)}KB`;
+					const ago = Date.now() - stat.mtimeMs;
+					if (ago < 60000) mtimeStr = "just now";
+					else if (ago < 3600000) mtimeStr = `${Math.round(ago / 60000)}m ago`;
+					else if (ago < 86400000) mtimeStr = `${Math.round(ago / 3600000)}h ago`;
+					else mtimeStr = `${Math.round(ago / 86400000)}d ago`;
+				} catch { /* ignore */ }
+
+				const contextInfo = stats?.contextTokens ? `  ${formatTokens(stats.contextTokens)} ctx` : "";
+				const compactInfo = stats?.compactionCount ? `  compacted ${stats.compactionCount}×` : "";
+
+				return `  ${t}  ${count} ep  ${sizeStr}${contextInfo}${compactInfo}  ${mtimeStr}`;
+			});
+
+			ctx.ui.notify(`🧵 Threads (${threads.length}):\n${lines.join("\n")}`, "info");
+		},
+	});
+
+	pi.registerCommand("thread-reset", {
+		description: "Reset a thread (clear its session history)",
+		handler: async (args, ctx) => {
+			const name = args.trim();
+			if (!name) {
+				ctx.ui.notify("Usage: /thread-reset <thread-name>", "warn");
+				return;
+			}
+
+			const threads = listThreads(ctx.cwd);
+			if (!threads.includes(name)) {
+				ctx.ui.notify(`Thread '${name}' not found. Available: ${threads.join(", ") || "(none)"}`, "warn");
+				return;
+			}
+
+			const sessionPath = getThreadSessionPath(ctx.cwd, name);
+			try {
+				fs.unlinkSync(sessionPath);
+			} catch { /* ignore */ }
+			episodeCounts.delete(name);
+			threadStats.delete(name);
+			ctx.ui.notify(`🗑️ Thread '${name}' reset`, "info");
+		},
+	});
+
+	pi.registerCommand("threads-clear", {
+		description: "Clear all threads (delete all session files)",
+		handler: async (_args, ctx) => {
+			const threads = listThreads(ctx.cwd);
+			if (threads.length === 0) {
+				ctx.ui.notify("No threads to clear", "info");
+				return;
+			}
+
+			const confirmed = await ctx.ui.confirm(
+				"Clear all threads?",
+				`This will delete ${threads.length} thread session${threads.length !== 1 ? "s" : ""} in .pi/threads/. This cannot be undone.`,
+			);
+			if (!confirmed) return;
+
+			let deleted = 0;
+			for (const t of threads) {
+				try {
+					fs.unlinkSync(getThreadSessionPath(ctx.cwd, t));
+					deleted++;
+				} catch { /* ignore */ }
+			}
+			episodeCounts.clear();
+			threadStats.clear();
+			ctx.ui.notify(`🗑️ Cleared ${deleted} thread${deleted !== 1 ? "s" : ""}`, "info");
+		},
+	});
+
 	// Reconstruct state on session load
 	pi.on("session_start", async (_event, ctx) => {
 		episodeCounts.clear();
@@ -1115,7 +1241,7 @@ export default function (pi: ExtensionAPI) {
 			if (taskList.length === 1) {
 				items = [await runOne(taskList[0], 0)];
 			} else {
-				items = await Promise.all(taskList.map((t, i) => runOne(t, i)));
+				items = await mapWithConcurrencyLimit(taskList, MAX_CONCURRENCY, (t, i) => runOne(t, i));
 			}
 
 			const anyError = items.some(
