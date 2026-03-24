@@ -629,34 +629,57 @@ export default function (pi: ExtensionAPI) {
 	let subagentModel = "anthropic/claude-sonnet-4-6";
 	let subagentThinking: string | undefined = undefined;
 
+	const updateStatusBar = (ctx: any) => {
+		const thinkingLabel = subagentThinking || "default";
+		const statusText = `sub: ${subagentModel} | thinking: ${thinkingLabel}`;
+		ctx.ui.setStatus("subagent-model", `\x1b[${(process.stdout.columns ?? 120) - statusText.length + 1}G\x1b[2m${statusText}\x1b[0m`);
+	};
+
 	pi.registerCommand("model-sub", {
-		description: "Set the subagent model for thread workers",
+		description: "Set the subagent model for thread workers (supports :thinking suffix, e.g. sonnet:high)",
 		handler: async (args, ctx) => {
 			const input = args.trim();
 
 			// Direct match via argument (like /model <term>)
 			if (input) {
-				const slashIndex = input.indexOf("/");
+				// Parse optional :thinking suffix (e.g., "sonnet:high", "anthropic/claude-sonnet-4-5:medium")
+				let modelInput = input;
+				let thinkingSuffix: string | undefined;
+				const levels = ["off", "minimal", "low", "medium", "high", "xhigh"];
+				const lastColon = input.lastIndexOf(":");
+				if (lastColon > 0) {
+					const suffix = input.substring(lastColon + 1).toLowerCase();
+					if (levels.includes(suffix)) {
+						modelInput = input.substring(0, lastColon);
+						thinkingSuffix = suffix;
+					}
+				}
+
+				const slashIndex = modelInput.indexOf("/");
 				if (slashIndex > 0) {
-					const provider = input.substring(0, slashIndex);
-					const modelId = input.substring(slashIndex + 1);
+					const provider = modelInput.substring(0, slashIndex);
+					const modelId = modelInput.substring(slashIndex + 1);
 					const found = ctx.modelRegistry.find(provider, modelId);
 					if (found) {
 						subagentModel = `${provider}/${modelId}`;
-						ctx.ui.setStatus("subagent-model", `\x1b[${(process.stdout.columns ?? 120) - `sub: ${subagentModel}`.length + 1}G\x1b[2msub: ${subagentModel}\x1b[0m`);
-						ctx.ui.notify(`Subagent model set to: ${subagentModel}`, "info");
+						if (thinkingSuffix) subagentThinking = thinkingSuffix;
+						updateStatusBar(ctx);
+						const thinkingMsg = thinkingSuffix ? ` | thinking: ${thinkingSuffix}` : "";
+						ctx.ui.notify(`Subagent model set to: ${subagentModel}${thinkingMsg}`, "info");
 						return;
 					}
 				}
 				// Fuzzy match
 				const allModels = ctx.modelRegistry.getAvailable();
 				const matches = allModels.filter((m: any) =>
-					`${m.id} ${m.provider} ${m.provider}/${m.id}`.toLowerCase().includes(input.toLowerCase())
+					`${m.id} ${m.provider} ${m.provider}/${m.id}`.toLowerCase().includes(modelInput.toLowerCase())
 				);
 				if (matches.length === 1) {
 					subagentModel = `${matches[0].provider}/${matches[0].id}`;
-					ctx.ui.setStatus("subagent-model", `\x1b[${(process.stdout.columns ?? 120) - `sub: ${subagentModel}`.length + 1}G\x1b[2msub: ${subagentModel}\x1b[0m`);
-					ctx.ui.notify(`Subagent model set to: ${subagentModel}`, "info");
+					if (thinkingSuffix) subagentThinking = thinkingSuffix;
+					updateStatusBar(ctx);
+					const thinkingMsg = thinkingSuffix ? ` | thinking: ${thinkingSuffix}` : "";
+					ctx.ui.notify(`Subagent model set to: ${subagentModel}${thinkingMsg}`, "info");
 					return;
 				}
 				// Fall through to picker with search pre-filled
@@ -824,7 +847,7 @@ export default function (pi: ExtensionAPI) {
 			if (!choice) return;
 
 			subagentModel = choice;
-			ctx.ui.setStatus("subagent-model", `\x1b[${(process.stdout.columns ?? 120) - `sub: ${subagentModel}`.length + 1}G\x1b[2msub: ${subagentModel}\x1b[0m`);
+			updateStatusBar(ctx);
 			ctx.ui.notify(`Subagent model set to: ${subagentModel}`, "info");
 		},
 	});
@@ -843,8 +866,7 @@ export default function (pi: ExtensionAPI) {
 			if (input === "reset" || input === "default") {
 				subagentThinking = undefined;
 				ctx.ui.notify("🧠 Subagent thinking reset to pi default", "info");
-				const thinkingLabel = subagentThinking || "default";
-				ctx.ui.setStatus("subagent-model", `\x1b[${(process.stdout.columns ?? 120) - `sub: ${subagentModel} | thinking: ${thinkingLabel}`.length + 1}G\x1b[2msub: ${subagentModel} | thinking: ${thinkingLabel}\x1b[0m`);
+				updateStatusBar(ctx);
 				return;
 			}
 
@@ -855,8 +877,7 @@ export default function (pi: ExtensionAPI) {
 
 			subagentThinking = input;
 			ctx.ui.notify(`🧠 Subagent thinking set to: ${input}`, "info");
-			const thinkingLabel = subagentThinking || "default";
-			ctx.ui.setStatus("subagent-model", `\x1b[${(process.stdout.columns ?? 120) - `sub: ${subagentModel} | thinking: ${thinkingLabel}`.length + 1}G\x1b[2msub: ${subagentModel} | thinking: ${thinkingLabel}\x1b[0m`);
+			updateStatusBar(ctx);
 		},
 	});
 
@@ -887,8 +908,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		ctx.ui.notify("🧵 Thread orchestrator active", "info");
-		const thinkingLabel = subagentThinking || "default";
-		ctx.ui.setStatus("subagent-model", `\x1b[${(process.stdout.columns ?? 120) - `sub: ${subagentModel} | thinking: ${thinkingLabel}`.length + 1}G\x1b[2msub: ${subagentModel} | thinking: ${thinkingLabel}\x1b[0m`);
+		updateStatusBar(ctx);
 	});
 
 	// Inject orchestrator system prompt
