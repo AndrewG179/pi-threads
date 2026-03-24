@@ -977,3 +977,58 @@ test("dispatch result rendering should not leave embedded newlines inside width-
 		);
 	}
 });
+
+test("dispatch result rendering should keep the live running action-summary row within terminal width", () => {
+	const fakePi = makeFakePi();
+	registerExtension(fakePi as any);
+
+	const dispatch = fakePi.tools.get("dispatch");
+	assert.ok(dispatch?.renderResult, "dispatch tool should expose renderResult");
+
+	const actionSummary = "Run bash command: sleep 8; echo Z. If it succeeds, report the final stdout token and whether the command completed successfully.";
+	const terminalWidth = 120;
+	const component = dispatch!.renderResult!(
+		{
+			content: [{ type: "text", text: "[live-alpha] (running...)" }],
+			details: {
+				mode: "single",
+				items: [{
+					thread: "live-alpha",
+					action: actionSummary,
+					episode: "(running...)",
+					episodeNumber: 1,
+					result: {
+						thread: "live-alpha",
+						action: actionSummary,
+						exitCode: 0,
+						messages: [],
+						stderr: "",
+						usage: {
+							input: 2200,
+							output: 77,
+							cacheRead: 0,
+							cacheWrite: 0,
+							cost: 0.0067,
+							contextTokens: 2300,
+							turns: 1,
+						},
+						model: "openai-codex/gpt-5.4",
+						sessionPath: "/tmp/live-alpha.jsonl",
+						isNewThread: true,
+					},
+				}],
+			},
+		},
+		{ expanded: false },
+		makeTheme(),
+	);
+
+	const renderedLines = flattenRenderedLines(component, terminalWidth);
+	const actionLine = renderedLines.find((line) => line.includes("Run bash command: sleep 8; echo Z."));
+	assert.ok(actionLine, "dispatch renderResult should emit the live action-summary row");
+	assert.equal(
+		visibleWidth(actionLine) <= terminalWidth,
+		true,
+		`dispatch renderResult should wrap or truncate the live action-summary row to the terminal width; got ${visibleWidth(actionLine)} for ${JSON.stringify(actionLine)}`,
+	);
+});
