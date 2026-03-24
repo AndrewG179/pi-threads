@@ -1,10 +1,11 @@
 # `/subagents` behavior
 
-This extension adds two user-facing controls:
+This extension adds these user-facing controls:
 
 - `/threads on`
 - `/threads off`
 - `/subagents`
+- `/model-sub`
 
 ## Thread mode
 
@@ -22,7 +23,34 @@ When thread mode is **off**:
 - the session behaves like a normal pi session
 
 The on/off state is stored per-project in `.pi/threads/state.json`.
-That file is only for thread mode enablement; it does not persist parent/subagent navigation relationships.
+That file is only for thread mode enablement; it does not persist parent/subagent navigation relationships or the `/model-sub` override.
+
+## `/model-sub`
+
+Worker model selection is separate from thread mode and separate from `/subagents` view state.
+
+Branch-canonical default:
+- dispatched workers inherit the current parent session model unless an explicit `/model-sub` override is set
+- if the parent model is not available in extension context, the extension still treats the mode as inheritance rather than falling back to a documented fixed default
+
+Selection modes:
+- `/model-sub provider/model` sets an explicit worker-model override directly
+- `/model-sub <query>` fuzzy-matches against configured available models; if exactly one model matches, that match becomes the override
+- in the interactive UI, ambiguous or partial input falls through to a picker with the search pre-filled
+
+Picker behavior:
+- the picker shows models currently available from the host model registry
+- the picker includes an explicit inherit/current-session option, which clears the override instead of selecting a fixed model
+- the picker is the canonical interactive way to browse and select a subagent model override
+
+Clearing/resetting the override:
+- `/model-sub inherit` clears the explicit override and returns workers to parent-model inheritance
+- `/model-sub clear`, `/model-sub default`, `/model-sub none`, and `/model-sub reset` are equivalent reset commands
+
+Status-bar display:
+- when an explicit override is active, the status bar shows `sub: override provider/model`
+- when no override is active and the parent model is known, the status bar shows `sub: inherit provider/model`
+- when no override is active and the parent model is not available in context, the status bar shows `sub: inherit current session model`
 
 ## `/subagents`
 

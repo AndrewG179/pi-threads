@@ -11,6 +11,7 @@ import { PiActorRuntime } from "../../src/runtime/pi-actor";
 
 type RegisteredTool = {
 	name: string;
+	execute?: (...args: any[]) => Promise<unknown> | unknown;
 	renderResult?: (result: Record<string, unknown>, controls: { expanded: boolean }, theme: ReturnType<typeof makeTheme>) => unknown;
 };
 
@@ -145,7 +146,15 @@ test("/subagents should open an independent custom view instead of a modal overl
 		assert.ok(subagents, "/subagents should be registered");
 
 		let customRenderer: ((...args: any[]) => unknown) | undefined;
-		let customOptions: Record<string, unknown> | undefined;
+		let customOptions: {
+			overlay?: boolean;
+			overlayOptions?: {
+				anchor?: string;
+				width?: string;
+				maxHeight?: string;
+				margin?: number;
+			};
+		} | undefined;
 
 		await subagents!.handler("", {
 			cwd: projectDir,
@@ -153,7 +162,18 @@ test("/subagents should open an independent custom view instead of a modal overl
 			switchSession: async () => ({ cancelled: false }),
 			ui: {
 				notify: () => {},
-				custom: async (renderer: (...args: any[]) => unknown, options?: Record<string, unknown>) => {
+				custom: async (
+					renderer: (...args: any[]) => unknown,
+					options?: {
+						overlay?: boolean;
+						overlayOptions?: {
+							anchor?: string;
+							width?: string;
+							maxHeight?: string;
+							margin?: number;
+						};
+					},
+				) => {
 					customRenderer = renderer;
 					customOptions = options;
 					return undefined;
@@ -239,7 +259,7 @@ test("/subagents should list a just-dispatched in-flight thread from same-runtim
 
 		const dispatch = fakePi.tools.get("dispatch");
 		const subagents = fakePi.commands.get("subagents");
-		assert.ok(dispatch, "dispatch should be registered");
+		assert.ok(dispatch?.execute, "dispatch should be registered");
 		assert.ok(subagents, "/subagents should be registered");
 
 		let customRenderer: ((...args: any[]) => unknown) | undefined;
@@ -264,7 +284,7 @@ test("/subagents should list a just-dispatched in-flight thread from same-runtim
 			} as any;
 		};
 
-		const execution = dispatch!.execute(
+		const execution = dispatch.execute!(
 			"tool-call-1",
 			{ thread: "alpha", action: "Inspect alpha while it is still running" },
 			undefined,

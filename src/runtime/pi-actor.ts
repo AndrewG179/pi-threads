@@ -189,7 +189,7 @@ function cleanupPromptFile(temp: PromptFile | null): void {
 	}
 }
 
-function defaultArgsBuilder(request: PiActorInvocationRequest, context: PiActorArgsContext): string[] {
+export function buildPiActorArgs(request: PiActorInvocationRequest, context: PiActorArgsContext): string[] {
 	const args = [
 		"--mode",
 		"json",
@@ -217,6 +217,10 @@ function defaultArgsBuilder(request: PiActorInvocationRequest, context: PiActorA
 	if (context.systemPromptFile) args.push("--append-system-prompt", context.systemPromptFile);
 	args.push(request.action);
 	return args;
+}
+
+function defaultArgsBuilder(request: PiActorInvocationRequest, context: PiActorArgsContext): string[] {
+	return buildPiActorArgs(request, context);
 }
 
 function resolvePiCommandSpec(): PiCommandSpec {

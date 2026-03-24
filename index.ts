@@ -18,12 +18,20 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { Message } from "@mariozechner/pi-ai";
 import { type ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
+import { Text, truncateToWidth, visibleWidth } from "./src/pi/runtime-deps";
 
 import { buildEpisode as buildThreadEpisode } from "./src/episode/builder";
 import { PiActorRuntime } from "./src/runtime/pi-actor";
 import { getThreadSessionPath, normalizeSessionPath, toSubagentStatus } from "./src/subagents/metadata";
+import {
+	buildSubagentModelPromptSection,
+	buildSubagentModelStatusText,
+	findFuzzyModelMatches,
+	formatModelIdentifier,
+	isModelOverrideResetQuery,
+	resolveEffectiveSubagentModel,
+	type ModelDescriptor,
+} from "./src/subagents/model-selection";
 import { deriveSessionBehavior, resolveActiveToolsForBehavior } from "./src/subagents/mode";
 import { SubagentRunStore } from "./src/subagents/runtime-store";
 import { loadThreadsState, saveThreadsState } from "./src/subagents/state";
@@ -83,6 +91,45 @@ Bad — dumps raw content into your context:
 Batch (parallel, shown side by side in groups of 3):
 - \`dispatch(tasks: [{thread: "auth", action: "Read auth middleware and list exported functions with signatures"}, {thread: "tests", action: "Run the test suite and report pass/fail counts"}, {thread: "docs", action: "Check if API docs exist and list what endpoints are documented"}])\`
 `;
+
+const DISPATCH_TOOL_PARAMETERS = {
+	type: "object",
+	properties: {
+		thread: {
+			type: "string",
+			description: "Thread name — identifies the work stream. Reuse for related actions. (single mode)",
+		},
+		action: {
+			type: "string",
+			description: "Direct, concrete instructions for the thread to execute. (single mode)",
+		},
+		tasks: {
+			type: "array",
+			description: "Batch mode: thread actions dispatched in parallel.",
+			minItems: 1,
+			items: {
+				type: "object",
+				properties: {
+					thread: {
+						type: "string",
+						description: "Thread name",
+					},
+					action: {
+						type: "string",
+						description: "Action for this thread",
+					},
+				},
+				required: ["thread", "action"],
+				additionalProperties: false,
+			},
+		},
+	},
+	additionalProperties: false,
+	oneOf: [
+		{ required: ["thread", "action"] },
+		{ required: ["tasks"] },
+	],
+} as const;
 
 // ─── Types ───
 
@@ -439,16 +486,71 @@ function summarizeDispatchItem(item: SingleDispatchResult, theme: any): string {
 	return lines.join("\n");
 }
 
+type ModelLike = {
+	provider: string;
+	id: string;
+	name?: string;
+};
+
+function toModelDescriptor(model: ModelLike | undefined): ModelDescriptor | undefined {
+	if (!model) return undefined;
+	return {
+		provider: model.provider,
+		id: model.id,
+		name: model.name,
+	};
+}
+
 // ─── Extension ───
 
 export default function (pi: ExtensionAPI) {
 	// Track episode counts per thread (reconstructed from session)
 	const episodeCounts = new Map<string, number>();
 	let defaultActiveTools: string[] | null = null;
+	let subagentModelOverride: ModelDescriptor | undefined;
 	const subagentRunStore = new SubagentRunStore();
 
 	const arraysEqual = (left: string[], right: string[]) =>
 		left.length === right.length && left.every((value, index) => value === right[index]);
+
+	const getParentSessionModel = (ctx: { model?: ModelLike }) => toModelDescriptor(ctx.model);
+
+	const getEffectiveSubagentModel = (ctx: { model?: ModelLike }): string | undefined =>
+		resolveEffectiveSubagentModel(getParentSessionModel(ctx), subagentModelOverride);
+
+	const updateSubagentModelStatus = (ctx: {
+		ui?: { theme?: { fg?: (color: string, text: string) => string }; setStatus?: (key: string, text: string | undefined) => void };
+		model?: ModelLike;
+	}) => {
+		const statusText = buildSubagentModelStatusText(getParentSessionModel(ctx), subagentModelOverride);
+		ctx.ui?.setStatus?.(
+			"subagent-model",
+			ctx.ui?.theme?.fg ? ctx.ui.theme.fg("dim", statusText) : statusText,
+		);
+	};
+
+	const setSubagentModelOverride = (nextModel: ModelDescriptor | undefined, ctx: {
+		ui?: {
+			notify?: (message: string, level?: string) => void;
+			theme?: { fg?: (color: string, text: string) => string };
+			setStatus?: (key: string, text: string | undefined) => void;
+		};
+		model?: ModelLike;
+	}) => {
+		subagentModelOverride = nextModel;
+		updateSubagentModelStatus(ctx);
+		if (nextModel) {
+			ctx.ui?.notify?.(`Subagent model override set to ${formatModelIdentifier(nextModel)}.`, "info");
+			return;
+		}
+		ctx.ui?.notify?.("Subagent model override cleared. Workers will inherit the current session model.", "info");
+	};
+
+	const getAvailableModels = async (ctx: { modelRegistry?: { getAvailable: () => Promise<readonly ModelLike[]> | readonly ModelLike[] } }): Promise<ModelDescriptor[]> => {
+		if (!ctx.modelRegistry?.getAvailable) return [];
+		const available = await Promise.resolve(ctx.modelRegistry.getAvailable());
+		return available.map((model) => toModelDescriptor(model)).filter((model): model is ModelDescriptor => model !== undefined);
+	};
 
 	const rebuildEpisodeCounts = (sessionManager: { getBranch(): Array<{ type: string; message: { role: string; toolName?: string; details?: unknown } }> }) => {
 		episodeCounts.clear();
@@ -519,6 +621,7 @@ export default function (pi: ExtensionAPI) {
 		} else {
 			ctx.ui.setStatus("pi-threads", undefined);
 		}
+		updateSubagentModelStatus(ctx);
 
 		rebuildEpisodeCounts(ctx.sessionManager);
 		return behavior;
@@ -577,6 +680,231 @@ export default function (pi: ExtensionAPI) {
 		);
 	};
 
+	const openSubagentModelPicker = async (ctx: {
+		hasUI: boolean;
+		model?: ModelLike;
+		modelRegistry?: { getAvailable: () => Promise<readonly ModelLike[]> | readonly ModelLike[] };
+		ui: {
+			notify: (message: string, level?: string) => void;
+			custom<T>(
+				factory: (tui: any, theme: any, keybindings: any, done: (result: T) => void) => unknown,
+				options?: unknown,
+			): Promise<T>;
+		};
+	}, initialQuery: string): Promise<ModelDescriptor | undefined | null> => {
+		const models = await getAvailableModels(ctx);
+		if (models.length === 0) {
+			ctx.ui.notify("No subagent models with configured API keys are available.", "warning");
+			return null;
+		}
+		if (!ctx.hasUI) {
+			ctx.ui.notify("The /model-sub picker requires the interactive UI. Use /model-sub provider/model or /model-sub inherit.", "warning");
+			return null;
+		}
+
+		const { DynamicBorder } = await import("@mariozechner/pi-coding-agent");
+		const { Container, Input, Text } = await import("@mariozechner/pi-tui");
+		const parentModel = getParentSessionModel(ctx);
+		const currentOverrideRef = subagentModelOverride ? formatModelIdentifier(subagentModelOverride) : undefined;
+		const sortedModels = [...models].sort((left, right) => {
+			const leftRef = formatModelIdentifier(left);
+			const rightRef = formatModelIdentifier(right);
+			const leftIsCurrent = currentOverrideRef !== undefined && leftRef === currentOverrideRef;
+			const rightIsCurrent = currentOverrideRef !== undefined && rightRef === currentOverrideRef;
+			if (leftIsCurrent && !rightIsCurrent) return -1;
+			if (!leftIsCurrent && rightIsCurrent) return 1;
+			return leftRef.localeCompare(rightRef);
+		});
+
+		const choice = await ctx.ui.custom<ModelDescriptor | undefined | null>((tui, theme, _keybindings, done) => {
+			const maxVisible = 10;
+			let query = initialQuery.trim();
+			let filteredModels = query ? findFuzzyModelMatches(sortedModels, query) : sortedModels;
+			let selectedIndex = 0;
+			const searchInput = new Input();
+			searchInput.setValue(query);
+			const container = new Container();
+			const headerText = new Text(theme.fg("accent", theme.bold("Subagent model override")), 0, 0);
+			const hintText = new Text(
+				theme.fg("muted", "Workers inherit the current session model by default. Pick a model to force an override."),
+				0,
+				0,
+			);
+			const searchLabel = new Text(theme.fg("muted", "Search:"), 0, 0);
+			const listText = new Text("", 0, 0);
+			const detailText = new Text("", 0, 0);
+			const footerText = new Text(theme.fg("dim", "↑↓ move • enter select • esc cancel"), 0, 0);
+
+			container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+			container.addChild(headerText);
+			container.addChild(hintText);
+			container.addChild(new Text("", 0, 0));
+			container.addChild(searchLabel);
+			container.addChild(searchInput);
+			container.addChild(new Text("", 0, 0));
+			container.addChild(listText);
+			container.addChild(new Text("", 0, 0));
+			container.addChild(detailText);
+			container.addChild(new Text("", 0, 0));
+			container.addChild(footerText);
+			container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+
+			const shouldShowInheritOption = (value: string) =>
+				value.length === 0
+				|| isModelOverrideResetQuery(value)
+				|| ["inherit", "current", "default", "parent"].some((token) => token.includes(value.toLowerCase()));
+
+			const getItems = () => {
+				const items: Array<{ kind: "inherit" } | { kind: "model"; model: ModelDescriptor }> = [];
+				if (shouldShowInheritOption(query)) {
+					items.push({ kind: "inherit" });
+				}
+				for (const model of filteredModels) {
+					items.push({ kind: "model", model });
+				}
+				return items;
+			};
+
+			const applyFilter = () => {
+				query = searchInput.getValue().trim();
+				filteredModels = query ? findFuzzyModelMatches(sortedModels, query) : sortedModels;
+				selectedIndex = Math.min(selectedIndex, Math.max(0, getItems().length - 1));
+			};
+
+			const renderList = () => {
+				const items = getItems();
+				if (items.length === 0) {
+					listText.setText(theme.fg("warning", "No matching models"));
+					detailText.setText(theme.fg("muted", "Try a broader search or use an exact provider/model identifier."));
+					return;
+				}
+
+				let startIndex = Math.max(0, selectedIndex - Math.floor(maxVisible / 2));
+				if (startIndex + maxVisible > items.length) {
+					startIndex = Math.max(0, items.length - maxVisible);
+				}
+				const endIndex = Math.min(startIndex + maxVisible, items.length);
+				const lines: string[] = [];
+
+				for (let index = startIndex; index < endIndex; index++) {
+					const item = items[index]!;
+					const isSelected = index === selectedIndex;
+					if (item.kind === "inherit") {
+						const active = subagentModelOverride === undefined ? theme.fg("success", " ✓") : "";
+						const label = parentModel
+							? `inherit current session model (${formatModelIdentifier(parentModel)})`
+							: "inherit current session model";
+						lines.push(
+							isSelected
+								? theme.fg("accent", `→ ${label}`) + active
+								: `  ${label}${active}`,
+						);
+						continue;
+					}
+
+					const ref = formatModelIdentifier(item.model);
+					const active = currentOverrideRef === ref ? theme.fg("success", " ✓") : "";
+					const label = `${item.model.id} ${theme.fg("muted", `[${item.model.provider}]`)}`;
+					lines.push(
+						isSelected
+							? theme.fg("accent", `→ ${item.model.id}`) + ` ${theme.fg("muted", `[${item.model.provider}]`)}${active}`
+							: `  ${label}${active}`,
+					);
+				}
+
+				if (items.length > maxVisible) {
+					lines.push(theme.fg("muted", `(${selectedIndex + 1}/${items.length})`));
+				}
+				listText.setText(lines.join("\n"));
+
+				const selected = items[selectedIndex]!;
+				if (selected.kind === "inherit") {
+					detailText.setText(
+						theme.fg(
+							"muted",
+							parentModel
+								? `Clear the explicit override and inherit ${formatModelIdentifier(parentModel)} from this session.`
+								: "Clear the explicit override and inherit whatever model this session is currently using.",
+						),
+					);
+					return;
+				}
+
+				detailText.setText(
+					theme.fg(
+						"muted",
+						selected.model.name
+							? `${formatModelIdentifier(selected.model)} — ${selected.model.name}`
+							: formatModelIdentifier(selected.model),
+					),
+				);
+			};
+
+			applyFilter();
+			renderList();
+
+			let focused = true;
+			searchInput.focused = true;
+
+			return {
+				get focused() {
+					return focused;
+				},
+				set focused(value: boolean) {
+					focused = value;
+					searchInput.focused = value;
+				},
+				render(width: number) {
+					return container.render(width);
+				},
+				invalidate() {
+					container.invalidate();
+				},
+				handleInput(data: string) {
+					const items = getItems();
+					if ((data === "\x1b[A" || data === "\x1bOA") && items.length > 0) {
+						selectedIndex = selectedIndex <= 0 ? items.length - 1 : selectedIndex - 1;
+						renderList();
+						tui.requestRender();
+						return;
+					}
+					if ((data === "\x1b[B" || data === "\x1bOB") && items.length > 0) {
+						selectedIndex = selectedIndex >= items.length - 1 ? 0 : selectedIndex + 1;
+						renderList();
+						tui.requestRender();
+						return;
+					}
+					if ((data === "\r" || data === "\n") && items.length > 0) {
+						const selected = items[selectedIndex]!;
+						done(selected.kind === "inherit" ? undefined : selected.model);
+						return;
+					}
+					if (data === "\x1b" || data === "\x03") {
+						done(null);
+						return;
+					}
+					searchInput.handleInput(data);
+					applyFilter();
+					renderList();
+					tui.requestRender();
+				},
+			};
+			},
+			{
+				overlay: true,
+				overlayOptions: {
+					anchor: "top-center",
+					width: "70%",
+					minWidth: 60,
+					maxHeight: "80%",
+					margin: 1,
+				},
+			},
+		);
+
+		return choice;
+	};
+
 	// Reconstruct state on session load
 	pi.on("session_start", async (_event, ctx) => {
 		syncSessionMode(ctx);
@@ -584,6 +912,10 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_switch", async (_event, ctx) => {
 		syncSessionMode(ctx);
+	});
+
+	pi.on("model_select", async (_event, ctx) => {
+		updateSubagentModelStatus(ctx);
 	});
 
 	// Inject orchestrator system prompt
@@ -602,6 +934,8 @@ export default function (pi: ExtensionAPI) {
 			});
 			extra += `\n## Active Threads\n${threadInfo.join("\n")}\n`;
 		}
+
+		extra += `\n${buildSubagentModelPromptSection(getParentSessionModel(ctx), subagentModelOverride)}\n`;
 
 		return { systemPrompt: event.systemPrompt + extra };
 	});
@@ -634,6 +968,65 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("model-sub", {
+		description: "Set or clear the worker model override used for dispatched subagents",
+		handler: async (args, ctx) => {
+			const input = args.trim();
+			if (isModelOverrideResetQuery(input)) {
+				setSubagentModelOverride(undefined, ctx);
+				return;
+			}
+
+			if (input.includes("/")) {
+				const slashIndex = input.indexOf("/");
+				const provider = input.slice(0, slashIndex).trim();
+				const id = input.slice(slashIndex + 1).trim();
+				if (provider && id) {
+					setSubagentModelOverride({ provider, id }, ctx);
+					return;
+				}
+			}
+
+			const availableModels = await getAvailableModels(ctx as { modelRegistry?: { getAvailable: () => Promise<readonly ModelLike[]> | readonly ModelLike[] } });
+			if (input) {
+				const matches = findFuzzyModelMatches(availableModels, input);
+				if (matches.length === 1) {
+					setSubagentModelOverride(matches[0], ctx);
+					return;
+				}
+				if (!ctx.hasUI) {
+					if (matches.length > 1) {
+						ctx.ui?.notify?.(
+							`Multiple subagent models match \"${input}\": ${matches.slice(0, 5).map((model) => formatModelIdentifier(model)).join(", ")}. Use an exact provider/model string.`,
+							"warning",
+						);
+						return;
+					}
+					ctx.ui?.notify?.(
+						"No matching configured subagent models were found. Use an exact provider/model string or run /model-sub in the interactive UI.",
+						"warning",
+					);
+					return;
+				}
+			}
+
+			const choice = await openSubagentModelPicker(ctx as {
+				hasUI: boolean;
+				model?: ModelLike;
+				modelRegistry?: { getAvailable: () => Promise<readonly ModelLike[]> | readonly ModelLike[] };
+				ui: {
+					notify: (message: string, level?: string) => void;
+					custom<T>(
+						factory: (tui: any, theme: any, keybindings: any, done: (result: T) => void) => unknown,
+						options?: unknown,
+					): Promise<T>;
+				};
+			}, input);
+			if (choice === null) return;
+			setSubagentModelOverride(choice, ctx);
+		},
+	});
+
 	// Register the dispatch tool
 	pi.registerTool({
 		name: "dispatch",
@@ -652,22 +1045,10 @@ export default function (pi: ExtensionAPI) {
 			"Reuse thread names for related work so threads accumulate useful context.",
 			"If a thread reports failure, re-plan and dispatch a new action — don't ask the thread to figure it out.",
 		],
-		parameters: Type.Object({
-			thread: Type.Optional(Type.String({ description: "Thread name — identifies the work stream. Reuse for related actions. (single mode)" })),
-			action: Type.Optional(Type.String({ description: "Direct, concrete instructions for the thread to execute. (single mode)" })),
-			tasks: Type.Optional(
-				Type.Array(
-					Type.Object({
-						thread: Type.String({ description: "Thread name" }),
-						action: Type.String({ description: "Action for this thread" }),
-					}),
-					{ description: "Batch mode: thread actions dispatched in parallel." },
-				),
-			),
-		}),
+		parameters: DISPATCH_TOOL_PARAMETERS,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+			const model = getEffectiveSubagentModel(ctx);
 			const sessionContext = resolveSessionContext(ctx);
 			const parentSessionFile = sessionContext.sessionFile;
 			const taskList = params.tasks?.length

@@ -127,6 +127,10 @@ declare module "@mariozechner/pi-coding-agent" {
 		registerTool(config: ToolDefinitionConfig): void;
 	}
 
+	export class DynamicBorder {
+		constructor(render: (text: string) => string);
+	}
+
 	export function getMarkdownTheme(): any;
 }
 
@@ -142,6 +146,7 @@ declare module "@mariozechner/pi-tui" {
 
 	export class Container implements Renderable {
 		constructor();
+		children: any[];
 		addChild(child: any): void;
 		render(width: number): string[];
 		invalidate(): void;
@@ -149,6 +154,17 @@ declare module "@mariozechner/pi-tui" {
 
 	export class Text implements Renderable {
 		constructor(text: string, x: number, y: number);
+		setText(text: string): void;
+		render(width: number): string[];
+		invalidate(): void;
+	}
+
+	export class Input implements Renderable {
+		constructor();
+		focused: boolean;
+		setValue(value: string): void;
+		getValue(): string;
+		handleInput(data: string): void;
 		render(width: number): string[];
 		invalidate(): void;
 	}

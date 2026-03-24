@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 
-import { PiActorRuntime } from "../../src/runtime/pi-actor.ts";
+import { PiActorRuntime } from "../../src/runtime/pi-actor";
 
 const EOF_SENSITIVE_WORKER_SCRIPT = `
 const fs = require("node:fs");
@@ -177,8 +177,8 @@ test("dispatch should not depend on pi being on PATH when the parent CLI path is
 		assert.equal(result.errorMessage, undefined);
 		assert.equal(result.messages.length, 1);
 		assert.equal(result.messages[0]?.role, "assistant");
-		assert.equal(result.messages[0]?.content[0]?.type, "text");
-		assert.equal(result.messages[0]?.content[0]?.text, "hello");
+		assert.equal(result.messages[0]?.content?.[0]?.type, "text");
+		assert.equal(result.messages[0]?.content?.[0]?.text, "hello");
 	} finally {
 		process.env.PATH = originalPath;
 		process.argv.splice(0, process.argv.length, ...originalArgv);
@@ -230,9 +230,9 @@ test("dispatch should split canonical provider/model references into CLI provide
 		const modelIndex = args.indexOf("--model");
 
 		assert.notEqual(providerIndex, -1, "Expected worker args to include --provider");
-		assert.equal(args[providerIndex + 1], "google");
+		assert.equal(args[providerIndex + 1]!, "google");
 		assert.notEqual(modelIndex, -1, "Expected worker args to include --model");
-		assert.equal(args[modelIndex + 1], "gemini-2.5-flash");
+		assert.equal(args[modelIndex + 1]!, "gemini-2.5-flash");
 		assert.equal(args.includes("google/gemini-2.5-flash"), false);
 	} finally {
 		process.argv.splice(0, process.argv.length, ...originalArgv);
@@ -271,8 +271,8 @@ test("PiActorRuntime parses streamed stdout events, flushes the trailing JSON me
 		assert.equal(result.messages[0]?.role, "assistant");
 		assert.equal(result.messages[1]?.role, "toolResult");
 		assert.equal(result.messages[2]?.role, "assistant");
-		assert.equal(result.messages[2]?.content[0]?.type, "text");
-		assert.equal(result.messages[2]?.content[0]?.text, "second");
+		assert.equal(result.messages[2]?.content?.[0]?.type, "text");
+		assert.equal(result.messages[2]?.content?.[0]?.text, "second");
 
 		assert.deepEqual(result.usage, {
 			input: 5,
