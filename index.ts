@@ -89,6 +89,12 @@ interface UsageStats {
 	turns: number;
 }
 
+interface ThreadStats {
+	contextTokens: number;
+	lastCompactedAt: number;
+	compactionCount: number;
+}
+
 interface ThreadActionResult {
 	thread: string;
 	action: string;
@@ -101,6 +107,7 @@ interface ThreadActionResult {
 	errorMessage?: string;
 	sessionPath: string;
 	isNewThread: boolean;
+	compaction?: { tokensBefore: number; tokensAfter: number };
 }
 
 interface SingleDispatchResult {
@@ -287,7 +294,7 @@ async function runPiOnThread(
 	systemPromptFile: string | undefined,
 	signal: AbortSignal | undefined,
 	onMessage?: (msg: Message) => void,
-): Promise<{ exitCode: number; messages: Message[]; stderr: string }> {
+): Promise<{ exitCode: number; messages: Message[]; stderr: string; compaction?: { tokensBefore: number; tokensAfter: number } }> {
 	const args: string[] = ["--mode", "json", "-p", "--no-extensions", "--no-skills", "--no-prompt-templates"];
 	args.push("--session", sessionPath);
 	if (model) {
@@ -299,6 +306,7 @@ async function runPiOnThread(
 	const messages: Message[] = [];
 	let stderr = "";
 	let wasAborted = false;
+	let compactionResult: { tokensBefore: number; tokensAfter: number } | undefined;
 
 	const exitCode = await new Promise<number>((resolve) => {
 		const proc = spawn("pi", args, { cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] });
@@ -319,6 +327,12 @@ async function runPiOnThread(
 			if (event.type === "tool_result_end" && event.message) {
 				messages.push(event.message as Message);
 				onMessage?.(event.message as Message);
+			}
+			if (event.type === "auto_compaction_end" && event.result) {
+				compactionResult = {
+					tokensBefore: event.result.tokensBefore ?? 0,
+					tokensAfter: event.result.tokensAfter ?? 0,
+				};
 			}
 		};
 
@@ -354,7 +368,7 @@ async function runPiOnThread(
 	});
 
 	if (wasAborted) throw new Error("Thread was aborted");
-	return { exitCode, messages, stderr };
+	return { exitCode, messages, stderr, compaction: compactionResult };
 }
 
 async function runThreadAction(
@@ -440,6 +454,7 @@ async function runThreadAction(
 		);
 		result.exitCode = actionResult.exitCode;
 		result.stderr = actionResult.stderr;
+		result.compaction = actionResult.compaction;
 
 		return result;
 	} finally {
@@ -470,8 +485,11 @@ function getFinalOutput(messages: Message[]): string {
  * Returns: tool call history + last assistant message.
  * The orchestrator sees exactly what the thread did and said.
  */
-function buildEpisode(messages: Message[]): string {
+function buildEpisode(messages: Message[], compaction?: { tokensBefore: number; tokensAfter: number }): string {
 	const parts: string[] = [];
+	if (compaction) {
+		parts.push(`⚠️ Context was compacted during this action (${formatTokens(compaction.tokensBefore)} → ${formatTokens(compaction.tokensAfter)} tokens kept)\n`);
+	}
 
 	// Part 1: Tool call history — compact summary of what the thread did
 	const toolCalls: string[] = [];
@@ -592,6 +610,7 @@ function getDisplayItems(messages: Message[]): DisplayItem[] {
 export default function (pi: ExtensionAPI) {
 	// Track episode counts per thread (reconstructed from session)
 	const episodeCounts = new Map<string, number>();
+	const threadStats = new Map<string, ThreadStats>();
 	let subagentModel = "anthropic/claude-sonnet-4-6";
 
 	pi.registerCommand("model-sub", {
@@ -797,6 +816,7 @@ export default function (pi: ExtensionAPI) {
 	// Reconstruct state on session load
 	pi.on("session_start", async (_event, ctx) => {
 		episodeCounts.clear();
+		threadStats.clear();
 
 		// Strip built-in tools — orchestrator only dispatches
 		const allTools = pi.getAllTools();
@@ -832,7 +852,10 @@ export default function (pi: ExtensionAPI) {
 		if (threads.length > 0) {
 			const threadInfo = threads.map((t) => {
 				const count = episodeCounts.get(t) || 0;
-				return `  - **${t}** (${count} episode${count !== 1 ? "s" : ""})`;
+				const stats = threadStats.get(t);
+				const contextInfo = stats?.contextTokens ? `, ${formatTokens(stats.contextTokens)} context` : "";
+				const compactInfo = stats?.compactionCount ? `, compacted ${stats.compactionCount}×` : "";
+				return `  - **${t}** (${count} episode${count !== 1 ? "s" : ""}${contextInfo}${compactInfo})`;
 			});
 			extra += `\n## Active Threads\n${threadInfo.join("\n")}\n`;
 		}
@@ -935,8 +958,17 @@ export default function (pi: ExtensionAPI) {
 				);
 
 				// Build episode directly — tool call history + last message, no extra model call
-				const episode = buildEpisode(result.messages);
+				const episode = buildEpisode(result.messages, result.compaction);
 				episodeCounts.set(task.thread, episodeNumber);
+
+				// Update thread context stats
+				const existingStats = threadStats.get(task.thread) || { contextTokens: 0, lastCompactedAt: 0, compactionCount: 0 };
+				existingStats.contextTokens = result.usage.contextTokens;
+				if (result.compaction) {
+					existingStats.lastCompactedAt = Date.now();
+					existingStats.compactionCount++;
+				}
+				threadStats.set(task.thread, existingStats);
 
 				const item: SingleDispatchResult = { thread: task.thread, action: task.action, episode, episodeNumber, result };
 				allItems[index] = item;
