@@ -635,6 +635,10 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setStatus("subagent-model", `\x1b[${(process.stdout.columns ?? 120) - statusText.length + 1}G\x1b[2m${statusText}\x1b[0m`);
 	};
 
+	const persistConfig = () => {
+		pi.appendEntry("thread-config", { model: subagentModel, thinking: subagentThinking });
+	};
+
 	pi.registerCommand("model-sub", {
 		description: "Set the subagent model for thread workers (supports :thinking suffix, e.g. sonnet:high)",
 		handler: async (args, ctx) => {
@@ -666,6 +670,7 @@ export default function (pi: ExtensionAPI) {
 						updateStatusBar(ctx);
 						const thinkingMsg = thinkingSuffix ? ` | thinking: ${thinkingSuffix}` : "";
 						ctx.ui.notify(`Subagent model set to: ${subagentModel}${thinkingMsg}`, "info");
+						persistConfig();
 						return;
 					}
 				}
@@ -680,6 +685,7 @@ export default function (pi: ExtensionAPI) {
 					updateStatusBar(ctx);
 					const thinkingMsg = thinkingSuffix ? ` | thinking: ${thinkingSuffix}` : "";
 					ctx.ui.notify(`Subagent model set to: ${subagentModel}${thinkingMsg}`, "info");
+					persistConfig();
 					return;
 				}
 				// Fall through to picker with search pre-filled
@@ -925,6 +931,7 @@ export default function (pi: ExtensionAPI) {
 			updateStatusBar(ctx);
 			const thinkingMsg = subagentThinking ? ` | thinking: ${subagentThinking}` : "";
 			ctx.ui.notify(`Subagent model set to: ${subagentModel}${thinkingMsg}`, "info");
+			persistConfig();
 		},
 	});
 
@@ -932,6 +939,14 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		episodeCounts.clear();
 		threadStats.clear();
+
+		// Restore model/thinking config from session
+		for (const entry of ctx.sessionManager.getEntries()) {
+			if (entry.type === "custom" && entry.customType === "thread-config" && entry.data) {
+				if (entry.data.model) subagentModel = entry.data.model;
+				subagentThinking = entry.data.thinking;
+			}
+		}
 
 		// Strip built-in tools — orchestrator only dispatches
 		const allTools = pi.getAllTools();
