@@ -928,35 +928,6 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerCommand("thinking-sub", {
-		description: "Set the default thinking level for thread workers",
-		handler: async (args, ctx) => {
-			const input = args.trim().toLowerCase();
-			const levels = ["off", "minimal", "low", "medium", "high", "xhigh"];
-
-			if (!input) {
-				ctx.ui.notify(`🧠 Subagent thinking: ${subagentThinking || "(pi default)"}. Usage: /thinking-sub ${levels.join("|")}|reset`, "info");
-				return;
-			}
-
-			if (input === "reset" || input === "default") {
-				subagentThinking = undefined;
-				ctx.ui.notify("🧠 Subagent thinking reset to pi default", "info");
-				updateStatusBar(ctx);
-				return;
-			}
-
-			if (!levels.includes(input)) {
-				ctx.ui.notify(`Invalid level. Use: ${levels.join(", ")} or "reset"`, "warn");
-				return;
-			}
-
-			subagentThinking = input;
-			ctx.ui.notify(`🧠 Subagent thinking set to: ${input}`, "info");
-			updateStatusBar(ctx);
-		},
-	});
-
 	// Reconstruct state on session load
 	pi.on("session_start", async (_event, ctx) => {
 		episodeCounts.clear();
