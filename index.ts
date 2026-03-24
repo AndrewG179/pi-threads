@@ -14,12 +14,26 @@
  */
 
 import * as fs from "node:fs";
-import * as path from "node:path";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
-import type { Message } from "@mariozechner/pi-ai";
 import { type ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Text, truncateToWidth, visibleWidth } from "./src/pi/runtime-deps";
 
+import {
+	collectCompletedDispatchItems,
+	rebuildEpisodeCounts as rebuildDispatchEpisodeCounts,
+} from "./src/dispatch/history";
+import {
+	createEmptyThreadActionResult,
+	type DispatchTask,
+	findDuplicateThreads,
+	getDispatchFailureSummary,
+	getThreadsDir,
+	resolveDispatchSessionPath,
+	type DispatchDetails,
+	type SingleDispatchResult,
+	type UsageStats,
+} from "./src/dispatch/contract";
+import { runThreadAction } from "./src/dispatch/runner";
 import { buildEpisode as buildThreadEpisode } from "./src/episode/builder";
 import { PiActorRuntime } from "./src/runtime/pi-actor";
 import { getThreadSessionPath, normalizeSessionPath, toSubagentStatus } from "./src/subagents/metadata";
@@ -28,9 +42,12 @@ import {
 	buildSubagentModelStatusText,
 	findFuzzyModelMatches,
 	formatModelIdentifier,
+	getAvailableModels,
 	isModelOverrideResetQuery,
 	resolveEffectiveSubagentModel,
+	toModelDescriptor,
 	type ModelDescriptor,
+	type ModelLike,
 } from "./src/subagents/model-selection";
 import { deriveSessionBehavior, resolveActiveToolsForBehavior } from "./src/subagents/mode";
 import { SubagentRunStore } from "./src/subagents/runtime-store";
@@ -39,20 +56,6 @@ import { SubagentBrowser } from "./src/subagents/view";
 import { wrapText } from "./src/text/wrap";
 
 // ─── Constants ───
-
-const THREADS_DIR = ".pi/threads";
-
-const THREAD_WORKER_PROMPT = `You are a thread — an execution worker controlled by an orchestrator.
-
-## Your Role
-Execute the instructions given to you. You are the hands, not the brain.
-
-## Rules
-1. **Follow instructions precisely.** Do exactly what you're told.
-2. **Handle tactical details.** Missing imports, typos, small fixups needed to complete your task — just handle them.
-3. **Never make strategic decisions.** If something is ambiguous, if you face a fork where different approaches are possible, or if you encounter something unexpected — STOP and report back. Do not guess.
-4. **If you fail, report clearly.** Don't try alternative approaches. Describe what went wrong and what state things are in now.
-5. **Be thorough within scope.** Complete all parts of your instructions.`;
 
 const piActorRuntime = new PiActorRuntime();
 
@@ -127,75 +130,6 @@ const DISPATCH_TOOL_PARAMETERS = {
 	additionalProperties: false,
 } as const;
 
-// ─── Types ───
-
-interface UsageStats {
-	input: number;
-	output: number;
-	cacheRead: number;
-	cacheWrite: number;
-	cost: number;
-	contextTokens: number;
-	turns: number;
-}
-
-interface ThreadActionResult {
-	thread: string;
-	action: string;
-	exitCode: number;
-	messages: Message[];
-	stderr: string;
-	usage: UsageStats;
-	model?: string;
-	stopReason?: string;
-	errorMessage?: string;
-	sessionPath: string;
-	isNewThread: boolean;
-}
-
-interface SingleDispatchResult {
-	thread: string;
-	action: string;
-	episode: string;
-	episodeNumber: number;
-	result: ThreadActionResult;
-}
-
-interface DispatchDetails {
-	mode: "single" | "batch";
-	items: SingleDispatchResult[];
-}
-
-// ─── Helpers ───
-
-function createEmptyUsageStats(): UsageStats {
-	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 };
-}
-
-function createEmptyThreadActionResult(params: {
-	thread: string;
-	action: string;
-	model: string | undefined;
-	sessionPath: string;
-	isNewThread: boolean;
-}): ThreadActionResult {
-	return {
-		thread: params.thread,
-		action: params.action,
-		exitCode: 0,
-		messages: [],
-		stderr: "",
-		usage: createEmptyUsageStats(),
-		model: params.model,
-		sessionPath: params.sessionPath,
-		isNewThread: params.isNewThread,
-	};
-}
-
-function getThreadsDir(cwd: string): string {
-	return path.join(cwd, THREADS_DIR);
-}
-
 function listThreadSessionNames(cwd: string): string[] {
 	const dir = getThreadsDir(cwd);
 	if (!fs.existsSync(dir)) return [];
@@ -206,13 +140,6 @@ function listThreadSessionNames(cwd: string): string[] {
 			.map((fileName) => fileName.replace(/\.jsonl$/, ""));
 	} catch {
 		return [];
-	}
-}
-
-function ensureThreadsDir(cwd: string): void {
-	const dir = getThreadsDir(cwd);
-	if (!fs.existsSync(dir)) {
-		fs.mkdirSync(dir, { recursive: true });
 	}
 }
 
@@ -295,163 +222,6 @@ function formatUsage(usage: UsageStats, model?: string): string {
 	return parts.join(" ");
 }
 
-// ─── Thread Execution ───
-
-async function runThreadAction(
-	cwd: string,
-	threadName: string,
-	action: string,
-	model: string | undefined,
-	signal: AbortSignal | undefined,
-	onUpdate: ((partial: AgentToolResult<DispatchDetails>) => void) | undefined,
-	episodeNumber: number,
-	runId: string,
-	onRuntimeMessage?: (message: Message, liveCost: number) => void,
-): Promise<ThreadActionResult> {
-	ensureThreadsDir(cwd);
-	const sessionPath = getThreadSessionPath(getThreadsDir(cwd), threadName);
-	const isNewThread = !fs.existsSync(sessionPath);
-
-	const liveResult = createEmptyThreadActionResult({
-		thread: threadName,
-		action,
-		model,
-		sessionPath,
-		isNewThread,
-	});
-
-	const trackUsage = (msg: Message) => {
-		if (msg.role !== "assistant") return;
-
-		liveResult.usage.turns++;
-		const usage = msg.usage;
-		if (usage) {
-			liveResult.usage.input += usage.input || 0;
-			liveResult.usage.output += usage.output || 0;
-			liveResult.usage.cacheRead += usage.cacheRead || 0;
-			liveResult.usage.cacheWrite += usage.cacheWrite || 0;
-			liveResult.usage.cost += usage.cost?.total || 0;
-			liveResult.usage.contextTokens = usage.totalTokens || 0;
-		}
-		if (!liveResult.model && msg.model) liveResult.model = msg.model;
-		if (msg.stopReason) liveResult.stopReason = msg.stopReason;
-		if (msg.errorMessage) liveResult.errorMessage = msg.errorMessage;
-	};
-
-	const emitUpdate = () => {
-		if (!onUpdate) return;
-		const lastText = getFinalOutput(liveResult.messages);
-		onUpdate({
-			content: [{ type: "text", text: lastText || "(running...)" }],
-			details: {
-				mode: "single",
-				items: [{
-					thread: threadName,
-					action,
-					episode: "(running...)",
-					episodeNumber,
-					result: liveResult,
-				}],
-			},
-		});
-	};
-
-	// Only real external tool aborts should cancel the worker. The current
-	// /subagents flow is same-session view state and no longer uses session
-	// switches as a control path for in-flight thread work.
-	const handle = piActorRuntime.invoke(
-		{
-			runId,
-			thread: threadName,
-			cwd,
-			action,
-			model,
-			sessionPath,
-			systemPrompt: THREAD_WORKER_PROMPT,
-		},
-	);
-	const abort = () => {
-		void handle.cancel();
-	};
-	if (signal?.aborted) abort();
-	else signal?.addEventListener("abort", abort, { once: true });
-
-	const unsubscribe = handle.subscribe((event) => {
-		if (event.type === "message") {
-			const threadedMessage = event.message as Message;
-			liveResult.messages.push(threadedMessage);
-			trackUsage(threadedMessage);
-			emitUpdate();
-			onRuntimeMessage?.(threadedMessage, liveResult.usage.cost);
-		}
-		if (event.type === "stderr") {
-			liveResult.stderr += event.chunk;
-		}
-	});
-
-	const runtimeResult = await handle.result.finally(() => {
-		unsubscribe();
-		signal?.removeEventListener("abort", abort);
-	});
-
-	const exitCode = runtimeResult.finalState.exitCode
-		?? (
-			runtimeResult.finalState.signal
-			|| runtimeResult.stopReason === "error"
-			|| runtimeResult.stopReason === "aborted"
-				? 1
-				: 0
-		);
-
-	return {
-		...liveResult,
-		messages: runtimeResult.messages as Message[],
-		stderr: runtimeResult.stderr,
-		usage: { ...runtimeResult.usage },
-		model: runtimeResult.model ?? liveResult.model,
-		stopReason: runtimeResult.stopReason,
-		errorMessage: runtimeResult.errorMessage,
-		exitCode,
-	};
-}
-
-// ─── Episode Generation ───
-
-function getFinalOutput(messages: Message[]): string {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (msg.role === "assistant") {
-			for (const part of msg.content) {
-				if (part.type === "text") return part.text;
-			}
-		}
-	}
-	return "";
-}
-
-function getDispatchFailureSummary(result: Pick<ThreadActionResult, "errorMessage" | "stderr">): string | undefined {
-	const errorText = result.errorMessage?.trim() || result.stderr.trim();
-	return errorText ? `THREAD ERROR:\n${errorText}` : undefined;
-}
-
-function findDuplicateThreads(tasks: Array<{ thread: string }>, threadsDir: string): string[] {
-	const threadsBySessionPath = new Map<string, string[]>();
-	for (const task of tasks) {
-		const sessionPath = getThreadSessionPath(threadsDir, task.thread);
-		const threads = threadsBySessionPath.get(sessionPath);
-		if (threads) {
-			threads.push(task.thread);
-		} else {
-			threadsBySessionPath.set(sessionPath, [task.thread]);
-		}
-	}
-	return [...new Set(
-		[...threadsBySessionPath.values()]
-			.filter((threads) => threads.length > 1)
-			.flat(),
-	)];
-}
-
 // ─── Rendering Helpers ───
 
 function summarizeDispatchItem(item: SingleDispatchResult, theme: any): string {
@@ -483,21 +253,6 @@ function summarizeDispatchItem(item: SingleDispatchResult, theme: any): string {
 		lines.push(theme.fg("dim", usage));
 	}
 	return lines.join("\n");
-}
-
-type ModelLike = {
-	provider: string;
-	id: string;
-	name?: string;
-};
-
-function toModelDescriptor(model: ModelLike | undefined): ModelDescriptor | undefined {
-	if (!model) return undefined;
-	return {
-		provider: model.provider,
-		id: model.id,
-		name: model.name,
-	};
 }
 
 // ─── Extension ───
@@ -545,33 +300,14 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui?.notify?.("Subagent model override cleared. Workers will inherit the current session model.", "info");
 	};
 
-	const getAvailableModels = async (ctx: { modelRegistry?: { getAvailable: () => Promise<readonly ModelLike[]> | readonly ModelLike[] } }): Promise<ModelDescriptor[]> => {
-		if (!ctx.modelRegistry?.getAvailable) return [];
-		const available = await Promise.resolve(ctx.modelRegistry.getAvailable());
-		return available.map((model) => toModelDescriptor(model)).filter((model): model is ModelDescriptor => model !== undefined);
-	};
-
 	const getCanonicalThreadSessionPath = (cwd: string, thread: string, sessionPath?: string) =>
-		normalizeSessionPath(sessionPath) ?? getThreadSessionPath(getThreadsDir(cwd), thread);
+		resolveDispatchSessionPath(cwd, thread, sessionPath);
 
 	const rebuildEpisodeCounts = (
 		cwd: string,
 		sessionManager: { getBranch(): Array<{ type: string; message: { role: string; toolName?: string; details?: unknown } }> },
 	) => {
-		episodeCounts.clear();
-		for (const entry of sessionManager.getBranch()) {
-			if (entry.type === "message" && entry.message.role === "toolResult") {
-				if (entry.message.toolName === "dispatch") {
-					const details = entry.message.details as DispatchDetails | undefined;
-					if (details?.items) {
-						for (const item of details.items) {
-							const sessionPath = getCanonicalThreadSessionPath(cwd, item.thread, item.result?.sessionPath);
-							episodeCounts.set(sessionPath, Math.max(episodeCounts.get(sessionPath) || 0, item.episodeNumber));
-						}
-					}
-				}
-			}
-		}
+		rebuildDispatchEpisodeCounts(episodeCounts, collectCompletedDispatchItems(cwd, sessionManager.getBranch()));
 	};
 
 	const resolveSessionContext = (ctx: {
@@ -639,7 +375,7 @@ export default function (pi: ExtensionAPI) {
 		parentBranchEntries: Array<{ type: string; message: { role: string; toolName?: string; details?: unknown } }>,
 	) => {
 		if (!parentSessionFile) return;
-		subagentRunStore.seedCompletedFromParent(parentSessionFile, cwd, parentBranchEntries);
+		subagentRunStore.seedCompletedFromParent(parentSessionFile, collectCompletedDispatchItems(cwd, parentBranchEntries));
 	};
 
 	const openSubagentsBrowser = async (ctx: {
@@ -698,7 +434,7 @@ export default function (pi: ExtensionAPI) {
 			): Promise<T>;
 		};
 	}, initialQuery: string): Promise<ModelDescriptor | undefined | null> => {
-		const models = await getAvailableModels(ctx);
+		const models = await getAvailableModels(ctx.modelRegistry);
 		if (models.length === 0) {
 			ctx.ui.notify("No subagent models with configured API keys are available.", "warning");
 			return null;
@@ -1038,7 +774,9 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			const availableModels = await getAvailableModels(ctx as { modelRegistry?: { getAvailable: () => Promise<readonly ModelLike[]> | readonly ModelLike[] } });
+			const availableModels = await getAvailableModels((ctx as {
+				modelRegistry?: { getAvailable: () => Promise<readonly ModelLike[]> | readonly ModelLike[] };
+			}).modelRegistry);
 			if (input) {
 				const matches = findFuzzyModelMatches(availableModels, input);
 				if (matches.length === 1) {
@@ -1102,7 +840,7 @@ export default function (pi: ExtensionAPI) {
 			const model = getEffectiveSubagentModel(ctx);
 			const sessionContext = resolveSessionContext(ctx);
 			const parentSessionFile = sessionContext.sessionFile;
-			const taskList = params.tasks?.length
+			const taskList: DispatchTask[] | null = params.tasks?.length
 				? params.tasks
 				: params.thread && params.action
 					? [{ thread: params.thread, action: params.action }]
@@ -1142,7 +880,7 @@ export default function (pi: ExtensionAPI) {
 				});
 			};
 
-			const runOne = async (task: { thread: string; action: string }, index: number): Promise<SingleDispatchResult> => {
+			const runOne = async (task: DispatchTask, index: number): Promise<SingleDispatchResult> => {
 				const sessionPath = taskSessionPaths.get(task.thread) ?? getThreadSessionPath(threadsDir, task.thread);
 				const episodeNumber = (episodeCounts.get(sessionPath) || 0) + 1;
 				const taskOnUpdate = mode === "single"
@@ -1187,12 +925,17 @@ export default function (pi: ExtensionAPI) {
 					details: { mode: "single", items: [pendingItem] },
 				});
 
-				const result = await runThreadAction(
-					ctx.cwd, task.thread, task.action, model, signal,
-					taskOnUpdate,
+				const result = await runThreadAction({
+					runtime: piActorRuntime,
+					cwd: ctx.cwd,
+					threadName: task.thread,
+					action: task.action,
+					model,
+					signal,
+					onUpdate: taskOnUpdate,
 					episodeNumber,
 					runId,
-					(message, liveCost) => {
+					onRuntimeMessage: (message, liveCost) => {
 						if (!parentSessionFile) return;
 						subagentRunStore.recordMessage({
 							parentSessionFile,
@@ -1201,8 +944,8 @@ export default function (pi: ExtensionAPI) {
 							sessionPath,
 							liveCost,
 						});
-				},
-				);
+					},
+				});
 
 				const episode = buildThreadEpisode(
 					result.messages as Parameters<typeof buildThreadEpisode>[0],
