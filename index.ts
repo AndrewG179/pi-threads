@@ -694,11 +694,6 @@ export default function (pi: ExtensionAPI) {
 						searchInput.handleInput(ch);
 					}
 				}
-				searchInput.onChange = (text: string) => {
-					searchText = text;
-					applyFilter();
-					tui.requestRender();
-				};
 				container.addChild(searchInput);
 
 				// Spacer
@@ -782,6 +777,8 @@ export default function (pi: ExtensionAPI) {
 							done(null);
 						} else {
 							searchInput.handleInput(data);
+							searchText = searchInput.value;
+							applyFilter();
 							renderList();
 							tui.requestRender();
 						}
