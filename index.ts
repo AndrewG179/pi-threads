@@ -125,10 +125,6 @@ const DISPATCH_TOOL_PARAMETERS = {
 		},
 	},
 	additionalProperties: false,
-	oneOf: [
-		{ required: ["thread", "action"] },
-		{ required: ["tasks"] },
-	],
 } as const;
 
 // ─── Types ───
