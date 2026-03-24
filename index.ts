@@ -847,8 +847,84 @@ export default function (pi: ExtensionAPI) {
 			if (!choice) return;
 
 			subagentModel = choice;
+
+			// Step 2: pick thinking level
+			const thinkingLevels = [
+				{ value: undefined,    label: "default",  desc: "Use pi default from settings" },
+				{ value: "off",        label: "off",      desc: "No reasoning — fastest, cheapest" },
+				{ value: "minimal",    label: "minimal",  desc: "1k token budget — barely any reasoning" },
+				{ value: "low",        label: "low",      desc: "2k token budget — light reasoning" },
+				{ value: "medium",     label: "medium",   desc: "8k token budget — moderate reasoning" },
+				{ value: "high",       label: "high",     desc: "16k token budget — complex tasks" },
+				{ value: "xhigh",      label: "xhigh",    desc: "Max reasoning — Opus 4.6 / GPT-5 only" },
+			];
+
+			const chosenThinking = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+				let selectedIndex = thinkingLevels.findIndex((l) => l.value === subagentThinking);
+				if (selectedIndex < 0) selectedIndex = 0;
+
+				const container = new Container();
+				const topBorder = new DynamicBorder((s: string) => theme.fg("accent", s));
+				container.addChild(topBorder);
+
+				const headerText = new Text(theme.fg("muted", `  Select thinking level for ${subagentModel}`), 0, 1);
+				container.addChild(headerText);
+
+				container.addChild(new Text("", 0, 1));
+
+				const listText = new Text("", 0, 0);
+				container.addChild(listText);
+
+				const descText = new Text("", 0, 1);
+				container.addChild(descText);
+
+				const bottomBorder = new DynamicBorder((s: string) => theme.fg("accent", s));
+				container.addChild(bottomBorder);
+
+				function renderThinkingList() {
+					const lines = thinkingLevels.map((l, i) => {
+						const isSelected = i === selectedIndex;
+						const isCurrent = l.value === subagentThinking || (l.value === undefined && subagentThinking === undefined);
+						const checkmark = isCurrent ? theme.fg("success", " ✓") : "";
+						if (isSelected) {
+							return `${theme.fg("accent", "→ " + l.label)}${checkmark}`;
+						}
+						return `  ${l.label}${checkmark}`;
+					});
+					listText.text = lines.join("\n");
+					descText.text = theme.fg("muted", `  ${thinkingLevels[selectedIndex]?.desc || ""}`);
+				}
+
+				renderThinkingList();
+
+				return {
+					render: (w: number) => container.render(w),
+					invalidate: () => container.invalidate(),
+					handleInput: (data: string) => {
+						if (matchesKey(data, Key.up)) {
+							selectedIndex = selectedIndex <= 0 ? thinkingLevels.length - 1 : selectedIndex - 1;
+							renderThinkingList();
+							tui.requestRender();
+						} else if (matchesKey(data, Key.down)) {
+							selectedIndex = selectedIndex >= thinkingLevels.length - 1 ? 0 : selectedIndex + 1;
+							renderThinkingList();
+							tui.requestRender();
+						} else if (matchesKey(data, Key.enter)) {
+							done(thinkingLevels[selectedIndex]?.value ?? "__default__");
+						} else if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+							done(null);
+						}
+					},
+				};
+			});
+
+			if (chosenThinking !== null) {
+				subagentThinking = chosenThinking === "__default__" ? undefined : chosenThinking;
+			}
+
 			updateStatusBar(ctx);
-			ctx.ui.notify(`Subagent model set to: ${subagentModel}`, "info");
+			const thinkingMsg = subagentThinking ? ` | thinking: ${subagentThinking}` : "";
+			ctx.ui.notify(`Subagent model set to: ${subagentModel}${thinkingMsg}`, "info");
 		},
 	});
 
