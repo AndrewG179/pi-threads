@@ -54,7 +54,7 @@ test("SubagentRunStore isolates live cards by parent session even when thread na
 	store.recordMessage({
 		parentSessionFile: parentA,
 		runId: "run-a",
-		thread: "shared",
+		sessionPath: threadSessionA,
 		message: assistantText("alpha progress"),
 		liveCost: 0.11,
 	});
@@ -69,7 +69,7 @@ test("SubagentRunStore isolates live cards by parent session even when thread na
 	store.recordMessage({
 		parentSessionFile: parentB,
 		runId: "run-b",
-		thread: "shared",
+		sessionPath: threadSessionB,
 		message: assistantText("beta progress"),
 		liveCost: 0.22,
 	});
@@ -107,7 +107,7 @@ test("SubagentRunStore ignores stale live updates once a newer run owns the thre
 	store.recordMessage({
 		parentSessionFile: parentSession,
 		runId: "run-1",
-		thread: "alpha",
+		sessionPath: threadSession,
 		message: assistantText("first progress"),
 		liveCost: 0.4,
 	});
@@ -122,7 +122,7 @@ test("SubagentRunStore ignores stale live updates once a newer run owns the thre
 	store.recordMessage({
 		parentSessionFile: parentSession,
 		runId: "run-1",
-		thread: "alpha",
+		sessionPath: threadSession,
 		message: assistantText("stale progress"),
 		liveCost: 9.9,
 	});
@@ -141,7 +141,7 @@ test("SubagentRunStore ignores stale live updates once a newer run owns the thre
 	store.recordMessage({
 		parentSessionFile: parentSession,
 		runId: "run-2",
-		thread: "alpha",
+		sessionPath: threadSession,
 		message: assistantWithTool("fresh progress", "echo fresh"),
 		liveCost: 0.25,
 	});
@@ -261,7 +261,7 @@ test("SubagentRunStore reseeding completed parent history should not overwrite n
 	store.recordMessage({
 		parentSessionFile: parentSession,
 		runId: "run-2",
-		thread: "alpha",
+		sessionPath: threadSession,
 		message: assistantWithTool("live progress", "echo live"),
 		liveCost: 0.2,
 	});
@@ -289,4 +289,64 @@ test("SubagentRunStore reseeding completed parent history should not overwrite n
 	assert.equal(card.toolPreview, "$ echo live");
 	assert.equal(card.status, "unknown");
 	assert.equal(card.accumulatedCost, 0.7);
+});
+
+test("SubagentRunStore should reconcile normalized thread aliases onto one canonical session record", () => {
+	const store = new SubagentRunStore();
+	const cwd = "/tmp/runtime-store-alias";
+	const parentSession = path.join(cwd, ".pi", "sessions", "parent.jsonl");
+	const aliasSession = path.join(cwd, ".pi", "threads", "collision_a.jsonl");
+
+	store.startRun({
+		parentSessionFile: parentSession,
+		runId: "run-1",
+		thread: "collision/a",
+		sessionPath: aliasSession,
+		action: "First alias action",
+	});
+	store.recordMessage({
+		parentSessionFile: parentSession,
+		runId: "run-1",
+		sessionPath: aliasSession,
+		message: assistantText("first alias output"),
+		liveCost: 0.25,
+	});
+	store.finishRun({
+		parentSessionFile: parentSession,
+		runId: "run-1",
+		thread: "collision/a",
+		sessionPath: aliasSession,
+		action: "First alias action",
+		episodeNumber: 1,
+		status: "done",
+		usageCost: 0.25,
+		messages: [assistantText("first alias output")],
+	});
+
+	store.startRun({
+		parentSessionFile: parentSession,
+		runId: "run-2",
+		thread: "collision_a",
+		sessionPath: aliasSession,
+		action: "Second alias action",
+	});
+	store.finishRun({
+		parentSessionFile: parentSession,
+		runId: "run-2",
+		thread: "collision_a",
+		sessionPath: aliasSession,
+		action: "Second alias action",
+		episodeNumber: 2,
+		status: "done",
+		usageCost: 0.5,
+		messages: [assistantText("second alias output")],
+	});
+
+	const cards = store.getCards(parentSession);
+	assert.equal(cards.length, 1, "one canonical worker session should produce one card even when thread aliases differ");
+	assert.equal(cards[0]?.thread, "collision_a", "the latest raw alias should remain available as presentation metadata");
+	assert.equal(cards[0]?.sessionPath, path.resolve(aliasSession));
+	assert.equal(cards[0]?.latestAction, "Second alias action");
+	assert.equal(cards[0]?.outputPreview, "second alias output");
+	assert.equal(cards[0]?.accumulatedCost, 0.75);
 });

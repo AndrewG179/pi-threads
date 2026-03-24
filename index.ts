@@ -503,7 +503,7 @@ function toModelDescriptor(model: ModelLike | undefined): ModelDescriptor | unde
 // ─── Extension ───
 
 export default function (pi: ExtensionAPI) {
-	// Track episode counts per thread (reconstructed from session)
+	// Track episode counts per canonical worker session path.
 	const episodeCounts = new Map<string, number>();
 	let defaultActiveTools: string[] | null = null;
 	let subagentModelOverride: ModelDescriptor | undefined;
@@ -551,7 +551,13 @@ export default function (pi: ExtensionAPI) {
 		return available.map((model) => toModelDescriptor(model)).filter((model): model is ModelDescriptor => model !== undefined);
 	};
 
-	const rebuildEpisodeCounts = (sessionManager: { getBranch(): Array<{ type: string; message: { role: string; toolName?: string; details?: unknown } }> }) => {
+	const getCanonicalThreadSessionPath = (cwd: string, thread: string, sessionPath?: string) =>
+		normalizeSessionPath(sessionPath) ?? getThreadSessionPath(getThreadsDir(cwd), thread);
+
+	const rebuildEpisodeCounts = (
+		cwd: string,
+		sessionManager: { getBranch(): Array<{ type: string; message: { role: string; toolName?: string; details?: unknown } }> },
+	) => {
 		episodeCounts.clear();
 		for (const entry of sessionManager.getBranch()) {
 			if (entry.type === "message" && entry.message.role === "toolResult") {
@@ -559,7 +565,8 @@ export default function (pi: ExtensionAPI) {
 					const details = entry.message.details as DispatchDetails | undefined;
 					if (details?.items) {
 						for (const item of details.items) {
-							episodeCounts.set(item.thread, Math.max(episodeCounts.get(item.thread) || 0, item.episodeNumber));
+							const sessionPath = getCanonicalThreadSessionPath(cwd, item.thread, item.result?.sessionPath);
+							episodeCounts.set(sessionPath, Math.max(episodeCounts.get(sessionPath) || 0, item.episodeNumber));
 						}
 					}
 				}
@@ -622,7 +629,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		updateSubagentModelStatus(ctx);
 
-		rebuildEpisodeCounts(ctx.sessionManager);
+		rebuildEpisodeCounts(ctx.cwd, ctx.sessionManager);
 		return behavior;
 	};
 
@@ -928,7 +935,7 @@ export default function (pi: ExtensionAPI) {
 		const threadSessions = listThreadSessionNames(ctx.cwd);
 		if (threadSessions.length > 0) {
 			const threadInfo = threadSessions.map((threadName) => {
-				const count = episodeCounts.get(threadName) || 0;
+				const count = episodeCounts.get(getCanonicalThreadSessionPath(ctx.cwd, threadName)) || 0;
 				return `  - **${threadName}** (${count} episode${count !== 1 ? "s" : ""})`;
 			});
 			extra += [
@@ -1097,7 +1104,8 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			const runOne = async (task: { thread: string; action: string }, index: number): Promise<SingleDispatchResult> => {
-				const episodeNumber = (episodeCounts.get(task.thread) || 0) + 1;
+				const sessionPath = taskSessionPaths.get(task.thread) ?? getThreadSessionPath(threadsDir, task.thread);
+				const episodeNumber = (episodeCounts.get(sessionPath) || 0) + 1;
 				const taskOnUpdate = mode === "single"
 					? onUpdate
 					: onUpdate
@@ -1110,7 +1118,6 @@ export default function (pi: ExtensionAPI) {
 							}
 						: undefined;
 
-				const sessionPath = taskSessionPaths.get(task.thread) ?? getThreadSessionPath(threadsDir, task.thread);
 				const runId = `${task.thread}:${episodeNumber}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
 
 				const pendingItem: SingleDispatchResult = {
@@ -1151,18 +1158,18 @@ export default function (pi: ExtensionAPI) {
 						subagentRunStore.recordMessage({
 							parentSessionFile,
 							runId,
-							thread: task.thread,
 							message,
+							sessionPath,
 							liveCost,
 						});
-					},
+				},
 				);
 
 				const episode = buildThreadEpisode(
 					result.messages as Parameters<typeof buildThreadEpisode>[0],
 					{ emptyFallback: getDispatchFailureSummary(result) },
 				);
-				episodeCounts.set(task.thread, episodeNumber);
+				episodeCounts.set(result.sessionPath, episodeNumber);
 
 				const item: SingleDispatchResult = { thread: task.thread, action: task.action, episode, episodeNumber, result };
 				allItems[index] = item;

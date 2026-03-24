@@ -61,7 +61,7 @@ interface StartRunInput {
 interface LiveMessageInput {
 	parentSessionFile: string;
 	runId: string;
-	thread: string;
+	sessionPath: string;
 	message: Message;
 	liveCost: number;
 }
@@ -114,8 +114,8 @@ function toCard(record: SubagentRunRecord): SubagentCard {
 	};
 }
 
-function getResultKey(item: { thread: string; action: string; episodeNumber: number; sessionPath: string }): string {
-	return `${item.thread}:${item.episodeNumber}:${item.action}:${item.sessionPath}`;
+function getResultKey(item: { action: string; episodeNumber: number; sessionPath: string }): string {
+	return `${item.episodeNumber}:${item.action}:${item.sessionPath}`;
 }
 
 function applyMessageSummary(record: SubagentRunRecord, messages: readonly Message[]): void {
@@ -158,14 +158,14 @@ export class SubagentRunStore {
 		if (!normalizedParent || !normalizedSessionPath) return undefined;
 
 		const parentRecords = this.getOrCreateParentRecords(normalizedParent);
-		const existing = parentRecords.get(thread) ?? createEmptyRecord(thread, normalizedSessionPath);
+		const existing = parentRecords.get(normalizedSessionPath) ?? createEmptyRecord(thread, normalizedSessionPath);
 		const next: SubagentRunRecord = {
 			...existing,
 			thread,
 			sessionPath: normalizedSessionPath,
 			outputTail: [...existing.outputTail],
 		};
-		parentRecords.set(thread, next);
+		parentRecords.set(normalizedSessionPath, next);
 		return next;
 	}
 
@@ -199,7 +199,6 @@ export class SubagentRunStore {
 				}
 
 				const resultKey = getResultKey({
-					thread: item.thread,
 					action: item.action,
 					episodeNumber: item.episodeNumber,
 					sessionPath,
@@ -226,7 +225,7 @@ export class SubagentRunStore {
 	}
 
 	recordMessage(input: LiveMessageInput): void {
-		const record = this.getRecord(input.parentSessionFile, input.thread);
+		const record = this.getRecord(input.parentSessionFile, input.sessionPath);
 		if (!record || record.activeRunId !== input.runId) return;
 
 		const messageOutput = summarizeOutputTail([input.message]);
@@ -258,7 +257,6 @@ export class SubagentRunStore {
 		if (!normalizedSessionPath) return;
 
 		const resultKey = getResultKey({
-			thread: input.thread,
 			action: input.action,
 			episodeNumber: input.episodeNumber,
 			sessionPath: normalizedSessionPath,
@@ -282,9 +280,10 @@ export class SubagentRunStore {
 			.sort((left, right) => left.thread.localeCompare(right.thread));
 	}
 
-	private getRecord(parentSessionFile: string | undefined, thread: string): SubagentRunRecord | undefined {
+	private getRecord(parentSessionFile: string | undefined, sessionPath: string): SubagentRunRecord | undefined {
 		const normalizedParent = normalizeSessionPath(parentSessionFile);
-		if (!normalizedParent) return undefined;
-		return this.recordsByParentSession.get(normalizedParent)?.get(thread);
+		const normalizedSessionPath = normalizeSessionPath(sessionPath);
+		if (!normalizedParent || !normalizedSessionPath) return undefined;
+		return this.recordsByParentSession.get(normalizedParent)?.get(normalizedSessionPath);
 	}
 }

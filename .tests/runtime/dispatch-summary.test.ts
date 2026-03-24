@@ -311,6 +311,70 @@ test("dispatch should reject batch tasks whose thread names normalize to the sam
 	}
 });
 
+test("dispatch should continue episode numbering across separate dispatches that target the same normalized worker session", async () => {
+	const projectDir = makeTempProject();
+	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
+
+	try {
+		fs.mkdirSync(path.dirname(parentSession), { recursive: true });
+		fs.writeFileSync(parentSession, "{\"type\":\"session\"}\n", "utf8");
+
+		const fakePi = makeFakePi();
+		registerExtension(fakePi as any);
+
+		const dispatch = fakePi.tools.get("dispatch");
+		assert.ok(dispatch, "dispatch tool should be registered");
+
+		const threadsDir = path.join(projectDir, ".pi", "threads");
+		const aliasAPath = getThreadSessionPath(threadsDir, "collision/a");
+		const aliasBPath = getThreadSessionPath(threadsDir, "collision_a");
+		assert.equal(aliasAPath, aliasBPath, "the alias inputs should resolve to the same canonical worker session path");
+
+		const invokedSessionPaths: string[] = [];
+		const originalInvoke = PiActorRuntime.prototype.invoke;
+		PiActorRuntime.prototype.invoke = function (request) {
+			assert.equal(typeof request.sessionPath, "string");
+			invokedSessionPaths.push(request.sessionPath!);
+			return {
+				result: Promise.resolve(makeAssistantResult(request.runId, request.thread, `done ${request.action}`)),
+				subscribe: () => () => {},
+				cancel: () => {},
+			} as any;
+		};
+
+		try {
+			const first = await dispatch.execute(
+				"tool-call-alias-first",
+				{ thread: "collision/a", action: "first alias task" },
+				undefined,
+				undefined,
+				makeDispatchContext(projectDir, parentSession),
+			) as any;
+			const second = await dispatch.execute(
+				"tool-call-alias-second",
+				{ thread: "collision_a", action: "second alias task" },
+				undefined,
+				undefined,
+				makeDispatchContext(projectDir, parentSession),
+			) as any;
+
+			assert.equal(first.details?.items?.[0]?.result?.sessionPath, aliasAPath);
+			assert.equal(second.details?.items?.[0]?.result?.sessionPath, aliasBPath);
+			assert.deepEqual(invokedSessionPaths, [aliasAPath, aliasBPath]);
+			assert.equal(first.details?.items?.[0]?.episodeNumber, 1);
+			assert.equal(
+				second.details?.items?.[0]?.episodeNumber,
+				2,
+				"separate dispatches to aliases of the same worker session should continue canonical episode numbering",
+			);
+		} finally {
+			PiActorRuntime.prototype.invoke = originalInvoke;
+		}
+	} finally {
+		fs.rmSync(projectDir, { recursive: true, force: true });
+	}
+});
+
 test("dispatch should represent a genuinely aborted tool call as aborted instead of waiting for child success", async () => {
 	const projectDir = makeTempProject();
 	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
