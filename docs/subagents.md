@@ -78,6 +78,11 @@ The browser should show a compact card per subagent with the information this ex
 - accumulated cost seen in the current parent session
 - completion status (`Done`, `Escalated`, `Aborted`, or unknown)
 
+Browser detail behavior:
+- the browser remains summary-oriented
+- the selected detail pane may show more wrapped `Action` and `Output` than the compact session list, but it is still a bounded summary view
+- browser `Recent Tool` remains a short preview, not a full transcript/tool log
+
 This is a view concern only. Whether the user is currently looking at the parent, a subagent, or the browser must not change whether work continues.
 
 Keyboard behavior:
@@ -97,6 +102,13 @@ Required runtime behavior:
 - switching views is a UI/navigation action, not an execution-control action
 
 The browser and inspector are same-session view state over the extension-owned background run store. They must not call host `switchSession(...)` for in-flight inspection, and they must not depend on remembered-parent banner/back-navigation machinery.
+
+Inspector behavior:
+- the inspector is a scrollable detail view inside the same custom view
+- `Up` and `Down` scroll the inspector body
+- the inspector should show the full task/action text currently recorded for that subagent
+- the inspector should show the full output history currently recorded for that subagent in the extension-owned run data, not just the tail preview used in the browser
+- the inspector is still based on extension-owned subagent detail data; it is not a host-native transcript/chat mount
 
 ## Non-negotiable invariants
 
