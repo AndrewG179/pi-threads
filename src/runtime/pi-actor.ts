@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import type { EpisodeMessage } from "../episode/builder";
+import { getThreadSessionPath } from "../subagents/metadata";
 
 const THREADS_DIR = ".pi/threads";
 const DEFAULT_PI_COMMAND = "pi";
@@ -27,6 +28,10 @@ type StreamEvent = {
 	type?: string;
 	message?: RuntimeMessage;
 };
+
+interface ProtocolErrorHandlers {
+	onMalformedOutput(error: Error): void;
+}
 
 type PromptFile = {
 	dir: string;
@@ -121,6 +126,16 @@ function toErrorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+function summarizeProtocolOutput(output: string): string {
+	const normalized = output.replace(/\s+/g, " ").trim();
+	if (!normalized) return "(blank output)";
+	return normalized.length > 200 ? `${normalized.slice(0, 199)}…` : normalized;
+}
+
+function createMalformedProtocolError(output: string): Error {
+	return new Error(`Worker emitted malformed --mode json output: ${summarizeProtocolOutput(output)}`);
+}
+
 function getExitSnapshot(child: ChildProcess): ExitSnapshot | null {
 	if (child.exitCode === null && child.signalCode === null) return null;
 	return { exitCode: child.exitCode, signal: child.signalCode };
@@ -152,11 +167,6 @@ function waitForClose(child: ChildProcess): Promise<void> {
 	return new Promise<void>((resolve) => child.once("close", () => resolve()));
 }
 
-function makeSessionPath(cwd: string, thread: string): string {
-	const safe = thread.replace(/[^\w.-]+/g, "_");
-	return path.join(cwd, THREADS_DIR, `${safe}.jsonl`);
-}
-
 function ensureSessionDirectory(sessionPath: string): void {
 	const dir = path.dirname(sessionPath);
 	if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -165,7 +175,7 @@ function ensureSessionDirectory(sessionPath: string): void {
 export function resolveSessionPath(
 	request: Pick<PiActorInvocationRequest, "cwd" | "thread" | "sessionPath">,
 ): string {
-	return request.sessionPath ?? makeSessionPath(request.cwd, request.thread);
+	return request.sessionPath ?? getThreadSessionPath(path.join(request.cwd, THREADS_DIR), request.thread);
 }
 
 function writePromptFile(content: string): PromptFile {
@@ -277,12 +287,33 @@ function waitForAbort(signal: AbortSignal): Promise<void> {
 	return new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
 }
 
+function parseStreamEvent(output: string): RuntimeMessage | undefined {
+	const event = JSON.parse(output) as StreamEvent;
+	if ((event.type === "message_end" || event.type === "tool_result_end") && event.message) {
+		return event.message;
+	}
+	return undefined;
+}
+
 function wireOutput(
 	child: ChildProcess,
 	onMessage: (message: RuntimeMessage) => void,
 	onStderr: (chunk: string) => void,
+	handlers: ProtocolErrorHandlers,
 ): () => void {
 	let stdoutBuffer = "";
+	let protocolBroken = false;
+
+	const handleProtocolOutput = (output: string) => {
+		if (protocolBroken || !output.trim()) return;
+		try {
+			const message = parseStreamEvent(output);
+			if (message) onMessage(message);
+		} catch {
+			protocolBroken = true;
+			handlers.onMalformedOutput(createMalformedProtocolError(output));
+		}
+	};
 
 	if (child.stdout) {
 		child.stdout.on("data", (chunk: Buffer | string) => {
@@ -290,15 +321,7 @@ function wireOutput(
 			const lines = stdoutBuffer.split("\n");
 			stdoutBuffer = lines.pop() || "";
 			for (const line of lines) {
-				if (!line.trim()) continue;
-				try {
-					const event = JSON.parse(line) as StreamEvent;
-					if ((event.type === "message_end" || event.type === "tool_result_end") && event.message) {
-						onMessage(event.message);
-					}
-				} catch {
-					/* ignore malformed JSON lines */
-				}
+				handleProtocolOutput(line);
 			}
 		});
 	}
@@ -310,15 +333,7 @@ function wireOutput(
 	}
 
 	return () => {
-		if (!stdoutBuffer.trim()) return;
-		try {
-			const event = JSON.parse(stdoutBuffer) as StreamEvent;
-			if ((event.type === "message_end" || event.type === "tool_result_end") && event.message) {
-				onMessage(event.message);
-			}
-		} catch {
-			/* ignore trailing non-json */
-		}
+		handleProtocolOutput(stdoutBuffer);
 	};
 }
 
@@ -341,6 +356,19 @@ async function runInvocation(params: {
 	let finalExitCode: number | null = null;
 	let finalSignal: NodeJS.Signals | null = null;
 	let cleanupAbortListener = () => {};
+	let protocolError: Error | undefined;
+
+	const resetPartialState = () => {
+		messages.length = 0;
+		usage.input = 0;
+		usage.output = 0;
+		usage.cacheRead = 0;
+		usage.cacheWrite = 0;
+		usage.cost = 0;
+		usage.contextTokens = 0;
+		usage.turns = 0;
+		model = undefined;
+	};
 
 	const handleMessage = (message: RuntimeMessage) => {
 		messages.push(message);
@@ -389,6 +417,16 @@ async function runInvocation(params: {
 				stderr += chunk;
 				emit({ type: "stderr", chunk });
 			},
+			{
+				onMalformedOutput(error) {
+					if (protocolError) return;
+					protocolError = error;
+					resetPartialState();
+					errorMessage = error.message;
+					stopReason = "error";
+					killChild(child);
+				},
+			},
 		);
 
 		const onAbort = () => {
@@ -411,6 +449,10 @@ async function runInvocation(params: {
 		if (signal.aborted) {
 			stopReason = "aborted";
 			if (finalExitCode === null && finalSignal === null) finalExitCode = 1;
+		} else if (protocolError) {
+			stopReason = "error";
+			errorMessage = protocolError.message;
+			if (finalExitCode === null || finalExitCode === 0) finalExitCode = 1;
 		} else if (!stopReason && finalExitCode !== null && finalExitCode !== 0) {
 			stopReason = "error";
 		}

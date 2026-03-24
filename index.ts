@@ -196,14 +196,14 @@ function getThreadsDir(cwd: string): string {
 	return path.join(cwd, THREADS_DIR);
 }
 
-function listThreads(cwd: string): string[] {
+function listThreadSessionNames(cwd: string): string[] {
 	const dir = getThreadsDir(cwd);
 	if (!fs.existsSync(dir)) return [];
 	try {
 		return fs
 			.readdirSync(dir)
-			.filter((f) => f.endsWith(".jsonl"))
-			.map((f) => f.replace(/\.jsonl$/, ""));
+			.filter((fileName) => fileName.endsWith(".jsonl"))
+			.map((fileName) => fileName.replace(/\.jsonl$/, ""));
 	} catch {
 		return [];
 	}
@@ -312,7 +312,7 @@ async function runThreadAction(
 	const sessionPath = getThreadSessionPath(getThreadsDir(cwd), threadName);
 	const isNewThread = !fs.existsSync(sessionPath);
 
-	const result = createEmptyThreadActionResult({
+	const liveResult = createEmptyThreadActionResult({
 		thread: threadName,
 		action,
 		model,
@@ -323,24 +323,24 @@ async function runThreadAction(
 	const trackUsage = (msg: Message) => {
 		if (msg.role !== "assistant") return;
 
-		result.usage.turns++;
+		liveResult.usage.turns++;
 		const usage = msg.usage;
 		if (usage) {
-			result.usage.input += usage.input || 0;
-			result.usage.output += usage.output || 0;
-			result.usage.cacheRead += usage.cacheRead || 0;
-			result.usage.cacheWrite += usage.cacheWrite || 0;
-			result.usage.cost += usage.cost?.total || 0;
-			result.usage.contextTokens = usage.totalTokens || 0;
+			liveResult.usage.input += usage.input || 0;
+			liveResult.usage.output += usage.output || 0;
+			liveResult.usage.cacheRead += usage.cacheRead || 0;
+			liveResult.usage.cacheWrite += usage.cacheWrite || 0;
+			liveResult.usage.cost += usage.cost?.total || 0;
+			liveResult.usage.contextTokens = usage.totalTokens || 0;
 		}
-		if (!result.model && msg.model) result.model = msg.model;
-		if (msg.stopReason) result.stopReason = msg.stopReason;
-		if (msg.errorMessage) result.errorMessage = msg.errorMessage;
+		if (!liveResult.model && msg.model) liveResult.model = msg.model;
+		if (msg.stopReason) liveResult.stopReason = msg.stopReason;
+		if (msg.errorMessage) liveResult.errorMessage = msg.errorMessage;
 	};
 
 	const emitUpdate = () => {
 		if (!onUpdate) return;
-		const lastText = getFinalOutput(result.messages);
+		const lastText = getFinalOutput(liveResult.messages);
 		onUpdate({
 			content: [{ type: "text", text: lastText || "(running...)" }],
 			details: {
@@ -350,7 +350,7 @@ async function runThreadAction(
 					action,
 					episode: "(running...)",
 					episodeNumber,
-					result,
+					result: liveResult,
 				}],
 			},
 		});
@@ -379,13 +379,13 @@ async function runThreadAction(
 	const unsubscribe = handle.subscribe((event) => {
 		if (event.type === "message") {
 			const threadedMessage = event.message as Message;
-			result.messages.push(threadedMessage);
+			liveResult.messages.push(threadedMessage);
 			trackUsage(threadedMessage);
 			emitUpdate();
-			onRuntimeMessage?.(threadedMessage, result.usage.cost);
+			onRuntimeMessage?.(threadedMessage, liveResult.usage.cost);
 		}
 		if (event.type === "stderr") {
-			result.stderr += event.chunk;
+			liveResult.stderr += event.chunk;
 		}
 	});
 
@@ -394,13 +394,7 @@ async function runThreadAction(
 		signal?.removeEventListener("abort", abort);
 	});
 
-	result.messages = runtimeResult.messages as Message[];
-	result.stderr = runtimeResult.stderr;
-	result.usage = { ...runtimeResult.usage };
-	result.model = runtimeResult.model ?? result.model;
-	result.stopReason = runtimeResult.stopReason;
-	result.errorMessage = runtimeResult.errorMessage;
-	result.exitCode = runtimeResult.finalState.exitCode
+	const exitCode = runtimeResult.finalState.exitCode
 		?? (
 			runtimeResult.finalState.signal
 			|| runtimeResult.stopReason === "error"
@@ -409,7 +403,16 @@ async function runThreadAction(
 				: 0
 		);
 
-	return result;
+	return {
+		...liveResult,
+		messages: runtimeResult.messages as Message[],
+		stderr: runtimeResult.stderr,
+		usage: { ...runtimeResult.usage },
+		model: runtimeResult.model ?? liveResult.model,
+		stopReason: runtimeResult.stopReason,
+		errorMessage: runtimeResult.errorMessage,
+		exitCode,
+	};
 }
 
 // ─── Episode Generation ───
@@ -922,13 +925,19 @@ export default function (pi: ExtensionAPI) {
 		let extra = ORCHESTRATOR_PROMPT;
 
 		// Tell the orchestrator about existing threads
-		const threads = listThreads(ctx.cwd);
-		if (threads.length > 0) {
-			const threadInfo = threads.map((t) => {
-				const count = episodeCounts.get(t) || 0;
-				return `  - **${t}** (${count} episode${count !== 1 ? "s" : ""})`;
+		const threadSessions = listThreadSessionNames(ctx.cwd);
+		if (threadSessions.length > 0) {
+			const threadInfo = threadSessions.map((threadName) => {
+				const count = episodeCounts.get(threadName) || 0;
+				return `  - **${threadName}** (${count} episode${count !== 1 ? "s" : ""})`;
 			});
-			extra += `\n## Active Threads\n${threadInfo.join("\n")}\n`;
+			extra += [
+				"",
+				"## Known Worker Sessions on Disk",
+				"These are existing `.pi/threads/*.jsonl` session files. They are not necessarily running right now or scoped to the current parent session.",
+				threadInfo.join("\n"),
+				"",
+			].join("\n");
 		}
 
 		extra += `\n${buildSubagentModelPromptSection(getParentSessionModel(ctx), subagentModelOverride)}\n`;

@@ -25,9 +25,8 @@ try {
 process.exit(0);
 `;
 
-const MIXED_OUTPUT_WORKER_SCRIPT = `
+const VALID_STREAMED_WORKER_SCRIPT = `
 process.stderr.write("warn-one\\n");
-process.stdout.write("not-json\\n");
 process.stdout.write(JSON.stringify({
   type: "message_end",
   message: {
@@ -71,6 +70,11 @@ setTimeout(() => {
   }));
   process.exit(0);
 }, 10);
+`;
+
+const MALFORMED_PROTOCOL_WORKER_SCRIPT = `
+process.stdout.write("not-json\\n");
+setTimeout(() => process.exit(0), 400);
 `;
 
 const SIMPLE_MESSAGE_WORKER_SCRIPT = `
@@ -240,12 +244,38 @@ test("dispatch should split canonical provider/model references into CLI provide
 	}
 });
 
-test("PiActorRuntime parses streamed stdout events, flushes the trailing JSON message, and aggregates stderr + usage", async () => {
+test("PiActorRuntime surfaces malformed worker protocol output as an error instead of silently swallowing it", async () => {
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-actor-malformed-protocol-"));
+
+	const runtime = new PiActorRuntime({
+		command: process.execPath,
+		buildArgs: () => ["-e", MALFORMED_PROTOCOL_WORKER_SCRIPT],
+	});
+
+	try {
+		const result = await runtime.invoke({
+			runId: "malformed-protocol",
+			thread: "stream-thread",
+			cwd: tmpDir,
+			action: "noop",
+		}).result;
+
+		assert.equal(result.stopReason, "error");
+		assert.match(result.errorMessage ?? "", /malformed --mode json output/i);
+		assert.equal(result.messages.length, 0);
+		assert.equal(result.usage.turns, 0);
+		assert.notEqual(result.finalState.exitCode, 0);
+	} finally {
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("PiActorRuntime parses valid streamed stdout events, flushes the trailing JSON message, and aggregates stderr + usage", async () => {
 	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-actor-stream-parse-"));
 
 	const runtime = new PiActorRuntime({
 		command: process.execPath,
-		buildArgs: () => ["-e", MIXED_OUTPUT_WORKER_SCRIPT],
+		buildArgs: () => ["-e", VALID_STREAMED_WORKER_SCRIPT],
 	});
 
 	const handle = runtime.invoke({
