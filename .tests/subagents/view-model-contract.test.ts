@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import { createRequire } from "node:module";
 import * as path from "node:path";
 import test from "node:test";
 
@@ -15,6 +16,8 @@ import {
 	patchPiActorInvoke,
 	writeThreadSession,
 } from "../helpers/subagent-test-helpers";
+
+const require = createRequire(path.join(process.cwd(), ".tests", "subagents", "view-model-contract.test.ts"));
 
 function makeDispatchItem(thread: string, episode: string) {
 	return {
@@ -771,6 +774,124 @@ test("standalone /subagents browser should use the keybindings object supplied b
 		);
 		assert.equal(closed, true, "cancel should back out of the inspector and then close the browser");
 	} finally {
+		fs.rmSync(projectDir, { recursive: true, force: true });
+	}
+});
+
+test("/model-sub picker should use the keybindings object supplied by ctx.ui.custom() for navigation and selection", async () => {
+	const projectDir = makeTempProject();
+	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
+	const piTui = require("@mariozechner/pi-tui") as { Input?: new () => {
+		focused: boolean;
+		setValue(value: string): void;
+		getValue(): string;
+		handleInput(data: string): void;
+		render(width: number): string[];
+		invalidate(): void;
+	}; Text?: new (text: string, x: number, y: number) => {
+		setText(text: string): void;
+		render(width: number): string[];
+		invalidate(): void;
+	} };
+	const originalInput = piTui.Input;
+	const originalText = piTui.Text;
+
+	try {
+		piTui.Input = class FakeInput {
+			focused = false;
+			private value = "";
+
+			setValue(value: string): void {
+				this.value = value;
+			}
+
+			getValue(): string {
+				return this.value;
+			}
+
+			handleInput(data: string): void {
+				this.value += data;
+			}
+
+			render(_width: number): string[] {
+				return [this.value];
+			}
+
+			invalidate(): void {}
+		};
+		piTui.Text = class FakeText {
+			constructor(private text: string) {}
+
+			setText(text: string): void {
+				this.text = text;
+			}
+
+			render(_width: number): string[] {
+				return this.text.length === 0 ? [""] : this.text.split("\n");
+			}
+
+			invalidate(): void {}
+		};
+
+		writeThreadSession(parentSession, [{ type: "session", version: 3, cwd: projectDir }]);
+
+		const fakePi = makeFakePi();
+		registerExtension(fakePi as any);
+
+		const modelSub = fakePi.commands.get("model-sub");
+		assert.ok(modelSub, "/model-sub should be registered");
+
+		const pickerContext = {
+			...makeCommandContext({
+				cwd: projectDir,
+				sessionFile: parentSession,
+				branch: [],
+				model: { provider: "openai-codex", id: "gpt-5.4" },
+				ui: {
+					custom: async (renderer: (...args: any[]) => unknown) => {
+						let choice: unknown;
+						const picker = renderer(
+							{ requestRender: () => {} },
+							makeTheme(),
+							{
+								matches(keyData: string, command: string) {
+									return (
+										(keyData === "custom-next" && command === "tui.select.down") ||
+										(keyData === "custom-open" && command === "tui.select.confirm")
+									);
+								},
+							},
+							(result: unknown) => {
+								choice = result;
+							},
+						) as { handleInput?: (keyData: string) => void };
+
+						assert.equal(typeof picker.handleInput, "function", "model picker should expose interactive input handling");
+
+						picker.handleInput!("custom-next");
+						picker.handleInput!("custom-open");
+
+						assert.deepEqual(
+							choice,
+							{ provider: "google", id: "gemini-2.5-flash", name: "Gemini 2.5 Flash" },
+							"the picker should move and confirm through the supplied keybindings object rather than raw escape sequences",
+						);
+						return choice;
+					},
+				},
+			}),
+			modelRegistry: {
+				getAvailable: () => [
+					{ provider: "openai-codex", id: "gpt-5.4", name: "GPT-5.4" },
+					{ provider: "google", id: "gemini-2.5-flash", name: "Gemini 2.5 Flash" },
+				],
+			},
+		};
+
+		await modelSub!.handler("", pickerContext as any);
+	} finally {
+		piTui.Input = originalInput;
+		piTui.Text = originalText;
 		fs.rmSync(projectDir, { recursive: true, force: true });
 	}
 });

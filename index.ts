@@ -710,6 +710,39 @@ export default function (pi: ExtensionAPI) {
 
 		const { DynamicBorder } = await import("@mariozechner/pi-coding-agent");
 		const { Container, Input, Text } = await import("@mariozechner/pi-tui");
+		const BorderComponent = typeof DynamicBorder === "function"
+			? DynamicBorder
+			: class {
+					constructor(_render: (text: string) => string) {}
+					render(_width: number) {
+						return [""];
+					}
+					invalidate() {}
+				};
+		const SearchInput = typeof Input === "function"
+			? Input
+			: class {
+					focused = false;
+					private value = "";
+
+					setValue(value: string) {
+						this.value = value;
+					}
+
+					getValue() {
+						return this.value;
+					}
+
+					handleInput(data: string) {
+						this.value += data;
+					}
+
+					render(_width: number) {
+						return [this.value];
+					}
+
+					invalidate() {}
+				};
 		const parentModel = getParentSessionModel(ctx);
 		const currentOverrideRef = subagentModelOverride ? formatModelIdentifier(subagentModelOverride) : undefined;
 		const sortedModels = [...models].sort((left, right) => {
@@ -722,12 +755,12 @@ export default function (pi: ExtensionAPI) {
 			return leftRef.localeCompare(rightRef);
 		});
 
-		const choice = await ctx.ui.custom<ModelDescriptor | undefined | null>((tui, theme, _keybindings, done) => {
+		const choice = await ctx.ui.custom<ModelDescriptor | undefined | null>((tui, theme, keybindings, done) => {
 			const maxVisible = 10;
 			let query = initialQuery.trim();
 			let filteredModels = query ? findFuzzyModelMatches(sortedModels, query) : sortedModels;
 			let selectedIndex = 0;
-			const searchInput = new Input();
+			const searchInput = new SearchInput();
 			searchInput.setValue(query);
 			const container = new Container();
 			const headerText = new Text(theme.fg("accent", theme.bold("Subagent model override")), 0, 0);
@@ -739,9 +772,9 @@ export default function (pi: ExtensionAPI) {
 			const searchLabel = new Text(theme.fg("muted", "Search:"), 0, 0);
 			const listText = new Text("", 0, 0);
 			const detailText = new Text("", 0, 0);
-			const footerText = new Text(theme.fg("dim", "↑↓ move • enter select • esc cancel"), 0, 0);
+			const footerText = new Text(theme.fg("dim", "selection keys move • confirm selects • cancel closes"), 0, 0);
 
-			container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+			container.addChild(new BorderComponent((text: string) => theme.fg("accent", text)));
 			container.addChild(headerText);
 			container.addChild(hintText);
 			container.addChild(new Text("", 0, 0));
@@ -753,7 +786,7 @@ export default function (pi: ExtensionAPI) {
 			container.addChild(detailText);
 			container.addChild(new Text("", 0, 0));
 			container.addChild(footerText);
-			container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+			container.addChild(new BorderComponent((text: string) => theme.fg("accent", text)));
 
 			const shouldShowInheritOption = (value: string) =>
 				value.length === 0
@@ -851,6 +884,12 @@ export default function (pi: ExtensionAPI) {
 
 			let focused = true;
 			searchInput.focused = true;
+			const matchesCommand = (input: string, command: string, fallbacks: readonly string[]) => {
+				if (keybindings && typeof keybindings.matches === "function") {
+					return keybindings.matches(input, command);
+				}
+				return fallbacks.includes(input);
+			};
 
 			return {
 				get focused() {
@@ -868,24 +907,24 @@ export default function (pi: ExtensionAPI) {
 				},
 				handleInput(data: string) {
 					const items = getItems();
-					if ((data === "\x1b[A" || data === "\x1bOA") && items.length > 0) {
+					if (matchesCommand(data, "tui.select.up", ["\x1b[A", "\x1bOA"]) && items.length > 0) {
 						selectedIndex = selectedIndex <= 0 ? items.length - 1 : selectedIndex - 1;
 						renderList();
 						tui.requestRender();
 						return;
 					}
-					if ((data === "\x1b[B" || data === "\x1bOB") && items.length > 0) {
+					if (matchesCommand(data, "tui.select.down", ["\x1b[B", "\x1bOB"]) && items.length > 0) {
 						selectedIndex = selectedIndex >= items.length - 1 ? 0 : selectedIndex + 1;
 						renderList();
 						tui.requestRender();
 						return;
 					}
-					if ((data === "\r" || data === "\n") && items.length > 0) {
+					if (matchesCommand(data, "tui.select.confirm", ["\r", "\n"]) && items.length > 0) {
 						const selected = items[selectedIndex]!;
 						done(selected.kind === "inherit" ? undefined : selected.model);
 						return;
 					}
-					if (data === "\x1b" || data === "\x03") {
+					if (matchesCommand(data, "tui.select.cancel", ["\x1b", "\x03"])) {
 						done(null);
 						return;
 					}
