@@ -7,6 +7,7 @@ export interface SubagentCard {
 	thread: string;
 	sessionPath: string;
 	latestAction: string;
+	outputLines: string[];
 	outputPreview: string;
 	outputTail: string[];
 	toolPreview: string;
@@ -80,7 +81,7 @@ export function summarizeToolCall(parts: Message["content"] | undefined): string
 	}
 }
 
-export function summarizeOutputTail(messages: readonly Message[], maxLines = 8): string[] {
+export function summarizeOutputLines(messages: readonly Message[]): string[] {
 	const lines: string[] = [];
 	for (const message of messages) {
 		if (message.role === "user") continue;
@@ -88,7 +89,11 @@ export function summarizeOutputTail(messages: readonly Message[], maxLines = 8):
 			lines.push(line);
 		}
 	}
-	return lines.slice(-maxLines);
+	return lines;
+}
+
+export function summarizeOutputTail(messages: readonly Message[], maxLines = 8): string[] {
+	return summarizeOutputLines(messages).slice(-maxLines);
 }
 
 export function summarizeOutputPreview(messages: readonly Message[]): string {

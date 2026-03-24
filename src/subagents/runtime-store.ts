@@ -3,6 +3,7 @@ import type { DispatchHistoryItem } from "../dispatch/history";
 
 import {
 	normalizeSessionPath,
+	summarizeOutputLines,
 	summarizeOutputPreview,
 	summarizeOutputTail,
 	summarizeRecentTool,
@@ -16,6 +17,7 @@ interface SubagentRunRecord {
 	thread: string;
 	sessionPath: string;
 	latestAction: string;
+	outputLines: string[];
 	outputPreview: string;
 	outputTail: string[];
 	toolPreview: string;
@@ -58,6 +60,7 @@ function createEmptyRecord(thread: string, sessionPath: string): SubagentRunReco
 		thread,
 		sessionPath,
 		latestAction: "",
+		outputLines: [],
 		outputPreview: "",
 		outputTail: [],
 		toolPreview: "",
@@ -72,6 +75,7 @@ function toCard(record: SubagentRunRecord): SubagentCard {
 		thread: record.thread,
 		sessionPath: record.sessionPath,
 		latestAction: record.latestAction,
+		outputLines: [...record.outputLines],
 		outputPreview: record.outputPreview,
 		outputTail: [...record.outputTail],
 		toolPreview: record.toolPreview,
@@ -85,8 +89,9 @@ function getResultKey(item: { action: string; episodeNumber: number; sessionPath
 }
 
 function applyMessageSummary(record: SubagentRunRecord, messages: readonly Message[]): void {
-	record.outputTail = summarizeOutputTail(messages);
-	record.outputPreview = summarizeOutputPreview(messages);
+	record.outputLines = summarizeOutputLines(messages);
+	record.outputTail = record.outputLines.slice(-8);
+	record.outputPreview = record.outputLines.at(-1) ?? summarizeOutputPreview(messages);
 	record.toolPreview = summarizeRecentTool(messages);
 }
 
@@ -129,6 +134,7 @@ export class SubagentRunStore {
 			...existing,
 			thread,
 			sessionPath: normalizedSessionPath,
+			outputLines: [...existing.outputLines],
 			outputTail: [...existing.outputTail],
 		};
 		parentRecords.set(normalizedSessionPath, next);
@@ -168,6 +174,7 @@ export class SubagentRunStore {
 		if (!record) return;
 
 		record.latestAction = input.action;
+		record.outputLines = [];
 		record.outputPreview = "";
 		record.outputTail = [];
 		record.toolPreview = "";
@@ -180,10 +187,11 @@ export class SubagentRunStore {
 		const record = this.getRecord(input.parentSessionFile, input.sessionPath);
 		if (!record || record.activeRunId !== input.runId) return;
 
-		const messageOutput = summarizeOutputTail([input.message]);
+		const messageOutput = summarizeOutputLines([input.message]);
 		if (messageOutput.length > 0) {
+			record.outputLines = [...record.outputLines, ...messageOutput];
 			record.outputTail = [...record.outputTail, ...messageOutput].slice(-8);
-			record.outputPreview = record.outputTail.at(-1) ?? record.outputPreview;
+			record.outputPreview = record.outputLines.at(-1) ?? record.outputPreview;
 		}
 
 		const toolPreview = summarizeToolCall(input.message.content);

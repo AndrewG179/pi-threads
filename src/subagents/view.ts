@@ -183,7 +183,9 @@ export class SubagentBrowser {
 	private renderSelected(card: SubagentCard | undefined, width: number, height: number, inspector: boolean): string[] {
 		if (!card) return frame([this.theme.fg("muted", EMPTY_SESSION)], width, height);
 
-		const output = card.outputTail.length > 0 ? card.outputTail : [card.outputPreview || EMPTY_OUTPUT];
+		const output = inspector
+			? (card.outputLines.length > 0 ? card.outputLines : [card.outputPreview || EMPTY_OUTPUT])
+			: (card.outputTail.length > 0 ? card.outputTail : [card.outputPreview || EMPTY_OUTPUT]);
 		const toolPreview = inspector ? (card.toolPreview || EMPTY_TOOL) : truncateToWidth(card.toolPreview || EMPTY_TOOL, Math.min(width, 50));
 		const lines = inspector
 			? [headerLine(card, this.theme, false, `Subagent [${card.thread}]`), this.theme.fg("dim", card.sessionPath), ""]

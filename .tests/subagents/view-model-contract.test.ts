@@ -632,6 +632,7 @@ test("/subagents browser selected pane should prioritize more action and output 
 			thread: "loc-scan",
 			sessionPath: "/tmp/loc-scan.jsonl",
 			latestAction: Array.from({ length: 40 }, (_, index) => `ACTION-${String(index + 1).padStart(2, "0")}`).join(" "),
+			outputLines: Array.from({ length: 12 }, (_, index) => `OUTPUT-${String(index + 1).padStart(2, "0")}`),
 			outputPreview: "OUTPUT-12",
 			outputTail: Array.from({ length: 12 }, (_, index) => `OUTPUT-${String(index + 1).padStart(2, "0")}`),
 			toolPreview: "$ cloc index.ts src --include-lang=TypeScript --json && printf '\\n---\\n' && cloc .tests --include-lang=TypeScript --json",
@@ -656,6 +657,7 @@ test("/subagents inspector should scroll through the existing detail document in
 			thread: "loc-scan",
 			sessionPath: "/tmp/loc-scan.jsonl",
 			latestAction: Array.from({ length: 60 }, (_, index) => `ACTION-${String(index + 1).padStart(2, "0")}`).join(" "),
+			outputLines: Array.from({ length: 16 }, (_, index) => `OUTPUT-${String(index + 1).padStart(2, "0")}`),
 			outputPreview: "OUTPUT-16",
 			outputTail: Array.from({ length: 16 }, (_, index) => `OUTPUT-${String(index + 1).padStart(2, "0")}`),
 			toolPreview: "$ cloc index.ts src --include-lang=TypeScript --json && printf '\\n---\\n' && cloc .tests --include-lang=TypeScript --json",
@@ -677,6 +679,91 @@ test("/subagents inspector should scroll through the existing detail document in
 
 	const scrolled = browser.render(72).join("\n");
 	assert.match(scrolled, /OUTPUT-16/, "scrolling the inspector should reveal later output lines from the existing detail document");
+});
+
+test("/subagents inspector should expose full completed output history instead of truncating to the last 8 lines", async () => {
+	const projectDir = makeTempProject();
+	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
+	const alphaSession = path.join(projectDir, ".pi", "threads", "alpha.jsonl");
+
+	try {
+		writeThreadSession(parentSession, [{ type: "session", version: 3, cwd: projectDir }]);
+		writeThreadSession(alphaSession, [{ type: "session", version: 3, cwd: projectDir }]);
+
+		const fakePi = makeFakePi();
+		registerExtension(fakePi as any);
+
+		const subagents = fakePi.commands.get("subagents");
+		assert.ok(subagents, "/subagents should be registered");
+
+		let browser: { handleInput?: (input: string) => void; render?: (width: number) => string[] } | undefined;
+		await subagents!.handler("", makeCommandContext({
+			cwd: projectDir,
+			sessionFile: parentSession,
+			branch: [{
+				type: "message",
+				message: {
+					role: "toolResult",
+					toolName: "dispatch",
+					details: {
+						mode: "single",
+						items: [{
+							thread: "alpha",
+							action: "Inspect alpha",
+							episode: "alpha ready",
+							episodeNumber: 1,
+							result: {
+								exitCode: 0,
+								stderr: "",
+								messages: [{
+									role: "assistant",
+									content: [{
+										type: "text",
+										text: Array.from({ length: 16 }, (_, index) => `OUTPUT-${String(index + 1).padStart(2, "0")}`).join("\n"),
+									}],
+								}],
+								usage: {
+									input: 12,
+									output: 8,
+									cacheRead: 0,
+									cacheWrite: 0,
+									cost: 0.02,
+									contextTokens: 20,
+									turns: 1,
+								},
+								sessionPath: alphaSession,
+								isNewThread: false,
+							},
+						}],
+					},
+				},
+			}],
+			ui: {
+				custom: async (renderer: (...args: any[]) => unknown) => {
+					browser = renderer(
+						{ terminal: { rows: 18 } },
+						makeTheme(),
+						makeSelectKeybindings(),
+						() => {},
+					) as { handleInput?: (input: string) => void; render?: (width: number) => string[] };
+					return undefined;
+				},
+			},
+		}) as any);
+
+		assert.equal(typeof browser?.handleInput, "function", "the subagent custom view should expose interactive input handling");
+
+		browser!.handleInput!("ENTER");
+		const initial = browser!.render!(72).join("\n");
+		assert.match(initial, /OUTPUT-01/, "the inspector should include the start of the completed output history, not just the last 8 lines");
+
+		for (let index = 0; index < 20; index++) browser!.handleInput!("DOWN");
+
+		const scrolled = browser!.render!(72).join("\n");
+		assert.match(scrolled, /OUTPUT-16/, "the inspector should still be able to reach the later output lines after scrolling");
+	} finally {
+		fs.rmSync(projectDir, { recursive: true, force: true });
+	}
 });
 
 test("standalone /subagents browser should use the keybindings object supplied by ctx.ui.custom() for navigation and selection", async () => {
