@@ -43,7 +43,7 @@ type ExitSnapshot = {
 	signal: NodeJS.Signals | null;
 };
 
-export interface PiActorUsageStats {
+interface PiActorUsageStats {
 	input: number;
 	output: number;
 	cacheRead: number;
@@ -53,7 +53,7 @@ export interface PiActorUsageStats {
 	turns: number;
 }
 
-export const EMPTY_PI_ACTOR_USAGE_STATS: PiActorUsageStats = {
+const EMPTY_USAGE_STATS: PiActorUsageStats = {
 	input: 0,
 	output: 0,
 	cacheRead: 0,
@@ -63,7 +63,7 @@ export const EMPTY_PI_ACTOR_USAGE_STATS: PiActorUsageStats = {
 	turns: 0,
 };
 
-export interface PiActorInvocationRequest {
+interface PiActorInvocationRequest {
 	runId: string;
 	thread: string;
 	cwd: string;
@@ -73,14 +73,14 @@ export interface PiActorInvocationRequest {
 	sessionPath?: string;
 }
 
-export interface PiActorArgsContext {
+interface PiActorArgsContext {
 	sessionPath: string;
 	systemPromptFile?: string;
 }
 
-export type PiActorArgsBuilder = (request: PiActorInvocationRequest, context: PiActorArgsContext) => string[];
+type PiActorArgsBuilder = (request: PiActorInvocationRequest, context: PiActorArgsContext) => string[];
 
-export interface PiActorRuntimeOptions {
+interface PiActorRuntimeOptions {
 	command?: string;
 	buildArgs?: PiActorArgsBuilder;
 }
@@ -90,13 +90,13 @@ interface PiCommandSpec {
 	argsPrefix: string[];
 }
 
-export interface PiActorFinalState {
+interface PiActorFinalState {
 	tag: "exited";
 	exitCode: number | null;
 	signal: NodeJS.Signals | null;
 }
 
-export interface PiActorResult {
+interface PiActorResult {
 	runId: string;
 	thread: string;
 	finalState: PiActorFinalState;
@@ -108,14 +108,19 @@ export interface PiActorResult {
 	errorMessage?: string;
 }
 
-export type PiActorEvent =
+type PiActorEvent =
 	| { type: "message"; message: EpisodeMessage }
 	| { type: "stderr"; chunk: string };
 
-export interface PiActorHandle {
+interface PiActorHandle {
 	readonly result: Promise<PiActorResult>;
 	subscribe(listener: (event: PiActorEvent) => void): () => void;
 	cancel(): void | Promise<void>;
+}
+
+interface SessionTurn {
+	ready: Promise<void>;
+	release(): void;
 }
 
 function toNumber(value: unknown): number {
@@ -172,7 +177,7 @@ function ensureSessionDirectory(sessionPath: string): void {
 	if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
-export function resolveSessionPath(
+function getInvocationSessionPath(
 	request: Pick<PiActorInvocationRequest, "cwd" | "thread" | "sessionPath">,
 ): string {
 	return request.sessionPath ?? getThreadSessionPath(path.join(request.cwd, THREADS_DIR), request.thread);
@@ -199,7 +204,7 @@ function cleanupPromptFile(temp: PromptFile | null): void {
 	}
 }
 
-export function buildPiActorArgs(request: PiActorInvocationRequest, context: PiActorArgsContext): string[] {
+function buildDefaultPiActorArgs(request: PiActorInvocationRequest, context: PiActorArgsContext): string[] {
 	const args = [
 		"--mode",
 		"json",
@@ -227,10 +232,6 @@ export function buildPiActorArgs(request: PiActorInvocationRequest, context: PiA
 	if (context.systemPromptFile) args.push("--append-system-prompt", context.systemPromptFile);
 	args.push(request.action);
 	return args;
-}
-
-function defaultArgsBuilder(request: PiActorInvocationRequest, context: PiActorArgsContext): string[] {
-	return buildPiActorArgs(request, context);
 }
 
 function resolvePiCommandSpec(): PiCommandSpec {
@@ -266,7 +267,7 @@ function createAbortedResult(request: PiActorInvocationRequest): PiActorResult {
 		finalState: createFinalState(1, null),
 		messages: [],
 		stderr: "",
-		usage: { ...EMPTY_PI_ACTOR_USAGE_STATS },
+		usage: { ...EMPTY_USAGE_STATS },
 		model: request.model,
 		stopReason: "aborted",
 	};
@@ -339,15 +340,16 @@ function wireOutput(
 
 async function runInvocation(params: {
 	request: PiActorInvocationRequest;
+	sessionPath: string;
 	command: string;
 	argsBuilder: PiActorArgsBuilder;
 	emit: (event: PiActorEvent) => void;
 	signal: AbortSignal;
 	setChild(child: ChildProcess | null): void;
 }): Promise<PiActorResult> {
-	const { request, command, argsBuilder, emit, signal, setChild } = params;
+	const { request, sessionPath, command, argsBuilder, emit, signal, setChild } = params;
 	const messages: RuntimeMessage[] = [];
-	const usage: PiActorUsageStats = { ...EMPTY_PI_ACTOR_USAGE_STATS };
+	const usage: PiActorUsageStats = { ...EMPTY_USAGE_STATS };
 	let promptFile: PromptFile | null = null;
 	let stderr = "";
 	let model: string | undefined;
@@ -395,7 +397,6 @@ async function runInvocation(params: {
 			return createAbortedResult(request);
 		}
 
-		const sessionPath = resolveSessionPath(request);
 		ensureSessionDirectory(sessionPath);
 		if (request.systemPrompt) promptFile = writePromptFile(request.systemPrompt);
 
@@ -493,13 +494,36 @@ export class PiActorRuntime {
 		const commandSpec = options.command
 			? { command: options.command, argsPrefix: [] }
 			: resolvePiCommandSpec();
-		const baseArgsBuilder = options.buildArgs ?? defaultArgsBuilder;
+		const baseArgsBuilder = options.buildArgs ?? buildDefaultPiActorArgs;
 
 		this.command = commandSpec.command;
 		this.argsBuilder = (request, context) => [
 			...commandSpec.argsPrefix,
 			...baseArgsBuilder(request, context),
 		];
+	}
+
+	private claimSessionTurn(sessionPath: string): SessionTurn {
+		const previous = this.sessionQueues.get(sessionPath)?.catch(() => undefined) ?? Promise.resolve();
+
+		let releaseTurn!: () => void;
+		const current = new Promise<void>((resolve) => {
+			releaseTurn = resolve;
+		});
+		const queueTail = previous.then(() => current);
+		this.sessionQueues.set(sessionPath, queueTail);
+
+		return {
+			ready: previous,
+			release: () => {
+				releaseTurn();
+				void queueTail.finally(() => {
+					if (this.sessionQueues.get(sessionPath) === queueTail) {
+						this.sessionQueues.delete(sessionPath);
+					}
+				});
+			},
+		};
 	}
 
 	invoke(request: PiActorInvocationRequest): PiActorHandle {
@@ -516,20 +540,13 @@ export class PiActorRuntime {
 			}
 		};
 
-		const sessionKey = resolveSessionPath(request);
-		const previous = this.sessionQueues.get(sessionKey)?.catch(() => undefined) ?? Promise.resolve();
-
-		let releaseTurn!: () => void;
-		const turn = new Promise<void>((resolve) => {
-			releaseTurn = resolve;
-		});
-		const queueTail = previous.then(() => turn);
-		this.sessionQueues.set(sessionKey, queueTail);
+		const sessionPath = getInvocationSessionPath(request);
+		const turn = this.claimSessionTurn(sessionPath);
 
 		const result = (async () => {
 			try {
 				const gate = await Promise.race([
-					previous.then(() => "ready" as const),
+					turn.ready.then(() => "ready" as const),
 					waitForAbort(controller.signal).then(() => "aborted" as const),
 				]);
 				if (gate === "aborted") {
@@ -538,6 +555,7 @@ export class PiActorRuntime {
 
 				return await runInvocation({
 					request,
+					sessionPath,
 					command: this.command,
 					argsBuilder: this.argsBuilder,
 					emit,
@@ -549,12 +567,7 @@ export class PiActorRuntime {
 				});
 			} finally {
 				child = null;
-				releaseTurn();
-				void queueTail.finally(() => {
-					if (this.sessionQueues.get(sessionKey) === queueTail) {
-						this.sessionQueues.delete(sessionKey);
-					}
-				});
+				turn.release();
 			}
 		})();
 

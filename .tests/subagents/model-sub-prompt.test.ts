@@ -1,48 +1,15 @@
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 
 import { default as registerExtension } from "../../index";
-
-type RegisteredCommand = {
-	handler: (args: string, ctx: Record<string, unknown>) => Promise<void> | void;
-};
-
-type RegisteredEventHandler = (event: unknown, ctx: Record<string, unknown>) => Promise<unknown> | unknown;
-
-function makeTempProject(): string {
-	return fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-model-sub-prompt-"));
-}
-
-function makeFakePi() {
-	const commands = new Map<string, RegisteredCommand>();
-	const events = new Map<string, RegisteredEventHandler[]>();
-
-	return {
-		on(event: string, listener: RegisteredEventHandler) {
-			const handlers = events.get(event) ?? [];
-			handlers.push(listener);
-			events.set(event, handlers);
-		},
-		registerCommand(name: string, config: RegisteredCommand) {
-			commands.set(name, config);
-		},
-		registerShortcut: () => {},
-		registerTool: () => {},
-		getActiveTools: () => ["read", "write", "edit", "bash", "dispatch"],
-		getAllTools: () => [{ name: "read" }, { name: "write" }, { name: "edit" }, { name: "bash" }, { name: "dispatch" }],
-		setActiveTools: () => {},
-		commands,
-		events,
-	};
-}
-
-function writeParentSession(filePath: string): void {
-	fs.mkdirSync(path.dirname(filePath), { recursive: true });
-	fs.writeFileSync(filePath, '{"type":"session"}\n', "utf8");
-}
+import {
+	makeCommandContext,
+	makeFakePi,
+	makeTempProject,
+	writeThreadSession,
+} from "../helpers/subagent-test-helpers";
 
 function writeThreadsState(cwd: string, enabled: boolean): void {
 	const statePath = path.join(cwd, ".pi", "threads", "state.json");
@@ -56,7 +23,7 @@ test("before_agent_start should describe on-disk worker sessions precisely inste
 	const threadSession = path.join(projectDir, ".pi", "threads", "alpha.jsonl");
 
 	try {
-		writeParentSession(parentSession);
+		writeThreadSession(parentSession, [{ type: "session" }]);
 		writeThreadsState(projectDir, true);
 		fs.mkdirSync(path.dirname(threadSession), { recursive: true });
 		fs.writeFileSync(threadSession, '{"type":"session"}\n', "utf8");
@@ -69,18 +36,12 @@ test("before_agent_start should describe on-disk worker sessions precisely inste
 
 		const promptResult = await beforeAgentStartHandlers[0](
 			{ systemPrompt: "BASE SYSTEM PROMPT\n" },
-			{
+			makeCommandContext({
 				cwd: projectDir,
-				hasUI: true,
-				ui: {
-					notify: () => {},
-				},
-				sessionManager: {
-					getSessionFile: () => parentSession,
-					getBranch: () => [],
-				},
+				sessionFile: parentSession,
+				branch: [],
 				model: { provider: "openai-codex", id: "gpt-5.4" },
-			} as any,
+			}) as any,
 		) as { systemPrompt?: string } | undefined;
 
 		assert.equal(typeof promptResult?.systemPrompt, "string");
@@ -99,7 +60,7 @@ test("before_agent_start should expose the active subagent model metadata after 
 	const overrideModel = "google/gemini-2.5-flash";
 
 	try {
-		writeParentSession(parentSession);
+		writeThreadSession(parentSession, [{ type: "session" }]);
 		writeThreadsState(projectDir, true);
 
 		const fakePi = makeFakePi();
@@ -110,32 +71,20 @@ test("before_agent_start should expose the active subagent model metadata after 
 		assert.ok(modelSub, "/model-sub should be registered");
 		assert.equal(beforeAgentStartHandlers.length > 0, true, "before_agent_start handler should be registered");
 
-		await modelSub!.handler(overrideModel, {
+		await modelSub!.handler(overrideModel, makeCommandContext({
 			cwd: projectDir,
-			hasUI: true,
-			ui: {
-				notify: () => {},
-			},
-			sessionManager: {
-				getSessionFile: () => parentSession,
-				getBranch: () => [],
-			},
-		} as any);
+			sessionFile: parentSession,
+			branch: [],
+		}) as any);
 
 		const promptResult = await beforeAgentStartHandlers[0](
 			{ systemPrompt: "BASE SYSTEM PROMPT\n" },
-			{
+			makeCommandContext({
 				cwd: projectDir,
-				hasUI: true,
-				ui: {
-					notify: () => {},
-				},
-				sessionManager: {
-					getSessionFile: () => parentSession,
-					getBranch: () => [],
-				},
+				sessionFile: parentSession,
+				branch: [],
 				model: parentModel,
-			} as any,
+			}) as any,
 		) as { systemPrompt?: string } | undefined;
 
 		assert.equal(typeof promptResult?.systemPrompt, "string");

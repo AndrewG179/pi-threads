@@ -1,44 +1,18 @@
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 
 import { default as registerExtension } from "../../index";
 import { PiActorRuntime } from "../../src/runtime/pi-actor";
 import { getThreadSessionPath } from "../../src/subagents/metadata";
-
-type RegisteredTool = {
-	name: string;
-	execute: (
-		toolCallId: string,
-		params: Record<string, unknown>,
-		signal: AbortSignal | undefined,
-		onUpdate: ((partial: unknown) => void) | undefined,
-		ctx: Record<string, unknown>,
-	) => Promise<unknown>;
-};
-
-function makeTempProject(): string {
-	return fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-dispatch-summary-"));
-}
-
-function makeFakePi() {
-	const tools = new Map<string, RegisteredTool>();
-
-	return {
-		on: () => {},
-		registerCommand: () => {},
-		registerShortcut: () => {},
-		registerTool(config: RegisteredTool) {
-			tools.set(config.name, config);
-		},
-		getActiveTools: () => ["read", "write", "edit", "bash", "dispatch"],
-		getAllTools: () => [{ name: "read" }, { name: "write" }, { name: "edit" }, { name: "bash" }, { name: "dispatch" }],
-		setActiveTools: () => {},
-		tools,
-	};
-}
+import {
+	makeCommandContext,
+	makeFakePi,
+	makeTempProject,
+	patchPiActorInvoke,
+	writeThreadSession,
+} from "../helpers/subagent-test-helpers";
 
 function makeAssistantResult(
 	runId: string,
@@ -62,18 +36,12 @@ function makeAssistantResult(
 }
 
 function makeDispatchContext(projectDir: string, parentSession: string) {
-	return {
+	return makeCommandContext({
 		cwd: projectDir,
-		hasUI: true,
-		ui: {
-			notify: () => {},
-		},
-		sessionManager: {
-			getSessionFile: () => parentSession,
-			getBranch: () => [],
-		},
+		sessionFile: parentSession,
+		branch: [],
 		model: { provider: "openai-codex", id: "gpt-5.4" },
-	} as any;
+	}) as any;
 }
 
 test("dispatch should surface hard child failures even when the child produced no assistant messages", async () => {
@@ -82,17 +50,15 @@ test("dispatch should surface hard child failures even when the child produced n
 	const childError = "spawn pi ENOENT";
 
 	try {
-		fs.mkdirSync(path.dirname(parentSession), { recursive: true });
-		fs.writeFileSync(parentSession, "{\"type\":\"session\"}\n", "utf8");
+		writeThreadSession(parentSession, [{ type: "session" }]);
 
 		const fakePi = makeFakePi();
 		registerExtension(fakePi as any);
 
 		const dispatch = fakePi.tools.get("dispatch");
-		assert.ok(dispatch, "dispatch tool should be registered");
+		assert.ok(dispatch?.execute, "dispatch tool should be registered");
 
-		const originalInvoke = PiActorRuntime.prototype.invoke;
-		PiActorRuntime.prototype.invoke = function () {
+		const restoreInvoke = patchPiActorInvoke(function () {
 			return {
 				runId: "run-1",
 				thread: "smoke-fast",
@@ -117,26 +83,15 @@ test("dispatch should surface hard child failures even when the child produced n
 					state: { tag: "exited", exitCode: 1, signal: null },
 				}),
 			} as any;
-		};
+		} as typeof PiActorRuntime.prototype.invoke);
 
 		try {
-			const result = await dispatch.execute(
+			const result = await dispatch.execute!(
 				"tool-call-1",
 				{ thread: "smoke-fast", action: "Respond with exactly: hello" },
 				undefined,
 				undefined,
-				{
-					cwd: projectDir,
-					hasUI: true,
-					ui: {
-						notify: () => {},
-					},
-					sessionManager: {
-						getSessionFile: () => parentSession,
-						getBranch: () => [],
-					},
-					model: { provider: "openai-codex", id: "gpt-5.4" },
-				} as any,
+				makeDispatchContext(projectDir, parentSession),
 			);
 
 			assert.equal((result as any).isError, true);
@@ -151,7 +106,7 @@ test("dispatch should surface hard child failures even when the child produced n
 				"dispatch summaries should not collapse hard child failures to '(no output)'",
 			);
 		} finally {
-			PiActorRuntime.prototype.invoke = originalInvoke;
+			restoreInvoke();
 		}
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });
@@ -163,18 +118,16 @@ test("dispatch should reject duplicate same-thread tasks in one batch before any
 	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
 
 	try {
-		fs.mkdirSync(path.dirname(parentSession), { recursive: true });
-		fs.writeFileSync(parentSession, "{\"type\":\"session\"}\n", "utf8");
+		writeThreadSession(parentSession, [{ type: "session" }]);
 
 		const fakePi = makeFakePi();
 		registerExtension(fakePi as any);
 
 		const dispatch = fakePi.tools.get("dispatch");
-		assert.ok(dispatch, "dispatch tool should be registered");
+		assert.ok(dispatch?.execute, "dispatch tool should be registered");
 
 		let invokeCalls = 0;
-		const originalInvoke = PiActorRuntime.prototype.invoke;
-		PiActorRuntime.prototype.invoke = function (request) {
+		const restoreInvoke = patchPiActorInvoke(function (request) {
 			invokeCalls += 1;
 			return {
 				result: Promise.resolve(
@@ -187,10 +140,10 @@ test("dispatch should reject duplicate same-thread tasks in one batch before any
 				subscribe: () => () => {},
 				cancel: () => {},
 			} as any;
-		};
+		} as typeof PiActorRuntime.prototype.invoke);
 
 		try {
-			const first = await dispatch.execute(
+			const first = await dispatch.execute!(
 				"tool-call-batch-duplicate-thread",
 				{
 					tasks: [
@@ -218,7 +171,7 @@ test("dispatch should reject duplicate same-thread tasks in one batch before any
 			);
 			assert.equal(invokeCalls, 0, "duplicate-thread validation should reject the batch before any child runtime starts");
 
-			const second = await dispatch.execute(
+			const second = await dispatch.execute!(
 				"tool-call-follow-up-alpha",
 				{ thread: "alpha", action: "third alpha task" },
 				undefined,
@@ -234,7 +187,7 @@ test("dispatch should reject duplicate same-thread tasks in one batch before any
 			);
 			assert.equal(invokeCalls, 1);
 		} finally {
-			PiActorRuntime.prototype.invoke = originalInvoke;
+			restoreInvoke();
 		}
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });
@@ -246,14 +199,13 @@ test("dispatch should reject batch tasks whose thread names normalize to the sam
 	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
 
 	try {
-		fs.mkdirSync(path.dirname(parentSession), { recursive: true });
-		fs.writeFileSync(parentSession, "{\"type\":\"session\"}\n", "utf8");
+		writeThreadSession(parentSession, [{ type: "session" }]);
 
 		const fakePi = makeFakePi();
 		registerExtension(fakePi as any);
 
 		const dispatch = fakePi.tools.get("dispatch");
-		assert.ok(dispatch, "dispatch tool should be registered");
+		assert.ok(dispatch?.execute, "dispatch tool should be registered");
 
 		const threadsDir = path.join(projectDir, ".pi", "threads");
 		const alphaSpace = getThreadSessionPath(threadsDir, "alpha beta");
@@ -261,18 +213,17 @@ test("dispatch should reject batch tasks whose thread names normalize to the sam
 		assert.equal(alphaSpace, alphaSlash, "the test inputs should target the same normalized worker session file");
 
 		let invokeCalls = 0;
-		const originalInvoke = PiActorRuntime.prototype.invoke;
-		PiActorRuntime.prototype.invoke = function (request) {
+		const restoreInvoke = patchPiActorInvoke(function (request) {
 			invokeCalls += 1;
 			return {
 				result: Promise.resolve(makeAssistantResult(request.runId, request.thread, `done ${request.action}`)),
 				subscribe: () => () => {},
 				cancel: () => {},
 			} as any;
-		};
+		} as typeof PiActorRuntime.prototype.invoke);
 
 		try {
-			const result = await dispatch.execute(
+			const result = await dispatch.execute!(
 				"tool-call-batch-normalized-duplicate-thread",
 				{
 					tasks: [
@@ -304,7 +255,7 @@ test("dispatch should reject batch tasks whose thread names normalize to the sam
 				"normalized duplicate-thread validation should reject the batch before any child runtime starts",
 			);
 		} finally {
-			PiActorRuntime.prototype.invoke = originalInvoke;
+			restoreInvoke();
 		}
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });
@@ -316,14 +267,13 @@ test("dispatch should continue episode numbering across separate dispatches that
 	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
 
 	try {
-		fs.mkdirSync(path.dirname(parentSession), { recursive: true });
-		fs.writeFileSync(parentSession, "{\"type\":\"session\"}\n", "utf8");
+		writeThreadSession(parentSession, [{ type: "session" }]);
 
 		const fakePi = makeFakePi();
 		registerExtension(fakePi as any);
 
 		const dispatch = fakePi.tools.get("dispatch");
-		assert.ok(dispatch, "dispatch tool should be registered");
+		assert.ok(dispatch?.execute, "dispatch tool should be registered");
 
 		const threadsDir = path.join(projectDir, ".pi", "threads");
 		const aliasAPath = getThreadSessionPath(threadsDir, "collision/a");
@@ -331,8 +281,7 @@ test("dispatch should continue episode numbering across separate dispatches that
 		assert.equal(aliasAPath, aliasBPath, "the alias inputs should resolve to the same canonical worker session path");
 
 		const invokedSessionPaths: string[] = [];
-		const originalInvoke = PiActorRuntime.prototype.invoke;
-		PiActorRuntime.prototype.invoke = function (request) {
+		const restoreInvoke = patchPiActorInvoke(function (request) {
 			assert.equal(typeof request.sessionPath, "string");
 			invokedSessionPaths.push(request.sessionPath!);
 			return {
@@ -340,17 +289,17 @@ test("dispatch should continue episode numbering across separate dispatches that
 				subscribe: () => () => {},
 				cancel: () => {},
 			} as any;
-		};
+		} as typeof PiActorRuntime.prototype.invoke);
 
 		try {
-			const first = await dispatch.execute(
+			const first = await dispatch.execute!(
 				"tool-call-alias-first",
 				{ thread: "collision/a", action: "first alias task" },
 				undefined,
 				undefined,
 				makeDispatchContext(projectDir, parentSession),
 			) as any;
-			const second = await dispatch.execute(
+			const second = await dispatch.execute!(
 				"tool-call-alias-second",
 				{ thread: "collision_a", action: "second alias task" },
 				undefined,
@@ -368,7 +317,7 @@ test("dispatch should continue episode numbering across separate dispatches that
 				"separate dispatches to aliases of the same worker session should continue canonical episode numbering",
 			);
 		} finally {
-			PiActorRuntime.prototype.invoke = originalInvoke;
+			restoreInvoke();
 		}
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });
@@ -380,17 +329,15 @@ test("dispatch should represent a genuinely aborted tool call as aborted instead
 	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
 
 	try {
-		fs.mkdirSync(path.dirname(parentSession), { recursive: true });
-		fs.writeFileSync(parentSession, "{\"type\":\"session\"}\n", "utf8");
+		writeThreadSession(parentSession, [{ type: "session" }]);
 
 		const fakePi = makeFakePi();
 		registerExtension(fakePi as any);
 
 		const dispatch = fakePi.tools.get("dispatch");
-		assert.ok(dispatch, "dispatch tool should be registered");
+		assert.ok(dispatch?.execute, "dispatch tool should be registered");
 
-		const originalInvoke = PiActorRuntime.prototype.invoke;
-		PiActorRuntime.prototype.invoke = function (request) {
+		const restoreInvoke = patchPiActorInvoke(function (request) {
 			let resolveResult!: (value: Awaited<ReturnType<PiActorRuntime["invoke"]>["result"]>) => void;
 			let cancelled = false;
 			return {
@@ -412,14 +359,14 @@ test("dispatch should represent a genuinely aborted tool call as aborted instead
 					}));
 				},
 			} as any;
-		};
+		} as typeof PiActorRuntime.prototype.invoke);
 
 		try {
 			const controller = new AbortController();
 			setTimeout(() => controller.abort(), 50);
 
 			const startedAt = Date.now();
-			const result = await dispatch.execute(
+			const result = await dispatch.execute!(
 				"tool-call-real-abort",
 				{ thread: "alpha", action: "run slow work" },
 				controller.signal,
@@ -440,7 +387,7 @@ test("dispatch should represent a genuinely aborted tool call as aborted instead
 				"a genuinely aborted dispatch should settle before the full slow child success path completes",
 			);
 		} finally {
-			PiActorRuntime.prototype.invoke = originalInvoke;
+			restoreInvoke();
 		}
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });
@@ -452,24 +399,23 @@ test("dispatch should not report exitCode = 0 when the real child process fails 
 	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
 
 	try {
-		fs.mkdirSync(path.dirname(parentSession), { recursive: true });
-		fs.writeFileSync(parentSession, "{\"type\":\"session\"}\n", "utf8");
+		writeThreadSession(parentSession, [{ type: "session" }]);
 
 		const fakePi = makeFakePi();
 		registerExtension(fakePi as any);
 
 		const dispatch = fakePi.tools.get("dispatch");
-		assert.ok(dispatch, "dispatch tool should be registered");
+		assert.ok(dispatch?.execute, "dispatch tool should be registered");
 
 		const missingCommand = "/definitely/missing/pi";
 		const missingRuntime = new PiActorRuntime({ command: missingCommand });
 		const originalInvoke = PiActorRuntime.prototype.invoke;
-		PiActorRuntime.prototype.invoke = function (request) {
+		const restoreInvoke = patchPiActorInvoke(function (request) {
 			return originalInvoke.call(missingRuntime, request);
-		};
+		} as typeof PiActorRuntime.prototype.invoke);
 
 		try {
-			const result = await dispatch.execute(
+			const result = await dispatch.execute!(
 				"tool-call-real-start-failure",
 				{ thread: "smoke-fast", action: "Respond with exactly: hello" },
 				undefined,
@@ -490,7 +436,7 @@ test("dispatch should not report exitCode = 0 when the real child process fails 
 				"the structured result should still carry the real startup failure detail",
 			);
 		} finally {
-			PiActorRuntime.prototype.invoke = originalInvoke;
+			restoreInvoke();
 		}
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });
