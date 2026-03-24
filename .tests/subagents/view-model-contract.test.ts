@@ -9,9 +9,11 @@ import { Container, Text } from "@mariozechner/pi-tui";
 import { default as registerExtension } from "../../index";
 import { visibleWidth } from "../../src/pi/runtime-deps";
 import { PiActorRuntime } from "../../src/runtime/pi-actor";
+import { SubagentBrowser } from "../../src/subagents/view";
 import {
 	makeCommandContext,
 	makeFakePi,
+	makeSelectKeybindings,
 	makeTempProject,
 	makeTheme,
 	patchPiActorInvoke,
@@ -622,6 +624,59 @@ test("/subagents browser should render a full editor-height frame so stale trans
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });
 	}
+});
+
+test("/subagents browser selected pane should prioritize more action and output detail before truncating", () => {
+	const browser = new SubagentBrowser(
+		() => [{
+			thread: "loc-scan",
+			sessionPath: "/tmp/loc-scan.jsonl",
+			latestAction: Array.from({ length: 40 }, (_, index) => `ACTION-${String(index + 1).padStart(2, "0")}`).join(" "),
+			outputPreview: "OUTPUT-12",
+			outputTail: Array.from({ length: 12 }, (_, index) => `OUTPUT-${String(index + 1).padStart(2, "0")}`),
+			toolPreview: "$ cloc index.ts src --include-lang=TypeScript --json && printf '\\n---\\n' && cloc .tests --include-lang=TypeScript --json",
+			accumulatedCost: 0.17,
+			status: "done",
+		}],
+		{ terminal: { rows: 24 } },
+		makeTheme(),
+		makeSelectKeybindings(),
+		() => {},
+	);
+
+	const rendered = browser.render(84).join("\n");
+	assert.match(rendered, /ACTION-12/, "the browser selected pane should expose substantially more wrapped action text than the old two-line cap");
+	assert.match(rendered, /OUTPUT-06/, "the browser selected pane should show multiple output tail lines, not just a single preview line");
+	assert.doesNotMatch(rendered, /OUTPUT-12/, "the browser should still truncate output to fit the pane instead of dumping the full tail");
+});
+
+test("/subagents inspector should scroll through the existing detail document instead of hard-capping section lines", () => {
+	const browser = new SubagentBrowser(
+		() => [{
+			thread: "loc-scan",
+			sessionPath: "/tmp/loc-scan.jsonl",
+			latestAction: Array.from({ length: 60 }, (_, index) => `ACTION-${String(index + 1).padStart(2, "0")}`).join(" "),
+			outputPreview: "OUTPUT-16",
+			outputTail: Array.from({ length: 16 }, (_, index) => `OUTPUT-${String(index + 1).padStart(2, "0")}`),
+			toolPreview: "$ cloc index.ts src --include-lang=TypeScript --json && printf '\\n---\\n' && cloc .tests --include-lang=TypeScript --json",
+			accumulatedCost: 0.17,
+			status: "done",
+		}],
+		{ terminal: { rows: 14 } },
+		makeTheme(),
+		makeSelectKeybindings(),
+		() => {},
+	);
+
+	browser.handleInput("ENTER");
+	const initial = browser.render(72).join("\n");
+	assert.match(initial, /Subagent \[loc-scan\]/, "Enter should still open the inspector");
+	assert.doesNotMatch(initial, /OUTPUT-16/, "the full detail document should not be visible without scrolling in a short inspector viewport");
+
+	for (let index = 0; index < 20; index++) browser.handleInput("DOWN");
+
+	const scrolled = browser.render(72).join("\n");
+	assert.match(scrolled, /OUTPUT-16/, "scrolling the inspector should reveal later output lines from the existing detail document");
 });
 
 test("standalone /subagents browser should use the keybindings object supplied by ctx.ui.custom() for navigation and selection", async () => {

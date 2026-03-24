@@ -20,6 +20,8 @@ const EMPTY_SESSION = "No subagent runs in this session.";
 const EMPTY_ACTION = "(no action)";
 const EMPTY_OUTPUT = "(no output yet)";
 const EMPTY_TOOL = "(no recent tool calls)";
+const BROWSER_SECTION_CAPS = [20, 10, 2] as const;
+const BROWSER_SECTION_WEIGHTS = [0.6, 0.3, 0.1] as const;
 
 function formatCost(cost: number): string {
 	if (cost <= 0) return "$0";
@@ -42,7 +44,39 @@ function frame(lines: string[], width: number, height: number): string[] {
 }
 
 function wrapLines(text: string, width: number, maxLines: number, fallback = "(none)"): string[] {
-	return wrapText(text || fallback, Math.max(12, width), { minWidth: 12 }).slice(0, maxLines);
+	const wrapped = wrapText(text || fallback, Math.max(12, width), { minWidth: 12 });
+	return Number.isFinite(maxLines) ? wrapped.slice(0, maxLines) : wrapped;
+}
+
+function allocateBrowserSectionLines(available: number): number[] {
+	if (available <= 0) return [0, 0, 0];
+
+	const budgets = BROWSER_SECTION_CAPS.map(() => 0);
+	let remaining = available;
+	for (let index = 0; index < budgets.length && remaining > 0; index++) {
+		budgets[index] = 1;
+		remaining--;
+	}
+
+	const desired = BROWSER_SECTION_CAPS.map((cap, index) => Math.min(cap, Math.floor(available * BROWSER_SECTION_WEIGHTS[index])));
+	for (let index = 0; index < budgets.length && remaining > 0; index++) {
+		const addition = Math.min(Math.max(0, desired[index] - budgets[index]), remaining);
+		budgets[index] += addition;
+		remaining -= addition;
+	}
+
+	while (remaining > 0) {
+		let grew = false;
+		for (let index = 0; index < budgets.length && remaining > 0; index++) {
+			if (budgets[index] >= BROWSER_SECTION_CAPS[index]) continue;
+			budgets[index]++;
+			remaining--;
+			grew = true;
+		}
+		if (!grew) break;
+	}
+
+	return budgets;
 }
 
 function highlight(theme: any, line: string, selected: boolean, width: number): string {
@@ -58,6 +92,7 @@ function headerLine(card: SubagentCard, theme: any, selected = false, title = `[
 export class SubagentBrowser {
 	private selectedIndex = 0;
 	private mode: "browser" | "inspector" = "browser";
+	private inspectorScroll = 0;
 
 	constructor(
 		private readonly getCards: () => SubagentCard[],
@@ -72,11 +107,24 @@ export class SubagentBrowser {
 		if (!kb) return;
 		const cards = this.cards();
 		if (kb.matches(keyData, "tui.select.cancel")) {
-			if (this.mode === "inspector") this.mode = "browser";
+			if (this.mode === "inspector") {
+				this.mode = "browser";
+				this.inspectorScroll = 0;
+			}
 			else this.done(undefined);
 			return;
 		}
-		if (this.mode === "inspector") return;
+		if (this.mode === "inspector") {
+			if (kb.matches(keyData, "tui.select.up")) {
+				this.inspectorScroll = Math.max(0, this.inspectorScroll - 1);
+				return;
+			}
+			if (kb.matches(keyData, "tui.select.down")) {
+				this.inspectorScroll++;
+				return;
+			}
+			return;
+		}
 		if (kb.matches(keyData, "tui.select.up")) {
 			if (cards.length > 0) this.selectedIndex = this.selectedIndex === 0 ? cards.length - 1 : this.selectedIndex - 1;
 			return;
@@ -87,6 +135,7 @@ export class SubagentBrowser {
 		}
 		if (kb.matches(keyData, "tui.select.confirm") && cards.length > 0) {
 			this.mode = "inspector";
+			this.inspectorScroll = 0;
 		}
 	}
 
@@ -134,28 +183,41 @@ export class SubagentBrowser {
 	private renderSelected(card: SubagentCard | undefined, width: number, height: number, inspector: boolean): string[] {
 		if (!card) return frame([this.theme.fg("muted", EMPTY_SESSION)], width, height);
 
-		const output = inspector && card.outputTail.length > 0 ? card.outputTail : [card.outputPreview || EMPTY_OUTPUT];
+		const output = card.outputTail.length > 0 ? card.outputTail : [card.outputPreview || EMPTY_OUTPUT];
+		const toolPreview = inspector ? (card.toolPreview || EMPTY_TOOL) : truncateToWidth(card.toolPreview || EMPTY_TOOL, Math.min(width, 50));
 		const lines = inspector
 			? [headerLine(card, this.theme, false, `Subagent [${card.thread}]`), this.theme.fg("dim", card.sessionPath), ""]
 			: [this.theme.fg("muted", "Selected"), headerLine(card, this.theme)];
-		const sections = [
-			["Action", [card.latestAction || EMPTY_ACTION], "text", inspector ? 3 : 2],
-			["Output", output, "text", 2],
-			["Recent Tool", [card.toolPreview || EMPTY_TOOL], "dim", inspector ? 2 : 1],
-		] as const;
+		const browserBudgets = allocateBrowserSectionLines(Math.max(0, height - lines.length - 3));
+		const sections = inspector
+			? [
+				["Action", [card.latestAction || EMPTY_ACTION], "text", Number.POSITIVE_INFINITY],
+				["Output", output, "text", Number.POSITIVE_INFINITY],
+				["Recent Tool", [toolPreview], "dim", Number.POSITIVE_INFINITY],
+			] as const
+			: [
+				["Action", [card.latestAction || EMPTY_ACTION], "text", browserBudgets[0]],
+				["Output", output, "text", browserBudgets[1]],
+				["Recent Tool", [toolPreview], "dim", browserBudgets[2]],
+			] as const;
 
 		for (const [index, [label, entries, color, maxLines]] of sections.entries()) {
 			if (inspector && index > 0 && lines.length < height) lines.push("");
-			if (lines.length >= height) break;
+			if (!inspector && lines.length >= height) break;
 			lines.push(this.theme.fg("muted", label));
+			if (!inspector && maxLines <= 0) continue;
 			for (const entry of entries) {
 				for (const line of wrapLines(entry, width, maxLines)) {
-					if (lines.length >= height) break;
+					if (!inspector && lines.length >= height) break;
 					lines.push(this.theme.fg(color, line));
 				}
 			}
 		}
-		return frame(lines, width, height);
+		if (!inspector) return frame(lines, width, height);
+
+		const maxScroll = Math.max(0, lines.length - height);
+		this.inspectorScroll = Math.max(0, Math.min(this.inspectorScroll, maxScroll));
+		return frame(lines.slice(this.inspectorScroll), width, height);
 	}
 
 	private renderBrowser(cards: SubagentCard[], width: number, height: number): string[] {
