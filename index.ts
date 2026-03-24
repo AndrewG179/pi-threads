@@ -445,7 +445,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const { DynamicBorder } = await import("@mariozechner/pi-coding-agent");
-		const { Container, Input, Text } = await import("@mariozechner/pi-tui");
+		const { Container, Input } = await import("@mariozechner/pi-tui");
 		const BorderComponent = typeof DynamicBorder === "function"
 			? DynamicBorder
 			: class {

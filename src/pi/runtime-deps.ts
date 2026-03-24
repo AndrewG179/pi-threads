@@ -10,12 +10,24 @@ function loadOptionalModule<T>(id: string): T | null {
 	}
 }
 
+type TextInstance = {
+	setText?(text: string): void;
+	render(width: number): string[];
+	invalidate(): void;
+};
+
+type MutableTextInstance = {
+	setText(text: string): void;
+	render(width: number): string[];
+	invalidate(): void;
+};
+
 type TextLike = {
-	new (text?: string, paddingX?: number, paddingY?: number, customBgFn?: (text: string) => string): {
-		setText?(text: string): void;
-		render(width: number): string[];
-		invalidate(): void;
-	};
+	new (text?: string, paddingX?: number, paddingY?: number, customBgFn?: (text: string) => string): TextInstance;
+};
+
+type MutableTextLike = {
+	new (text?: string, paddingX?: number, paddingY?: number, customBgFn?: (text: string) => string): MutableTextInstance;
 };
 
 type PiTuiModule = {
@@ -35,9 +47,10 @@ type TypeboxModule = {
 
 const piTui = loadOptionalModule<PiTuiModule>("@mariozechner/pi-tui");
 const typebox = loadOptionalModule<TypeboxModule>("@sinclair/typebox");
+const BaseText = piTui?.Text as TextLike | undefined;
 
 class FallbackText {
-	private text: string;
+	protected text: string;
 
 	constructor(text = "") {
 		this.text = text;
@@ -56,7 +69,40 @@ class FallbackText {
 	}
 }
 
-export const Text = (piTui?.Text ?? FallbackText) as TextLike;
+const TextBase = (BaseText ?? FallbackText) as new (
+	text?: string,
+	paddingX?: number,
+	paddingY?: number,
+	customBgFn?: (text: string) => string,
+) => TextInstance;
+
+class CompatibleText extends TextBase implements MutableTextInstance {
+	private currentText: string;
+
+	constructor(text = "", paddingX = 0, paddingY = 0, customBgFn?: (text: string) => string) {
+		super(text, paddingX, paddingY, customBgFn);
+		this.currentText = text;
+	}
+
+	// The installed pi-tui Text renders from a mutable `text` field but exposes no setter.
+	setText(text: string): void {
+		this.currentText = text;
+		(this as TextInstance & { text?: string }).text = text;
+		super.invalidate();
+	}
+
+	invalidate(): void {
+		(this as TextInstance & { text?: string }).text = this.currentText;
+		super.invalidate();
+	}
+
+	render(width: number): string[] {
+		(this as TextInstance & { text?: string }).text = this.currentText;
+		return super.render(width);
+	}
+}
+
+export const Text = CompatibleText as MutableTextLike;
 
 export const truncateToWidth = piTui?.truncateToWidth ?? ((input: string, width: number, ellipsis = "...") => {
 	if (width <= 0) return "";

@@ -154,7 +154,7 @@ declare module "@mariozechner/pi-tui" {
 
 	export class Text implements Renderable {
 		constructor(text: string, x: number, y: number);
-		setText(text: string): void;
+		setText?(text: string): void;
 		render(width: number): string[];
 		invalidate(): void;
 	}
