@@ -7,7 +7,7 @@ import test from "node:test";
 import { Container, Text } from "@mariozechner/pi-tui";
 
 import { default as registerExtension } from "../../index";
-import { ThreadSupervisor } from "../../src/runtime/thread-supervisor";
+import { PiActorRuntime } from "../../src/runtime/pi-actor";
 
 type RegisteredTool = {
 	name: string;
@@ -244,8 +244,8 @@ test("/subagents should list a just-dispatched in-flight thread from same-runtim
 
 		let customRenderer: ((...args: any[]) => unknown) | undefined;
 		let resolveRun: ((value: unknown) => void) | undefined;
-		const originalInvoke = ThreadSupervisor.prototype.invoke;
-		ThreadSupervisor.prototype.invoke = function () {
+		const originalInvoke = PiActorRuntime.prototype.invoke;
+		PiActorRuntime.prototype.invoke = function () {
 			return {
 				runId: "run-1",
 				thread: "alpha",
@@ -320,7 +320,7 @@ test("/subagents should list a just-dispatched in-flight thread from same-runtim
 				model: "openai-codex/gpt-5.4",
 			});
 			await execution;
-			ThreadSupervisor.prototype.invoke = originalInvoke;
+			PiActorRuntime.prototype.invoke = originalInvoke;
 		}
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });

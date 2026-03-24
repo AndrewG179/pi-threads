@@ -23,7 +23,6 @@ import { Type } from "@sinclair/typebox";
 
 import { buildEpisode as buildThreadEpisode } from "./src/episode/builder";
 import { PiActorRuntime } from "./src/runtime/pi-actor";
-import { ThreadSupervisor } from "./src/runtime/thread-supervisor";
 import { getThreadSessionPath, normalizeSessionPath, toSubagentStatus } from "./src/subagents/metadata";
 import { deriveSessionBehavior, resolveActiveToolsForBehavior } from "./src/subagents/mode";
 import { SubagentRunStore } from "./src/subagents/runtime-store";
@@ -48,7 +47,6 @@ Execute the instructions given to you. You are the hands, not the brain.
 5. **Be thorough within scope.** Complete all parts of your instructions.`;
 
 const piActorRuntime = new PiActorRuntime();
-const threadSupervisor = new ThreadSupervisor(piActorRuntime);
 
 const ORCHESTRATOR_PROMPT = `
 # Thread-Based Execution Model
@@ -317,7 +315,7 @@ async function runThreadAction(
 	// Thread work is background execution and must survive view/session switches.
 	// The host tool AbortSignal can fire for session-switch lifecycle reasons, so
 	// it is not a safe ownership boundary for worker lifetime here.
-	const handle = threadSupervisor.invoke(
+	const handle = piActorRuntime.invoke(
 		{
 			runId,
 			thread: threadName,

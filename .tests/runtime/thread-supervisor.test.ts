@@ -5,7 +5,6 @@ import * as path from "node:path";
 import test from "node:test";
 
 import { PiActorRuntime } from "../../src/runtime/pi-actor";
-import { ThreadSupervisor } from "../../src/runtime/thread-supervisor";
 
 interface RunWindow {
 	start: number;
@@ -77,8 +76,8 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
 	}
 }
 
-test("ThreadSupervisor serializes same-thread invocations while allowing different threads to overlap", async () => {
-	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "thread-supervisor-"));
+test("PiActorRuntime serializes same-session invocations while allowing different sessions to overlap", async () => {
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-actor-runtime-"));
 	const markerFilePath = path.join(tmpDir, "markers.log");
 	const delayMs = 180;
 
@@ -86,12 +85,11 @@ test("ThreadSupervisor serializes same-thread invocations while allowing differe
 		command: process.execPath,
 		buildArgs: (request) => ["-e", WINDOW_WORKER_SCRIPT, markerFilePath, request.runId, String(delayMs)],
 	});
-	const supervisor = new ThreadSupervisor(runtime);
 
 	try {
 		const [sameA, sameB] = await Promise.all([
-			supervisor.invoke({ runId: "same-A", thread: "same-thread", cwd: tmpDir, action: "noop" }).result,
-			supervisor.invoke({ runId: "same-B", thread: "same-thread", cwd: tmpDir, action: "noop" }).result,
+			runtime.invoke({ runId: "same-A", thread: "same-thread", cwd: tmpDir, action: "noop" }).result,
+			runtime.invoke({ runId: "same-B", thread: "same-thread", cwd: tmpDir, action: "noop" }).result,
 		]);
 
 		assert.equal(sameA.finalState.tag, "exited");
@@ -108,14 +106,14 @@ test("ThreadSupervisor serializes same-thread invocations while allowing differe
 		assert.equal(
 			secondRun.start >= firstRun.end,
 			true,
-			`Expected same-thread serialization, got first=[${firstRun.start},${firstRun.end}] second=[${secondRun.start},${secondRun.end}]`,
+			`Expected same-session serialization, got first=[${firstRun.start},${firstRun.end}] second=[${secondRun.start},${secondRun.end}]`,
 		);
 
 		fs.writeFileSync(markerFilePath, "", "utf8");
 
 		await Promise.all([
-			supervisor.invoke({ runId: "diff-A", thread: "thread-a", cwd: tmpDir, action: "noop" }).result,
-			supervisor.invoke({ runId: "diff-B", thread: "thread-b", cwd: tmpDir, action: "noop" }).result,
+			runtime.invoke({ runId: "diff-A", thread: "thread-a", cwd: tmpDir, action: "noop" }).result,
+			runtime.invoke({ runId: "diff-B", thread: "thread-b", cwd: tmpDir, action: "noop" }).result,
 		]);
 
 		const diffWindows = parseWindows(markerFilePath);
@@ -129,15 +127,15 @@ test("ThreadSupervisor serializes same-thread invocations while allowing differe
 		assert.equal(
 			overlapEnd > overlapStart,
 			true,
-			`Expected overlap for different threads, got diff-A=[${diffA.start},${diffA.end}] diff-B=[${diffB.start},${diffB.end}]`,
+			`Expected overlap for different sessions, got diff-A=[${diffA.start},${diffA.end}] diff-B=[${diffB.start},${diffB.end}]`,
 		);
 	} finally {
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 	}
 });
 
-test("ThreadSupervisor allows matching thread names to overlap when they target different sessions", async () => {
-	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "thread-supervisor-session-key-"));
+test("PiActorRuntime allows matching thread names to overlap when they target different sessions", async () => {
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-actor-runtime-session-key-"));
 	const markerFilePath = path.join(tmpDir, "markers.log");
 	const cwdA = path.join(tmpDir, "cwd-a");
 	const cwdB = path.join(tmpDir, "cwd-b");
@@ -150,12 +148,11 @@ test("ThreadSupervisor allows matching thread names to overlap when they target 
 		command: process.execPath,
 		buildArgs: (request) => ["-e", WINDOW_WORKER_SCRIPT, markerFilePath, request.runId, String(delayMs)],
 	});
-	const supervisor = new ThreadSupervisor(runtime);
 
 	try {
 		await Promise.all([
-			supervisor.invoke({ runId: "same-name-a", thread: "shared-thread", cwd: cwdA, action: "noop" }).result,
-			supervisor.invoke({ runId: "same-name-b", thread: "shared-thread", cwd: cwdB, action: "noop" }).result,
+			runtime.invoke({ runId: "same-name-a", thread: "shared-thread", cwd: cwdA, action: "noop" }).result,
+			runtime.invoke({ runId: "same-name-b", thread: "shared-thread", cwd: cwdB, action: "noop" }).result,
 		]);
 
 		const windows = parseWindows(markerFilePath);
@@ -176,8 +173,8 @@ test("ThreadSupervisor allows matching thread names to overlap when they target 
 	}
 });
 
-test("ThreadSupervisor cancels queued same-thread runs without starting a child", async () => {
-	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "thread-supervisor-queued-cancel-"));
+test("PiActorRuntime cancels queued same-session runs without starting a child", async () => {
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-actor-runtime-queued-cancel-"));
 	const markerFilePath = path.join(tmpDir, "markers.log");
 	const delayMs = 400;
 
@@ -185,30 +182,28 @@ test("ThreadSupervisor cancels queued same-thread runs without starting a child"
 		command: process.execPath,
 		buildArgs: (request) => ["-e", WINDOW_WORKER_SCRIPT, markerFilePath, request.runId, String(delayMs)],
 	});
-	const supervisor = new ThreadSupervisor(runtime);
 
 	try {
-		const runningHandle = supervisor.invoke({
+		const runningHandle = runtime.invoke({
 			runId: "queued-cancel-running",
 			thread: "same-thread",
 			cwd: tmpDir,
 			action: "noop",
 		});
-		const queuedHandle = supervisor.invoke({
+		const queuedHandle = runtime.invoke({
 			runId: "queued-cancel-target",
 			thread: "same-thread",
 			cwd: tmpDir,
 			action: "noop",
 		});
 
-		await waitFor(() => supervisor.inspect("queued-cancel-running")?.state.tag === "running");
+		await waitFor(() => runningHandle.getSnapshot().state.tag === "running");
 
 		const cancelStart = Date.now();
-		const cancelled = await supervisor.cancel("queued-cancel-target", "abort");
+		await queuedHandle.cancel("abort");
 		const queuedResult = await queuedHandle.result;
 		const cancelDurationMs = Date.now() - cancelStart;
 
-		assert.equal(cancelled, true);
 		assert.equal(cancelDurationMs < delayMs, true, `queued cancel should not wait ${delayMs}ms for prior run`);
 		assert.equal(queuedResult.stopReason, "aborted");
 		assert.equal(queuedResult.finalState.tag, "exited");
@@ -226,8 +221,8 @@ test("ThreadSupervisor cancels queued same-thread runs without starting a child"
 	}
 });
 
-test("ThreadSupervisor aborts externally signalled queued runs without starting a child or disturbing the active same-thread run", async () => {
-	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "thread-supervisor-external-queued-abort-"));
+test("PiActorRuntime aborts externally signalled queued runs without starting a child or disturbing the active same-session run", async () => {
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-actor-runtime-external-queued-abort-"));
 	const markerFilePath = path.join(tmpDir, "markers.log");
 	const delayMs = 180;
 
@@ -235,17 +230,16 @@ test("ThreadSupervisor aborts externally signalled queued runs without starting 
 		command: process.execPath,
 		buildArgs: (request) => ["-e", WINDOW_WORKER_SCRIPT, markerFilePath, request.runId, String(delayMs)],
 	});
-	const supervisor = new ThreadSupervisor(runtime);
 
 	try {
-		const runningHandle = supervisor.invoke({
+		const runningHandle = runtime.invoke({
 			runId: "external-abort-running",
 			thread: "same-thread",
 			cwd: tmpDir,
 			action: "noop",
 		});
 		const queuedAbortController = new AbortController();
-		const queuedHandle = supervisor.invoke(
+		const queuedHandle = runtime.invoke(
 			{
 				runId: "external-abort-queued",
 				thread: "same-thread",
@@ -255,7 +249,7 @@ test("ThreadSupervisor aborts externally signalled queued runs without starting 
 			{ signal: queuedAbortController.signal },
 		);
 
-		await waitFor(() => supervisor.inspect("external-abort-running")?.state.tag === "running");
+		await waitFor(() => runningHandle.getSnapshot().state.tag === "running");
 		queuedAbortController.abort();
 
 		const queuedResult = await queuedHandle.result;
@@ -263,7 +257,7 @@ test("ThreadSupervisor aborts externally signalled queued runs without starting 
 		assert.equal(queuedResult.finalState.tag, "exited");
 		assert.equal(queuedResult.finalState.requestedTerminationReason, "abort");
 		assert.equal(queuedResult.messages.length, 0);
-		assert.equal(supervisor.inspect("external-abort-queued"), undefined);
+		assert.equal(queuedHandle.getSnapshot().state.tag, "exited");
 
 		const runningResult = await runningHandle.result;
 		assert.equal(runningResult.finalState.tag, "exited");
@@ -277,18 +271,17 @@ test("ThreadSupervisor aborts externally signalled queued runs without starting 
 	}
 });
 
-test("ThreadSupervisor returns handle events and supports cancellation + inspection", async () => {
-	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "thread-supervisor-cancel-"));
+test("PiActorRuntime exposes handle events and snapshots across cancellation", async () => {
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-actor-runtime-cancel-"));
 
 	const runtime = new PiActorRuntime({
 		command: process.execPath,
 		buildArgs: () => ["-e", CANCELLABLE_WORKER_SCRIPT],
 		defaultSigtermGraceMs: 50,
 	});
-	const supervisor = new ThreadSupervisor(runtime);
 
 	try {
-		const handle = supervisor.invoke({
+		const handle = runtime.invoke({
 			runId: "cancel-me",
 			thread: "cancel-thread",
 			cwd: tmpDir,
@@ -304,20 +297,16 @@ test("ThreadSupervisor returns handle events and supports cancellation + inspect
 		});
 
 		await waitFor(() => events.includes("message"));
-		await waitFor(() => supervisor.inspect("cancel-me")?.state.tag === "running");
-		assert.equal(supervisor.listActive().some((item) => item.runId === "cancel-me"), true);
+		await waitFor(() => handle.getSnapshot().state.tag === "running");
 
-		const cancelled = await supervisor.cancel("cancel-me", "abort");
-		assert.equal(cancelled, true);
-
+		await handle.cancel("abort");
 		const result = await handle.result;
 		unsubscribe();
 
 		assert.equal(result.stopReason, "aborted");
 		assert.equal(result.finalState.tag, "exited");
 		assert.equal(result.finalState.requestedTerminationReason, "abort");
-		assert.equal(supervisor.inspect("cancel-me"), undefined);
-		assert.equal(supervisor.listActive().some((item) => item.runId === "cancel-me"), false);
+		assert.equal(handle.getSnapshot().state.tag, "exited");
 	} finally {
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 	}

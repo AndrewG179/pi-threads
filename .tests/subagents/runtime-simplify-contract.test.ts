@@ -5,7 +5,7 @@ import * as path from "node:path";
 import test from "node:test";
 
 import { default as registerExtension } from "../../index";
-import { ThreadSupervisor } from "../../src/runtime/thread-supervisor";
+import { PiActorRuntime } from "../../src/runtime/pi-actor";
 
 type RegisteredTool = {
 	name: string;
@@ -119,8 +119,8 @@ test("/subagents should refresh live card details from the runtime-owned run sto
 
 		let emitMessage!: (text: string) => void;
 		let finishRun!: () => void;
-		const originalInvoke = ThreadSupervisor.prototype.invoke;
-		ThreadSupervisor.prototype.invoke = function (request: any) {
+		const originalInvoke = PiActorRuntime.prototype.invoke;
+		PiActorRuntime.prototype.invoke = function (request: any) {
 			let listener: ((event: unknown) => void) | undefined;
 			let resolveResult!: (value: unknown) => void;
 			const result = new Promise((resolve) => {
@@ -227,7 +227,7 @@ test("/subagents should refresh live card details from the runtime-owned run sto
 			if (browser) browser.handleInput("ESC");
 			await handlerPromise;
 			await execution;
-			ThreadSupervisor.prototype.invoke = originalInvoke;
+			PiActorRuntime.prototype.invoke = originalInvoke;
 		}
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });
@@ -250,8 +250,8 @@ test("/subagents should discover a newly started current-session child while the
 		assert.ok(subagents, "/subagents should be registered");
 
 		let finishRun!: () => void;
-		const originalInvoke = ThreadSupervisor.prototype.invoke;
-		ThreadSupervisor.prototype.invoke = function (request: any) {
+		const originalInvoke = PiActorRuntime.prototype.invoke;
+		PiActorRuntime.prototype.invoke = function (request: any) {
 			let resolveResult!: (value: unknown) => void;
 			const result = new Promise((resolve) => {
 				resolveResult = resolve;
@@ -336,7 +336,7 @@ test("/subagents should discover a newly started current-session child while the
 		} finally {
 			if (browser) browser.handleInput("ESC");
 			await handlerPromise;
-			ThreadSupervisor.prototype.invoke = originalInvoke;
+			PiActorRuntime.prototype.invoke = originalInvoke;
 		}
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });
@@ -459,8 +459,8 @@ test("/subagents view interactions should not trigger host switchSession abort b
 
 		const parentDispatchController = new AbortController();
 		let finishRun!: () => void;
-		const originalInvoke = ThreadSupervisor.prototype.invoke;
-		ThreadSupervisor.prototype.invoke = function (request: any) {
+		const originalInvoke = PiActorRuntime.prototype.invoke;
+		PiActorRuntime.prototype.invoke = function (request: any) {
 			let resolveResult!: (value: unknown) => void;
 			const result = new Promise((resolve) => {
 				resolveResult = resolve;
@@ -556,7 +556,7 @@ test("/subagents view interactions should not trigger host switchSession abort b
 			assert.equal(result.details?.items?.[0]?.result?.exitCode, 0);
 			assert.equal(result.isError, undefined);
 		} finally {
-			ThreadSupervisor.prototype.invoke = originalInvoke;
+			PiActorRuntime.prototype.invoke = originalInvoke;
 		}
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });
@@ -580,8 +580,8 @@ test("/subagents browser and inspector view changes should not stall dispatch co
 
 		let emitMessage!: (text: string) => void;
 		let finishRun!: () => void;
-		const originalInvoke = ThreadSupervisor.prototype.invoke;
-		ThreadSupervisor.prototype.invoke = function (request: any) {
+		const originalInvoke = PiActorRuntime.prototype.invoke;
+		PiActorRuntime.prototype.invoke = function (request: any) {
 			let listener: ((event: unknown) => void) | undefined;
 			let resolveResult!: (value: unknown) => void;
 			const result = new Promise((resolve) => {
@@ -742,7 +742,7 @@ test("/subagents browser and inspector view changes should not stall dispatch co
 				"the parent tool result text should still include the finished child output after the view changes",
 			);
 		} finally {
-			ThreadSupervisor.prototype.invoke = originalInvoke;
+			PiActorRuntime.prototype.invoke = originalInvoke;
 		}
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });

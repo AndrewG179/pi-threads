@@ -5,7 +5,7 @@ import * as path from "node:path";
 import test from "node:test";
 
 import { default as registerExtension } from "../../index";
-import { ThreadSupervisor } from "../../src/runtime/thread-supervisor";
+import { PiActorRuntime } from "../../src/runtime/pi-actor";
 
 type RegisteredTool = {
 	name: string;
@@ -54,8 +54,8 @@ test("dispatch should surface hard child failures even when the child produced n
 		const dispatch = fakePi.tools.get("dispatch");
 		assert.ok(dispatch, "dispatch tool should be registered");
 
-		const originalInvoke = ThreadSupervisor.prototype.invoke;
-		ThreadSupervisor.prototype.invoke = function () {
+		const originalInvoke = PiActorRuntime.prototype.invoke;
+		PiActorRuntime.prototype.invoke = function () {
 			return {
 				runId: "run-1",
 				thread: "smoke-fast",
@@ -114,7 +114,7 @@ test("dispatch should surface hard child failures even when the child produced n
 				"dispatch summaries should not collapse hard child failures to '(no output)'",
 			);
 		} finally {
-			ThreadSupervisor.prototype.invoke = originalInvoke;
+			PiActorRuntime.prototype.invoke = originalInvoke;
 		}
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });

@@ -5,7 +5,7 @@ import * as path from "node:path";
 import test from "node:test";
 
 import { default as registerExtension } from "../../index";
-import { ThreadSupervisor } from "../../src/runtime/thread-supervisor";
+import { PiActorRuntime } from "../../src/runtime/pi-actor";
 import { loadThreadsState } from "../../src/subagents/state";
 
 type RegisteredTool = {
@@ -97,8 +97,8 @@ test("dispatch should not persist parent linkage in state.json", async () => {
 		const dispatch = fakePi.tools.get("dispatch");
 		assert.ok(dispatch, "dispatch tool should be registered");
 
-		const originalInvoke = ThreadSupervisor.prototype.invoke;
-		ThreadSupervisor.prototype.invoke = function () {
+		const originalInvoke = PiActorRuntime.prototype.invoke;
+		PiActorRuntime.prototype.invoke = function () {
 			return {
 				runId: "run-1",
 				thread: "smoke-fast",
@@ -141,7 +141,7 @@ test("dispatch should not persist parent linkage in state.json", async () => {
 				} as any,
 			);
 		} finally {
-			ThreadSupervisor.prototype.invoke = originalInvoke;
+			PiActorRuntime.prototype.invoke = originalInvoke;
 		}
 
 		assert.deepEqual(loadThreadsState(projectDir), { enabled: false });
