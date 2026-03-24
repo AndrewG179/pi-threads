@@ -243,15 +243,15 @@ export class SubagentBrowser {
 		const height = this.height();
 		const header = [
 			this.theme.fg("toolTitle", "Subagents"),
-			this.theme.fg("dim", this.mode === "inspector" ? "Live inspector. Esc back to the browser" : "Current session only. Up/Down browse, Enter inspect, Esc close"),
+			this.theme.fg("dim", this.mode === "inspector" ? "Live inspector. Up/Down scroll, Esc back to the browser" : "Current session only. Up/Down browse, Enter inspect, Esc close"),
 			"",
 		];
-		const bodyHeight = Math.max(6, height - header.length);
+		const bodyHeight = Math.max(6, height - header.length - 1);
 		const body = cards.length === 0
 			? [this.theme.fg("muted", EMPTY_SESSION)]
 			: this.mode === "inspector"
 				? this.renderSelected(this.selected(cards), width, bodyHeight, true)
 				: this.renderBrowser(cards, width, bodyHeight);
-		return frame([...header, ...body], width, height);
+		return frame([...header, ...body, ""], width, height);
 	}
 }
