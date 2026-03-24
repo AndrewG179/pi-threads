@@ -4,6 +4,7 @@ import test from "node:test";
 
 import type { Message } from "@mariozechner/pi-ai";
 
+import { collectCompletedDispatchItems } from "../../src/dispatch/history";
 import { SubagentRunStore } from "../../src/subagents/runtime-store";
 
 function assistantText(text: string): Message {
@@ -192,7 +193,7 @@ test("SubagentRunStore does not double-count finished cost when parent toolResul
 		messages: [assistantText("alpha done")],
 	});
 
-	store.seedCompletedFromParent(parentSession, cwd, [
+	store.seedCompletedFromParent(parentSession, collectCompletedDispatchItems(cwd, [
 		dispatchToolResult([
 			{
 				thread: "alpha",
@@ -205,8 +206,8 @@ test("SubagentRunStore does not double-count finished cost when parent toolResul
 				},
 			},
 		]),
-	]);
-	store.seedCompletedFromParent(parentSession, cwd, [
+	]));
+	store.seedCompletedFromParent(parentSession, collectCompletedDispatchItems(cwd, [
 		dispatchToolResult([
 			{
 				thread: "alpha",
@@ -219,7 +220,7 @@ test("SubagentRunStore does not double-count finished cost when parent toolResul
 				},
 			},
 		]),
-	]);
+	]));
 
 	const card = store.getCards(parentSession)[0];
 
@@ -236,7 +237,7 @@ test("SubagentRunStore reseeding completed parent history should not overwrite n
 	const parentSession = path.join(cwd, ".pi", "sessions", "parent.jsonl");
 	const threadSession = path.join(cwd, ".pi", "threads", "alpha.jsonl");
 
-	store.seedCompletedFromParent(parentSession, cwd, [
+	store.seedCompletedFromParent(parentSession, collectCompletedDispatchItems(cwd, [
 		dispatchToolResult([
 			{
 				thread: "alpha",
@@ -249,7 +250,7 @@ test("SubagentRunStore reseeding completed parent history should not overwrite n
 				},
 			},
 		]),
-	]);
+	]));
 
 	store.startRun({
 		parentSessionFile: parentSession,
@@ -266,7 +267,7 @@ test("SubagentRunStore reseeding completed parent history should not overwrite n
 		liveCost: 0.2,
 	});
 
-	store.seedCompletedFromParent(parentSession, cwd, [
+	store.seedCompletedFromParent(parentSession, collectCompletedDispatchItems(cwd, [
 		dispatchToolResult([
 			{
 				thread: "alpha",
@@ -279,7 +280,7 @@ test("SubagentRunStore reseeding completed parent history should not overwrite n
 				},
 			},
 		]),
-	]);
+	]));
 
 	const card = store.getCards(parentSession)[0];
 

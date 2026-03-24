@@ -1,7 +1,22 @@
-export interface ModelDescriptor {
+export interface ModelLike {
 	provider: string;
 	id: string;
 	name?: string;
+}
+
+export interface ModelDescriptor extends ModelLike {}
+
+export interface ModelRegistryLike {
+	getAvailable: () => Promise<readonly ModelLike[]> | readonly ModelLike[];
+}
+
+export function toModelDescriptor(model: ModelLike | undefined): ModelDescriptor | undefined {
+	if (!model) return undefined;
+	return {
+		provider: model.provider,
+		id: model.id,
+		name: model.name,
+	};
 }
 
 export function formatModelIdentifier(model: Pick<ModelDescriptor, "provider" | "id">): string {
@@ -53,6 +68,12 @@ export function findFuzzyModelMatches(models: readonly ModelDescriptor[], query:
 			return compareModels(left.model, right.model);
 		})
 		.map((entry) => entry.model);
+}
+
+export async function getAvailableModels(modelRegistry: ModelRegistryLike | undefined): Promise<ModelDescriptor[]> {
+	if (!modelRegistry?.getAvailable) return [];
+	const available = await Promise.resolve(modelRegistry.getAvailable());
+	return available.map((model) => toModelDescriptor(model)).filter((model): model is ModelDescriptor => model !== undefined);
 }
 
 export function resolveEffectiveSubagentModel(

@@ -1,8 +1,7 @@
-import * as path from "node:path";
 import type { Message } from "@mariozechner/pi-ai";
+import type { DispatchHistoryItem } from "../dispatch/history";
 
 import {
-	getThreadSessionPath,
 	normalizeSessionPath,
 	summarizeOutputPreview,
 	summarizeOutputTail,
@@ -12,30 +11,6 @@ import {
 	type SubagentCard,
 	type SubagentStatus,
 } from "./metadata";
-
-interface DispatchItem {
-	thread?: string;
-	action?: string;
-	episodeNumber?: number;
-	result?: {
-		sessionPath?: string;
-		exitCode?: number;
-		stopReason?: string;
-		messages?: Message[];
-		usage?: {
-			cost?: number | { total?: number };
-		};
-	};
-}
-
-interface SessionEntry {
-	type?: string;
-	message?: {
-		role?: string;
-		toolName?: string;
-		details?: unknown;
-	};
-}
 
 interface SubagentRunRecord {
 	thread: string;
@@ -50,7 +25,7 @@ interface SubagentRunRecord {
 	activeRunId?: string;
 }
 
-interface StartRunInput {
+export interface StartRunInput {
 	parentSessionFile: string;
 	runId: string;
 	thread: string;
@@ -58,7 +33,7 @@ interface StartRunInput {
 	action: string;
 }
 
-interface LiveMessageInput {
+export interface LiveMessageInput {
 	parentSessionFile: string;
 	runId: string;
 	sessionPath: string;
@@ -66,7 +41,7 @@ interface LiveMessageInput {
 	liveCost: number;
 }
 
-interface FinishRunInput {
+export interface FinishRunInput {
 	parentSessionFile: string;
 	runId: string;
 	thread: string;
@@ -76,15 +51,6 @@ interface FinishRunInput {
 	status: SubagentStatus;
 	usageCost: number;
 	messages: readonly Message[];
-}
-
-function extractUsageCost(cost: unknown): number {
-	if (typeof cost === "number" && Number.isFinite(cost)) return cost;
-	if (typeof cost === "object" && cost !== null) {
-		const total = (cost as { total?: unknown }).total;
-		return typeof total === "number" && Number.isFinite(total) ? total : 0;
-	}
-	return 0;
 }
 
 function createEmptyRecord(thread: string, sessionPath: string): SubagentRunRecord {
@@ -169,44 +135,30 @@ export class SubagentRunStore {
 		return next;
 	}
 
-	seedCompletedFromParent(parentSessionFile: string | undefined, cwd: string, parentBranchEntries: readonly unknown[]): void {
+	seedCompletedFromParent(parentSessionFile: string | undefined, parentDispatchItems: readonly DispatchHistoryItem[]): void {
 		const normalizedParent = normalizeSessionPath(parentSessionFile);
 		if (!normalizedParent) return;
 
-		const threadsDir = path.join(cwd, ".pi", "threads");
 		const seenResultKeys = this.getOrCreateSeenResultKeys(normalizedParent);
 
-		for (const entry of parentBranchEntries) {
-			if (typeof entry !== "object" || entry === null) continue;
-			const line = entry as SessionEntry;
-			if (line.type !== "message" || line.message?.role !== "toolResult" || line.message.toolName !== "dispatch") continue;
+		for (const item of parentDispatchItems) {
+			const record = this.upsert(normalizedParent, item.thread, item.result.sessionPath);
+			if (!record) continue;
 
-			const details = line.message.details as { items?: DispatchItem[] } | undefined;
-			if (!details?.items) continue;
+			if (!record.activeRunId) {
+				record.latestAction = item.action;
+				record.status = toSubagentStatus(item.result);
+				if (item.result.messages.length > 0) applyMessageSummary(record, item.result.messages);
+			}
 
-			for (const item of details.items) {
-				if (!item.thread || !item.action || typeof item.episodeNumber !== "number") continue;
-
-				const sessionPath = normalizeSessionPath(item.result?.sessionPath) ?? getThreadSessionPath(threadsDir, item.thread);
-				const record = this.upsert(normalizedParent, item.thread, sessionPath);
-				if (!record) continue;
-				const messages = Array.isArray(item.result?.messages) ? item.result.messages : [];
-
-				if (!record.activeRunId) {
-					record.latestAction = item.action;
-					record.status = toSubagentStatus(item.result);
-					if (messages.length > 0) applyMessageSummary(record, messages);
-				}
-
-				const resultKey = getResultKey({
-					action: item.action,
-					episodeNumber: item.episodeNumber,
-					sessionPath,
-				});
-				if (!seenResultKeys.has(resultKey)) {
-					seenResultKeys.add(resultKey);
-					record.persistedCost += extractUsageCost(item.result?.usage?.cost);
-				}
+			const resultKey = getResultKey({
+				action: item.action,
+				episodeNumber: item.episodeNumber,
+				sessionPath: item.result.sessionPath,
+			});
+			if (!seenResultKeys.has(resultKey)) {
+				seenResultKeys.add(resultKey);
+				record.persistedCost += item.result.usageCost;
 			}
 		}
 	}
