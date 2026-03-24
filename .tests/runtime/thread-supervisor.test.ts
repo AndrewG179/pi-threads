@@ -32,19 +32,6 @@ setTimeout(() => {
 }, delayMs);
 `;
 
-const CANCELLABLE_WORKER_SCRIPT = `
-setTimeout(() => {
-  process.stdout.write(JSON.stringify({
-    type: "message_end",
-    message: {
-      role: "assistant",
-      content: [{ type: "text", text: "worker-started" }]
-    }
-  }) + "\\n");
-}, 25);
-setInterval(() => {}, 1000);
-`;
-
 function parseWindows(markerFilePath: string): Map<string, RunWindow> {
 	const windows = new Map<string, RunWindow>();
 	if (!fs.existsSync(markerFilePath)) return windows;
@@ -64,16 +51,6 @@ function parseWindows(markerFilePath: string): Map<string, RunWindow> {
 	}
 
 	return windows;
-}
-
-async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
-	const startedAt = Date.now();
-	while (!predicate()) {
-		if (Date.now() - startedAt > timeoutMs) {
-			throw new Error(`Timed out after ${timeoutMs}ms`);
-		}
-		await new Promise((resolve) => setTimeout(resolve, 10));
-	}
 }
 
 test("PiActorRuntime serializes same-session invocations while allowing different sessions to overlap", async () => {
@@ -168,145 +145,6 @@ test("PiActorRuntime allows matching thread names to overlap when they target di
 			true,
 			`Expected overlap for same thread name across different sessions, got A=[${runA.start},${runA.end}] B=[${runB.start},${runB.end}]`,
 		);
-	} finally {
-		fs.rmSync(tmpDir, { recursive: true, force: true });
-	}
-});
-
-test("PiActorRuntime cancels queued same-session runs without starting a child", async () => {
-	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-actor-runtime-queued-cancel-"));
-	const markerFilePath = path.join(tmpDir, "markers.log");
-	const delayMs = 400;
-
-	const runtime = new PiActorRuntime({
-		command: process.execPath,
-		buildArgs: (request) => ["-e", WINDOW_WORKER_SCRIPT, markerFilePath, request.runId, String(delayMs)],
-	});
-
-	try {
-		const runningHandle = runtime.invoke({
-			runId: "queued-cancel-running",
-			thread: "same-thread",
-			cwd: tmpDir,
-			action: "noop",
-		});
-		const queuedHandle = runtime.invoke({
-			runId: "queued-cancel-target",
-			thread: "same-thread",
-			cwd: tmpDir,
-			action: "noop",
-		});
-
-		await waitFor(() => runningHandle.getSnapshot().state.tag === "running");
-
-		const cancelStart = Date.now();
-		await queuedHandle.cancel("abort");
-		const queuedResult = await queuedHandle.result;
-		const cancelDurationMs = Date.now() - cancelStart;
-
-		assert.equal(cancelDurationMs < delayMs, true, `queued cancel should not wait ${delayMs}ms for prior run`);
-		assert.equal(queuedResult.stopReason, "aborted");
-		assert.equal(queuedResult.finalState.tag, "exited");
-		assert.equal(queuedResult.finalState.requestedTerminationReason, "abort");
-		assert.equal(queuedResult.messages.length, 0);
-
-		const runningResult = await runningHandle.result;
-		assert.equal(runningResult.finalState.tag, "exited");
-
-		const windows = parseWindows(markerFilePath);
-		assert.equal(windows.has("queued-cancel-running"), true);
-		assert.equal(windows.has("queued-cancel-target"), false);
-	} finally {
-		fs.rmSync(tmpDir, { recursive: true, force: true });
-	}
-});
-
-test("PiActorRuntime aborts externally signalled queued runs without starting a child or disturbing the active same-session run", async () => {
-	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-actor-runtime-external-queued-abort-"));
-	const markerFilePath = path.join(tmpDir, "markers.log");
-	const delayMs = 180;
-
-	const runtime = new PiActorRuntime({
-		command: process.execPath,
-		buildArgs: (request) => ["-e", WINDOW_WORKER_SCRIPT, markerFilePath, request.runId, String(delayMs)],
-	});
-
-	try {
-		const runningHandle = runtime.invoke({
-			runId: "external-abort-running",
-			thread: "same-thread",
-			cwd: tmpDir,
-			action: "noop",
-		});
-		const queuedAbortController = new AbortController();
-		const queuedHandle = runtime.invoke(
-			{
-				runId: "external-abort-queued",
-				thread: "same-thread",
-				cwd: tmpDir,
-				action: "noop",
-			},
-			{ signal: queuedAbortController.signal },
-		);
-
-		await waitFor(() => runningHandle.getSnapshot().state.tag === "running");
-		queuedAbortController.abort();
-
-		const queuedResult = await queuedHandle.result;
-		assert.equal(queuedResult.stopReason, "aborted");
-		assert.equal(queuedResult.finalState.tag, "exited");
-		assert.equal(queuedResult.finalState.requestedTerminationReason, "abort");
-		assert.equal(queuedResult.messages.length, 0);
-		assert.equal(queuedHandle.getSnapshot().state.tag, "exited");
-
-		const runningResult = await runningHandle.result;
-		assert.equal(runningResult.finalState.tag, "exited");
-		assert.equal(runningResult.messages[0]?.role, "assistant");
-
-		const windows = parseWindows(markerFilePath);
-		assert.equal(windows.has("external-abort-running"), true);
-		assert.equal(windows.has("external-abort-queued"), false);
-	} finally {
-		fs.rmSync(tmpDir, { recursive: true, force: true });
-	}
-});
-
-test("PiActorRuntime exposes handle events and snapshots across cancellation", async () => {
-	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-actor-runtime-cancel-"));
-
-	const runtime = new PiActorRuntime({
-		command: process.execPath,
-		buildArgs: () => ["-e", CANCELLABLE_WORKER_SCRIPT],
-		defaultSigtermGraceMs: 50,
-	});
-
-	try {
-		const handle = runtime.invoke({
-			runId: "cancel-me",
-			thread: "cancel-thread",
-			cwd: tmpDir,
-			action: "noop",
-		});
-
-		assert.equal(typeof handle.cancel, "function");
-		assert.equal(typeof handle.subscribe, "function");
-
-		const events: string[] = [];
-		const unsubscribe = handle.subscribe((event) => {
-			events.push(event.type);
-		});
-
-		await waitFor(() => events.includes("message"));
-		await waitFor(() => handle.getSnapshot().state.tag === "running");
-
-		await handle.cancel("abort");
-		const result = await handle.result;
-		unsubscribe();
-
-		assert.equal(result.stopReason, "aborted");
-		assert.equal(result.finalState.tag, "exited");
-		assert.equal(result.finalState.requestedTerminationReason, "abort");
-		assert.equal(handle.getSnapshot().state.tag, "exited");
 	} finally {
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 	}

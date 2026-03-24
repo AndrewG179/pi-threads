@@ -352,10 +352,6 @@ async function runThreadAction(
 	result.errorMessage = runtimeResult.errorMessage;
 	result.exitCode = runtimeResult.finalState.exitCode ?? (runtimeResult.finalState.signal ? 1 : 0);
 
-	if (!result.stopReason && runtimeResult.finalState.requestedTerminationReason === "abort") {
-		result.stopReason = "aborted";
-	}
-
 	return result;
 }
 

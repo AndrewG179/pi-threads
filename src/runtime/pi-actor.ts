@@ -4,14 +4,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import type { EpisodeMessage } from "../episode/builder";
-import {
-	INITIAL_RUN_STATE,
-	transitionRunState,
-	type ExitedRunState,
-	type RunState,
-	type RunTerminationReason,
-} from "../run/state-machine";
-import { terminateProcess } from "./termination";
 
 const THREADS_DIR = ".pi/threads";
 const DEFAULT_PI_COMMAND = "pi";
@@ -86,7 +78,6 @@ export type PiActorArgsBuilder = (request: PiActorInvocationRequest, context: Pi
 export interface PiActorRuntimeOptions {
 	command?: string;
 	buildArgs?: PiActorArgsBuilder;
-	defaultSigtermGraceMs?: number;
 }
 
 interface PiCommandSpec {
@@ -94,14 +85,16 @@ interface PiCommandSpec {
 	argsPrefix: string[];
 }
 
-export interface PiActorInvokeOptions {
-	signal?: AbortSignal;
+export interface PiActorFinalState {
+	tag: "exited";
+	exitCode: number | null;
+	signal: NodeJS.Signals | null;
 }
 
 export interface PiActorResult {
 	runId: string;
 	thread: string;
-	finalState: ExitedRunState;
+	finalState: PiActorFinalState;
 	messages: readonly EpisodeMessage[];
 	stderr: string;
 	usage: PiActorUsageStats;
@@ -111,44 +104,16 @@ export interface PiActorResult {
 }
 
 export type PiActorEvent =
-	| { type: "state"; state: RunState }
 	| { type: "message"; message: EpisodeMessage }
 	| { type: "stderr"; chunk: string };
 
-export interface PiActorSnapshot {
-	runId: string;
-	thread: string;
-	pid: number | undefined;
-	startedAt: number;
-	state: RunState;
-}
-
 export interface PiActorHandle {
-	readonly runId: string;
-	readonly thread: string;
 	readonly result: Promise<PiActorResult>;
-	cancel(reason?: RunTerminationReason): Promise<void>;
 	subscribe(listener: (event: PiActorEvent) => void): () => void;
-	getSnapshot(): PiActorSnapshot;
-}
-
-interface InvocationOptions {
-	request: PiActorInvocationRequest;
-	command: string;
-	argsBuilder: PiActorArgsBuilder;
-	sigtermGraceMs: number;
-	waitForTurn: Promise<void>;
-	releaseTurn: () => void;
-	signal?: AbortSignal;
 }
 
 function toNumber(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) ? value : 0;
-}
-
-function isAbortError(error: unknown): boolean {
-	if (error instanceof Error && error.name === "AbortError") return true;
-	return error instanceof Error && /abort/i.test(error.message);
 }
 
 function toErrorMessage(error: unknown): string {
@@ -268,113 +233,78 @@ function resolvePiCommandSpec(): PiCommandSpec {
 					argsPrefix: [resolvedEntryPoint],
 				};
 			}
-			return {
-				command: resolvedEntryPoint,
-				argsPrefix: [],
-			};
+			return { command: resolvedEntryPoint, argsPrefix: [] };
 		}
 	}
 
 	return { command: DEFAULT_PI_COMMAND, argsPrefix: [] };
 }
 
-function asExitedState(state: RunState, exitCode: number | null, signal: NodeJS.Signals | null): ExitedRunState {
-	if (state.tag === "exited") return state;
-	if (state.tag === "running") return { tag: "exited", pid: state.pid, exitCode, signal };
-	if (state.tag === "terminating") {
-		return {
-			tag: "exited",
-			pid: state.pid,
-			exitCode,
-			signal,
-			requestedTerminationReason: state.reason,
-		};
-	}
+function createFinalState(exitCode: number | null, signal: NodeJS.Signals | null): PiActorFinalState {
 	return { tag: "exited", exitCode, signal };
 }
 
-function createCancelledResult(
-	request: PiActorInvocationRequest,
-	reason: RunTerminationReason,
-	errorMessage?: string,
-): PiActorResult {
-	return {
-		runId: request.runId,
-		thread: request.thread,
-		finalState: {
-			tag: "exited",
-			exitCode: null,
-			signal: null,
-			requestedTerminationReason: reason,
-		},
-		messages: [],
-		stderr: "",
-		usage: { ...EMPTY_PI_ACTOR_USAGE_STATS },
-		model: request.model,
-		stopReason: reason === "abort" ? "aborted" : "error",
-		errorMessage,
+function wireOutput(
+	child: ChildProcess,
+	onMessage: (message: RuntimeMessage) => void,
+	onStderr: (chunk: string) => void,
+): () => void {
+	let stdoutBuffer = "";
+
+	if (child.stdout) {
+		child.stdout.on("data", (chunk: Buffer | string) => {
+			stdoutBuffer += chunk.toString();
+			const lines = stdoutBuffer.split("\n");
+			stdoutBuffer = lines.pop() || "";
+			for (const line of lines) {
+				if (!line.trim()) continue;
+				try {
+					const event = JSON.parse(line) as StreamEvent;
+					if ((event.type === "message_end" || event.type === "tool_result_end") && event.message) {
+						onMessage(event.message);
+					}
+				} catch {
+					/* ignore malformed JSON lines */
+				}
+			}
+		});
+	}
+
+	if (child.stderr) {
+		child.stderr.on("data", (chunk: Buffer | string) => {
+			onStderr(chunk.toString());
+		});
+	}
+
+	return () => {
+		if (!stdoutBuffer.trim()) return;
+		try {
+			const event = JSON.parse(stdoutBuffer) as StreamEvent;
+			if ((event.type === "message_end" || event.type === "tool_result_end") && event.message) {
+				onMessage(event.message);
+			}
+		} catch {
+			/* ignore trailing non-json */
+		}
 	};
 }
 
-function createInvocation(options: InvocationOptions): PiActorHandle {
-	const { request, command, argsBuilder, sigtermGraceMs, waitForTurn, releaseTurn, signal } = options;
-	const listeners = new Set<(event: PiActorEvent) => void>();
+async function runInvocation(params: {
+	request: PiActorInvocationRequest;
+	command: string;
+	argsBuilder: PiActorArgsBuilder;
+	emit: (event: PiActorEvent) => void;
+}): Promise<PiActorResult> {
+	const { request, command, argsBuilder, emit } = params;
 	const messages: RuntimeMessage[] = [];
 	const usage: PiActorUsageStats = { ...EMPTY_PI_ACTOR_USAGE_STATS };
-
-	let child: ChildProcess | null = null;
-	let state: RunState = INITIAL_RUN_STATE;
-	let startedAt = Date.now();
+	let promptFile: PromptFile | null = null;
 	let stderr = "";
 	let model: string | undefined;
 	let stopReason: string | undefined;
 	let errorMessage: string | undefined;
-	let requestedTerminationReason: RunTerminationReason | undefined;
-	let terminationPromise: Promise<void> | null = null;
-	let cancelQueuedWait: ((reason: RunTerminationReason) => void) | null = null;
-
-	const queuedCancellation = new Promise<RunTerminationReason>((resolve) => {
-		cancelQueuedWait = resolve;
-	});
-
-	const emit = (event: PiActorEvent) => {
-		for (const listener of listeners) {
-			try {
-				listener(event);
-			} catch {
-				/* ignore listener errors */
-			}
-		}
-	};
-
-	const setState = (next: RunState) => {
-		state = next;
-		emit({ type: "state", state: next });
-	};
-
-	const moveToStarted = (pid: number) => {
-		if (state.tag !== "queued") return;
-		setState(transitionRunState(state, { type: "started", pid }));
-	};
-
-	const moveToTerminating = (reason: RunTerminationReason) => {
-		if (typeof child?.pid === "number" && state.tag === "queued") {
-			moveToStarted(child.pid);
-		}
-		if (state.tag !== "running") return;
-		setState(transitionRunState(state, { type: "terminationRequested", reason }));
-	};
-
-	const moveToExited = (exitCode: number | null, signalCode: NodeJS.Signals | null) => {
-		let next = asExitedState(state, exitCode, signalCode);
-		if (requestedTerminationReason && !next.requestedTerminationReason) {
-			next = {
-				...next,
-				requestedTerminationReason,
-			};
-		}
-		setState(next);
-	};
+	let finalExitCode: number | null = null;
+	let finalSignal: NodeJS.Signals | null = null;
 
 	const handleMessage = (message: RuntimeMessage) => {
 		messages.push(message);
@@ -390,198 +320,71 @@ function createInvocation(options: InvocationOptions): PiActorHandle {
 				if (tokens > 0) usage.contextTokens = tokens;
 			}
 		}
-
 		if (!model && typeof message.model === "string") model = message.model;
 		if (typeof message.stopReason === "string") stopReason = message.stopReason;
 		if (typeof message.errorMessage === "string") errorMessage = message.errorMessage;
 		emit({ type: "message", message });
 	};
 
-	const wireOutput = (proc: ChildProcess): (() => void) => {
-		let stdoutBuffer = "";
+	try {
+		const sessionPath = resolveSessionPath(request);
+		ensureSessionDirectory(sessionPath);
+		if (request.systemPrompt) promptFile = writePromptFile(request.systemPrompt);
 
-		if (proc.stdout) {
-			proc.stdout.on("data", (chunk: Buffer | string) => {
-				stdoutBuffer += chunk.toString();
-				const lines = stdoutBuffer.split("\n");
-				stdoutBuffer = lines.pop() || "";
-				for (const line of lines) {
-					if (!line.trim()) continue;
-					try {
-						const event = JSON.parse(line) as StreamEvent;
-						if ((event.type === "message_end" || event.type === "tool_result_end") && event.message) {
-							handleMessage(event.message);
-						}
-					} catch {
-						/* ignore malformed JSON lines */
-					}
-				}
-			});
+		const child = spawn(command, argsBuilder(request, {
+			sessionPath,
+			systemPromptFile: promptFile?.filePath,
+		}), {
+			cwd: request.cwd,
+			env: process.env,
+			stdio: ["ignore", "pipe", "pipe"],
+			shell: false,
+		});
+
+		const flushStdout = wireOutput(
+			child,
+			handleMessage,
+			(chunk) => {
+				stderr += chunk;
+				emit({ type: "stderr", chunk });
+			},
+		);
+
+		const closePromise = waitForClose(child).then(() => {
+			flushStdout();
+		});
+
+		const exited = await waitForExit(child);
+		finalExitCode = exited.exitCode;
+		finalSignal = exited.signal;
+		await closePromise;
+
+		if (!stopReason && finalExitCode !== null && finalExitCode !== 0) {
+			stopReason = "error";
 		}
-
-		if (proc.stderr) {
-			proc.stderr.on("data", (chunk: Buffer | string) => {
-				const text = chunk.toString();
-				stderr += text;
-				emit({ type: "stderr", chunk: text });
-			});
-		}
-
-		return () => {
-			if (!stdoutBuffer.trim()) return;
-			try {
-				const event = JSON.parse(stdoutBuffer) as StreamEvent;
-				if ((event.type === "message_end" || event.type === "tool_result_end") && event.message) {
-					handleMessage(event.message);
-				}
-			} catch {
-				/* ignore trailing non-json */
-			}
-		};
-	};
-
-	const requestTermination = async (reason: RunTerminationReason): Promise<void> => {
-		if (!child || getExitSnapshot(child)) return;
-		moveToTerminating(reason);
-		await terminateProcess(child, { sigtermGraceMs });
-	};
-
-	const cancel = async (reason: RunTerminationReason = "abort"): Promise<void> => {
-		requestedTerminationReason ??= reason;
-		if (state.tag === "exited") return;
-		if (!child) {
-			cancelQueuedWait?.(requestedTerminationReason);
-			cancelQueuedWait = null;
-			return;
-		}
-		if (!terminationPromise) {
-			terminationPromise = requestTermination(requestedTerminationReason);
-		}
-		await terminationPromise;
-	};
-
-	const getSnapshot = (): PiActorSnapshot => ({
-		runId: request.runId,
-		thread: request.thread,
-		pid: child?.pid,
-		startedAt,
-		state,
-	});
-
-	const result = (async (): Promise<PiActorResult> => {
-		let promptFile: PromptFile | null = null;
-		let removeAbortListener: (() => void) | undefined;
-		let finalExitCode: number | null = null;
-		let finalSignal: NodeJS.Signals | null = null;
-
-		try {
-			if (signal) {
-				const onAbort = () => {
-					void cancel("abort");
-				};
-				if (signal.aborted) onAbort();
-				else signal.addEventListener("abort", onAbort, { once: true });
-				removeAbortListener = () => signal.removeEventListener("abort", onAbort);
-			}
-
-			const queuedReason = await Promise.race([
-				waitForTurn.then(() => undefined as RunTerminationReason | undefined),
-				queuedCancellation.then((reason) => reason),
-			]);
-			cancelQueuedWait = null;
-
-			if (queuedReason) {
-				requestedTerminationReason ??= queuedReason;
-				const cancelled = createCancelledResult(request, queuedReason);
-				setState(cancelled.finalState);
-				return cancelled;
-			}
-
-			const sessionPath = resolveSessionPath(request);
-			ensureSessionDirectory(sessionPath);
-			if (request.systemPrompt) promptFile = writePromptFile(request.systemPrompt);
-
-			const args = argsBuilder(request, {
-				sessionPath,
-				systemPromptFile: promptFile?.filePath,
-			});
-			child = spawn(command, args, {
-				cwd: request.cwd,
-				env: process.env,
-				stdio: ["ignore", "pipe", "pipe"],
-				shell: false,
-			});
-			startedAt = Date.now();
-
-			if (typeof child.pid === "number") moveToStarted(child.pid);
-			if (requestedTerminationReason) void cancel(requestedTerminationReason);
-
-			const flushStdout = wireOutput(child);
-			const closePromise = waitForClose(child).then(() => {
-				flushStdout();
-			});
-
-			const exited = await waitForExit(child);
-			finalExitCode = exited.exitCode;
-			finalSignal = exited.signal;
-			moveToExited(finalExitCode, finalSignal);
-			await closePromise;
-
-			if (!stopReason && finalExitCode !== null && finalExitCode !== 0) {
-				stopReason = "error";
-			}
-		} catch (error) {
-			errorMessage ??= toErrorMessage(error);
-			stopReason ??= requestedTerminationReason === "abort" || signal?.aborted || isAbortError(error)
-				? "aborted"
-				: "error";
-
-			const exited = child ? getExitSnapshot(child) : null;
-			finalExitCode = exited?.exitCode ?? finalExitCode;
-			finalSignal = exited?.signal ?? finalSignal;
-			moveToExited(finalExitCode, finalSignal);
-		} finally {
-			removeAbortListener?.();
-			cleanupPromptFile(promptFile);
-			releaseTurn();
-		}
-
-		const finalState = asExitedState(state, finalExitCode, finalSignal);
-		state = finalState;
-		if (!stopReason && finalState.requestedTerminationReason === "abort") {
-			stopReason = "aborted";
-		}
-
-		return {
-			runId: request.runId,
-			thread: request.thread,
-			finalState,
-			messages,
-			stderr,
-			usage,
-			model: model ?? request.model,
-			stopReason,
-			errorMessage,
-		};
-	})();
+	} catch (error) {
+		errorMessage = toErrorMessage(error);
+		stopReason = "error";
+	} finally {
+		cleanupPromptFile(promptFile);
+	}
 
 	return {
 		runId: request.runId,
 		thread: request.thread,
-		result,
-		cancel,
-		subscribe(listener: (event: PiActorEvent) => void): () => void {
-			listeners.add(listener);
-			return () => listeners.delete(listener);
-		},
-		getSnapshot,
+		finalState: createFinalState(finalExitCode, finalSignal),
+		messages,
+		stderr,
+		usage,
+		model: model ?? request.model,
+		stopReason,
+		errorMessage,
 	};
 }
 
 export class PiActorRuntime {
 	private readonly command: string;
 	private readonly argsBuilder: PiActorArgsBuilder;
-	private readonly defaultSigtermGraceMs: number;
 	private readonly sessionQueues = new Map<string, Promise<void>>();
 
 	constructor(options: PiActorRuntimeOptions = {}) {
@@ -595,33 +398,53 @@ export class PiActorRuntime {
 			...commandSpec.argsPrefix,
 			...baseArgsBuilder(request, context),
 		];
-		this.defaultSigtermGraceMs = options.defaultSigtermGraceMs ?? 5_000;
 	}
 
-	invoke(request: PiActorInvocationRequest, options: PiActorInvokeOptions = {}): PiActorHandle {
+	invoke(request: PiActorInvocationRequest): PiActorHandle {
+		const listeners = new Set<(event: PiActorEvent) => void>();
+		const emit = (event: PiActorEvent) => {
+			for (const listener of listeners) {
+				try {
+					listener(event);
+				} catch {
+					/* ignore listener errors */
+				}
+			}
+		};
+
 		const sessionKey = resolveSessionPath(request);
 		const previous = this.sessionQueues.get(sessionKey)?.catch(() => undefined) ?? Promise.resolve();
 
 		let releaseTurn!: () => void;
-		const turnGate = new Promise<void>((resolve) => {
+		const turn = new Promise<void>((resolve) => {
 			releaseTurn = resolve;
 		});
-		const queueTail = previous.then(() => turnGate);
+		const queueTail = previous.then(() => turn);
 		this.sessionQueues.set(sessionKey, queueTail);
 
-		return createInvocation({
-			request,
-			command: this.command,
-			argsBuilder: this.argsBuilder,
-			sigtermGraceMs: this.defaultSigtermGraceMs,
-			waitForTurn: previous,
-			releaseTurn: () => {
+		const result = (async () => {
+			await previous;
+			try {
+				return await runInvocation({
+					request,
+					command: this.command,
+					argsBuilder: this.argsBuilder,
+					emit,
+				});
+			} finally {
 				releaseTurn();
 				if (this.sessionQueues.get(sessionKey) === queueTail) {
 					this.sessionQueues.delete(sessionKey);
 				}
+			}
+		})();
+
+		return {
+			result,
+			subscribe(listener: (event: PiActorEvent) => void): () => void {
+				listeners.add(listener);
+				return () => listeners.delete(listener);
 			},
-			signal: options.signal,
-		});
+		};
 	}
 }

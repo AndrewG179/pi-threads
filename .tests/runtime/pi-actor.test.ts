@@ -95,7 +95,6 @@ test("PiActorRuntime closes worker stdin for one-shot invocations", async () => 
 	const runtime = new PiActorRuntime({
 		command: process.execPath,
 		buildArgs: () => [workerPath],
-		defaultSigtermGraceMs: 25,
 	});
 
 	const handle = runtime.invoke({
@@ -122,7 +121,6 @@ test("PiActorRuntime closes worker stdin for one-shot invocations", async () => 
 			assert.equal(settled.result.messages[0]?.role, "assistant");
 		}
 	} finally {
-		await handle.cancel("abort").catch(() => {});
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 	}
 });
@@ -235,7 +233,6 @@ test("PiActorRuntime parses streamed stdout events, flushes the trailing JSON me
 	const runtime = new PiActorRuntime({
 		command: process.execPath,
 		buildArgs: () => ["-e", MIXED_OUTPUT_WORKER_SCRIPT],
-		defaultSigtermGraceMs: 25,
 	});
 
 	const handle = runtime.invoke({
@@ -279,13 +276,10 @@ test("PiActorRuntime parses streamed stdout events, flushes the trailing JSON me
 		assert.match(result.stderr, /warn-one/);
 		assert.match(result.stderr, /warn-two/);
 
-		assert.equal(eventTypes.includes("state"), true);
 		assert.equal(eventTypes.filter((type) => type === "message").length, 3);
 		assert.equal(eventTypes.includes("stderr"), true);
 		assert.equal(stderrChunks.join(""), "warn-one\nwarn-two");
-		assert.equal(handle.getSnapshot().state.tag, "exited");
 	} finally {
-		await handle.cancel("abort").catch(() => {});
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 	}
 });
@@ -309,7 +303,6 @@ test("PiActorRuntime writes system prompts to a temp file for the child and clea
 				);
 				return ["-e", SIMPLE_MESSAGE_WORKER_SCRIPT];
 			},
-			defaultSigtermGraceMs: 25,
 		});
 
 		const result = await runtime.invoke({
