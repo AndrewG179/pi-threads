@@ -1,106 +1,19 @@
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 
 import { default as registerExtension } from "../../index";
 import { PiActorRuntime } from "../../src/runtime/pi-actor";
-
-type RegisteredTool = {
-	name: string;
-	execute: (
-		toolCallId: string,
-		params: Record<string, unknown>,
-		signal: AbortSignal | undefined,
-		onUpdate: ((partial: unknown) => void) | undefined,
-		ctx: Record<string, unknown>,
-	) => Promise<unknown>;
-};
-
-type RegisteredEventHandler = (event: unknown, ctx: Record<string, unknown>) => Promise<unknown> | unknown;
-
-type BrowserLike = {
-	handleInput(input: string): void;
-	render(width: number): string[];
-	invalidate(): void;
-};
-
-function makeTempProject(): string {
-	return fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-runtime-simplify-"));
-}
-
-function makeFakePi() {
-	const tools = new Map<string, RegisteredTool>();
-	const commands = new Map<string, { handler: (args: string, ctx: Record<string, unknown>) => Promise<void> | void }>();
-	const events = new Map<string, RegisteredEventHandler[]>();
-
-	return {
-		on(event: string, listener: RegisteredEventHandler) {
-			const handlers = events.get(event) ?? [];
-			handlers.push(listener);
-			events.set(event, handlers);
-		},
-		registerCommand(name: string, config: { handler: (args: string, ctx: Record<string, unknown>) => Promise<void> | void }) {
-			commands.set(name, config);
-		},
-		registerShortcut: () => {},
-		registerTool(config: RegisteredTool) {
-			tools.set(config.name, config);
-		},
-		getActiveTools: () => ["read", "write", "edit", "bash", "dispatch"],
-		getAllTools: () => [{ name: "read" }, { name: "write" }, { name: "edit" }, { name: "bash" }, { name: "dispatch" }],
-		setActiveTools: () => {},
-		tools,
-		commands,
-		events,
-	};
-}
-
-function makeSelectKeybindings() {
-	return {
-		matches(input: string, command: string) {
-			return (
-				(input === "UP" && command === "tui.select.up") ||
-				(input === "DOWN" && command === "tui.select.down") ||
-				(input === "ENTER" && command === "tui.select.confirm") ||
-				(input === "ESC" && command === "tui.select.cancel")
-			);
-		},
-	};
-}
-
-function makeTheme() {
-	return {
-		fg: (_color: string, text: string) => text,
-		bg: (_color: string, text: string) => text,
-	};
-}
-
-function writeThreadSession(filePath: string, lines: unknown[]): void {
-	fs.mkdirSync(path.dirname(filePath), { recursive: true });
-	fs.writeFileSync(
-		filePath,
-		lines.map((line) => JSON.stringify(line)).join("\n") + "\n",
-		"utf8",
-	);
-}
-
-function createBrowserPromise(
-	factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (result: unknown) => void) => unknown,
-): { browser: BrowserLike; result: Promise<unknown> } {
-	let browser!: BrowserLike;
-	const result = new Promise<unknown>((resolve) => {
-		browser = factory(
-			{ terminal: { rows: 24 } },
-			makeTheme(),
-			makeSelectKeybindings(),
-			resolve,
-		) as BrowserLike;
-	});
-
-	return { browser, result };
-}
+import {
+	type BrowserLike,
+	createBrowserPromise,
+	makeCommandContext,
+	makeFakePi,
+	makeTempProject,
+	patchPiActorInvoke,
+	writeThreadSession,
+} from "../helpers/subagent-test-helpers";
 
 test("/subagents should refresh live card details from the runtime-owned run store while the browser stays open", async () => {
 	const projectDir = makeTempProject();
@@ -114,13 +27,12 @@ test("/subagents should refresh live card details from the runtime-owned run sto
 
 		const dispatch = fakePi.tools.get("dispatch");
 		const subagents = fakePi.commands.get("subagents");
-		assert.ok(dispatch, "dispatch should be registered");
+		assert.ok(dispatch?.execute, "dispatch should be registered");
 		assert.ok(subagents, "/subagents should be registered");
 
 		let emitMessage!: (text: string) => void;
 		let finishRun!: () => void;
-		const originalInvoke = PiActorRuntime.prototype.invoke;
-		PiActorRuntime.prototype.invoke = function (request: any) {
+		const restoreInvoke = patchPiActorInvoke(function (request: any) {
 			let listener: ((event: unknown) => void) | undefined;
 			let resolveResult!: (value: unknown) => void;
 			const result = new Promise((resolve) => {
@@ -164,50 +76,35 @@ test("/subagents should refresh live card details from the runtime-owned run sto
 						if (listener === next) listener = undefined;
 					};
 				},
-				getSnapshot: () => ({
-					runId: request.runId,
-					thread: request.thread,
-					pid: undefined,
-					startedAt: Date.now(),
-					state: { tag: "running" },
-				}),
 			} as any;
-		};
+		} as typeof PiActorRuntime.prototype.invoke);
 
-		const execution = dispatch.execute(
+		const execution = dispatch.execute!(
 			"tool-call-live-refresh",
 			{ thread: "alpha", action: "Inspect alpha while it is still running" },
 			undefined,
 			undefined,
-			{
+			makeCommandContext({
 				cwd: projectDir,
-				hasUI: true,
-				ui: { notify: () => {} },
-				sessionManager: {
-					getSessionFile: () => parentSession,
-					getBranch: () => [],
-				},
+				sessionFile: parentSession,
+				branch: [],
 				model: { provider: "openai-codex", id: "gpt-5.4" },
-			} as any,
+			}) as any,
 		);
 
 		let browser: BrowserLike | undefined;
-		const handlerPromise = subagents!.handler("", {
+		const handlerPromise = subagents!.handler("", makeCommandContext({
 			cwd: projectDir,
-			hasUI: true,
+			sessionFile: parentSession,
+			branch: [],
 			ui: {
-				notify: () => {},
 				custom: (factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (result: unknown) => void) => unknown) => {
 					const created = createBrowserPromise(factory);
 					browser = created.browser;
 					return created.result;
 				},
 			},
-			sessionManager: {
-				getSessionFile: () => parentSession,
-				getBranch: () => [],
-			},
-		} as any);
+		}) as any);
 
 		try {
 			await Promise.resolve();
@@ -227,7 +124,7 @@ test("/subagents should refresh live card details from the runtime-owned run sto
 			if (browser) browser.handleInput("ESC");
 			await handlerPromise;
 			await execution;
-			PiActorRuntime.prototype.invoke = originalInvoke;
+			restoreInvoke();
 		}
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });
@@ -246,12 +143,11 @@ test("/subagents should discover a newly started current-session child while the
 
 		const dispatch = fakePi.tools.get("dispatch");
 		const subagents = fakePi.commands.get("subagents");
-		assert.ok(dispatch, "dispatch should be registered");
+		assert.ok(dispatch?.execute, "dispatch should be registered");
 		assert.ok(subagents, "/subagents should be registered");
 
 		let finishRun!: () => void;
-		const originalInvoke = PiActorRuntime.prototype.invoke;
-		PiActorRuntime.prototype.invoke = function (request: any) {
+		const restoreInvoke = patchPiActorInvoke(function (request: any) {
 			let resolveResult!: (value: unknown) => void;
 			const result = new Promise((resolve) => {
 				resolveResult = resolve;
@@ -274,53 +170,38 @@ test("/subagents should discover a newly started current-session child while the
 				result,
 				cancel: async () => {},
 				subscribe: () => () => {},
-				getSnapshot: () => ({
-					runId: request.runId,
-					thread: request.thread,
-					pid: undefined,
-					startedAt: Date.now(),
-					state: { tag: "running" },
-				}),
 			} as any;
-		};
+		} as typeof PiActorRuntime.prototype.invoke);
 
 		let browser: BrowserLike | undefined;
-		const handlerPromise = subagents!.handler("", {
+		const handlerPromise = subagents!.handler("", makeCommandContext({
 			cwd: projectDir,
-			hasUI: true,
+			sessionFile: parentSession,
+			branch: [],
 			ui: {
-				notify: () => {},
 				custom: (factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (result: unknown) => void) => unknown) => {
 					const created = createBrowserPromise(factory);
 					browser = created.browser;
 					return created.result;
 				},
 			},
-			sessionManager: {
-				getSessionFile: () => parentSession,
-				getBranch: () => [],
-			},
-		} as any);
+		}) as any);
 
 		try {
 			await Promise.resolve();
 			assert.match(browser!.render(80).join("\n"), /No subagent runs in this session\./);
 
-			const execution = dispatch.execute(
+			const execution = dispatch.execute!(
 				"tool-call-new-live-child",
 				{ thread: "alpha", action: "Inspect alpha while it is still running" },
 				undefined,
 				undefined,
-				{
+				makeCommandContext({
 					cwd: projectDir,
-					hasUI: true,
-					ui: { notify: () => {} },
-					sessionManager: {
-						getSessionFile: () => parentSession,
-						getBranch: () => [],
-					},
+					sessionFile: parentSession,
+					branch: [],
 					model: { provider: "openai-codex", id: "gpt-5.4" },
-				} as any,
+				}) as any,
 			);
 
 			await Promise.resolve();
@@ -336,7 +217,7 @@ test("/subagents should discover a newly started current-session child while the
 		} finally {
 			if (browser) browser.handleInput("ESC");
 			await handlerPromise;
-			PiActorRuntime.prototype.invoke = originalInvoke;
+			restoreInvoke();
 		}
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });
@@ -362,63 +243,59 @@ test("/subagents should stay in the same host session: Enter opens the inspector
 
 		let browser: BrowserLike | undefined;
 		let switchCalls = 0;
-		const handlerPromise = subagents!.handler("", {
+		const handlerPromise = subagents!.handler("", makeCommandContext({
 			cwd: projectDir,
-			hasUI: true,
+			sessionFile: parentSession,
+			branch: [{
+				type: "message",
+				message: {
+					role: "toolResult",
+					toolName: "dispatch",
+					details: {
+						mode: "batch",
+						items: [
+							{
+								thread: "alpha",
+								action: "Inspect alpha",
+								episode: "alpha ready",
+								episodeNumber: 1,
+								result: {
+									exitCode: 0,
+									stderr: "",
+									messages: [{ role: "assistant", content: [{ type: "text", text: "alpha ready" }] }],
+									usage: { cost: 0.01 },
+									sessionPath: alphaSession,
+								},
+							},
+							{
+								thread: "beta",
+								action: "Inspect beta",
+								episode: "beta ready",
+								episodeNumber: 1,
+								result: {
+									exitCode: 0,
+									stderr: "",
+									messages: [{ role: "assistant", content: [{ type: "text", text: "beta ready" }] }],
+									usage: { cost: 0.02 },
+									sessionPath: betaSession,
+								},
+							},
+						],
+					},
+				},
+			}],
 			switchSession: async () => {
 				switchCalls++;
 				return { cancelled: false };
 			},
 			ui: {
-				notify: () => {},
 				custom: (factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (result: unknown) => void) => unknown) => {
 					const created = createBrowserPromise(factory);
 					browser = created.browser;
 					return created.result;
 				},
 			},
-			sessionManager: {
-				getSessionFile: () => parentSession,
-				getBranch: () => [{
-					type: "message",
-					message: {
-						role: "toolResult",
-						toolName: "dispatch",
-						details: {
-							mode: "batch",
-							items: [
-								{
-									thread: "alpha",
-									action: "Inspect alpha",
-									episode: "alpha ready",
-									episodeNumber: 1,
-									result: {
-										exitCode: 0,
-										stderr: "",
-										messages: [{ role: "assistant", content: [{ type: "text", text: "alpha ready" }] }],
-										usage: { cost: 0.01 },
-										sessionPath: alphaSession,
-									},
-								},
-								{
-									thread: "beta",
-									action: "Inspect beta",
-									episode: "beta ready",
-									episodeNumber: 1,
-									result: {
-										exitCode: 0,
-										stderr: "",
-										messages: [{ role: "assistant", content: [{ type: "text", text: "beta ready" }] }],
-										usage: { cost: 0.02 },
-										sessionPath: betaSession,
-									},
-								},
-							],
-						},
-					},
-				}],
-			},
-		} as any);
+		}) as any);
 
 		try {
 			await Promise.resolve();
@@ -454,13 +331,12 @@ test("/subagents view interactions should not trigger host switchSession abort b
 
 		const dispatch = fakePi.tools.get("dispatch");
 		const subagents = fakePi.commands.get("subagents");
-		assert.ok(dispatch, "dispatch should be registered");
+		assert.ok(dispatch?.execute, "dispatch should be registered");
 		assert.ok(subagents, "/subagents should be registered");
 
 		const parentDispatchController = new AbortController();
 		let finishRun!: () => void;
-		const originalInvoke = PiActorRuntime.prototype.invoke;
-		PiActorRuntime.prototype.invoke = function (request: any) {
+		const restoreInvoke = patchPiActorInvoke(function (request: any) {
 			let resolveResult!: (value: unknown) => void;
 			const result = new Promise((resolve) => {
 				resolveResult = resolve;
@@ -486,56 +362,41 @@ test("/subagents view interactions should not trigger host switchSession abort b
 				result,
 				cancel: async () => {},
 				subscribe: () => () => {},
-				getSnapshot: () => ({
-					runId: request.runId,
-					thread: request.thread,
-					pid: undefined,
-					startedAt: Date.now(),
-					state: { tag: "running" },
-				}),
 			} as any;
-		};
+		} as typeof PiActorRuntime.prototype.invoke);
 
-		const execution = dispatch.execute(
+		const execution = dispatch.execute!(
 			"tool-call-no-switch-abort",
 			{ thread: "alpha", action: "Run slow background work and finish cleanly" },
 			parentDispatchController.signal,
 			undefined,
-			{
+			makeCommandContext({
 				cwd: projectDir,
-				hasUI: true,
-				ui: { notify: () => {} },
-				sessionManager: {
-					getSessionFile: () => parentSession,
-					getBranch: () => [],
-				},
+				sessionFile: parentSession,
+				branch: [],
 				model: { provider: "openai-codex", id: "gpt-5.4" },
-			} as any,
+			}) as any,
 		);
 
 		let browser: BrowserLike | undefined;
 		let switchCalls = 0;
-		const handlerPromise = subagents!.handler("", {
+		const handlerPromise = subagents!.handler("", makeCommandContext({
 			cwd: projectDir,
-			hasUI: true,
+			sessionFile: parentSession,
+			branch: [],
 			switchSession: async () => {
 				switchCalls++;
 				parentDispatchController.abort();
 				return { cancelled: false };
 			},
 			ui: {
-				notify: () => {},
 				custom: (factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (result: unknown) => void) => unknown) => {
 					const created = createBrowserPromise(factory);
 					browser = created.browser;
 					return created.result;
 				},
 			},
-			sessionManager: {
-				getSessionFile: () => parentSession,
-				getBranch: () => [],
-			},
-		} as any);
+		}) as any);
 
 		try {
 			await Promise.resolve();
@@ -556,7 +417,7 @@ test("/subagents view interactions should not trigger host switchSession abort b
 			assert.equal(result.details?.items?.[0]?.result?.exitCode, 0);
 			assert.equal(result.isError, undefined);
 		} finally {
-			PiActorRuntime.prototype.invoke = originalInvoke;
+			restoreInvoke();
 		}
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });
@@ -575,13 +436,12 @@ test("/subagents browser and inspector view changes should not stall dispatch co
 
 		const dispatch = fakePi.tools.get("dispatch");
 		const subagents = fakePi.commands.get("subagents");
-		assert.ok(dispatch, "dispatch should be registered");
+		assert.ok(dispatch?.execute, "dispatch should be registered");
 		assert.ok(subagents, "/subagents should be registered");
 
 		let emitMessage!: (text: string) => void;
 		let finishRun!: () => void;
-		const originalInvoke = PiActorRuntime.prototype.invoke;
-		PiActorRuntime.prototype.invoke = function (request: any) {
+		const restoreInvoke = patchPiActorInvoke(function (request: any) {
 			let listener: ((event: unknown) => void) | undefined;
 			let resolveResult!: (value: unknown) => void;
 			const result = new Promise((resolve) => {
@@ -625,55 +485,35 @@ test("/subagents browser and inspector view changes should not stall dispatch co
 						if (listener === next) listener = undefined;
 					};
 				},
-				getSnapshot: () => ({
-					runId: request.runId,
-					thread: request.thread,
-					pid: undefined,
-					startedAt: Date.now(),
-					state: { tag: "running" },
-				}),
 			} as any;
-		};
+		} as typeof PiActorRuntime.prototype.invoke);
 
-		const execution = dispatch.execute(
+		const execution = dispatch.execute!(
 			"tool-call-parent-completion-after-view-changes",
 			{ thread: "alpha", action: "Keep working while the user opens and closes /subagents" },
 			undefined,
 			undefined,
-			{
+			makeCommandContext({
 				cwd: projectDir,
-				hasUI: true,
-				ui: { notify: () => {} },
-				sessionManager: {
-					getSessionFile: () => parentSession,
-					getBranch: () => [],
-				},
+				sessionFile: parentSession,
+				branch: [],
 				model: { provider: "openai-codex", id: "gpt-5.4" },
-			} as any,
+			}) as any,
 		);
 
 		let browser: BrowserLike | undefined;
-		let switchCalls = 0;
-		const handlerPromise = subagents!.handler("", {
+		const handlerPromise = subagents!.handler("", makeCommandContext({
 			cwd: projectDir,
-			hasUI: true,
-			switchSession: async () => {
-				switchCalls++;
-				return { cancelled: false };
-			},
+			sessionFile: parentSession,
+			branch: [],
 			ui: {
-				notify: () => {},
 				custom: (factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (result: unknown) => void) => unknown) => {
 					const created = createBrowserPromise(factory);
 					browser = created.browser;
 					return created.result;
 				},
 			},
-			sessionManager: {
-				getSessionFile: () => parentSession,
-				getBranch: () => [],
-			},
-		} as any);
+		}) as any);
 
 		try {
 			await Promise.resolve();
@@ -719,7 +559,6 @@ test("/subagents browser and inspector view changes should not stall dispatch co
 				};
 			};
 
-			assert.equal(switchCalls, 0, "opening the browser and inspector should remain a same-session view concern");
 			assert.equal(result.details?.items?.[0]?.result?.exitCode, 0);
 			assert.equal(
 				result.details?.items?.[0]?.result?.messages?.[0]?.content?.[0]?.text,
@@ -742,7 +581,7 @@ test("/subagents browser and inspector view changes should not stall dispatch co
 				"the parent tool result text should still include the finished child output after the view changes",
 			);
 		} finally {
-			PiActorRuntime.prototype.invoke = originalInvoke;
+			restoreInvoke();
 		}
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });

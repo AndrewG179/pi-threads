@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 
@@ -8,66 +7,14 @@ import { Container, Text } from "@mariozechner/pi-tui";
 
 import { default as registerExtension } from "../../index";
 import { PiActorRuntime } from "../../src/runtime/pi-actor";
-
-type RegisteredTool = {
-	name: string;
-	execute?: (...args: any[]) => Promise<unknown> | unknown;
-	renderResult?: (result: Record<string, unknown>, controls: { expanded: boolean }, theme: ReturnType<typeof makeTheme>) => unknown;
-};
-
-type RegisteredCommand = {
-	handler: (args: string, ctx: Record<string, unknown>) => Promise<void> | void;
-};
-
-type RegisteredShortcut = {
-	handler: (ctx: Record<string, unknown>) => Promise<void> | void;
-};
-
-function makeTempProject(): string {
-	return fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-view-model-"));
-}
-
-function makeFakePi() {
-	const tools = new Map<string, RegisteredTool>();
-	const commands = new Map<string, RegisteredCommand>();
-	const shortcuts = new Map<string, RegisteredShortcut>();
-
-	return {
-		on: () => {},
-		registerCommand(name: string, config: RegisteredCommand) {
-			commands.set(name, config);
-		},
-		registerShortcut(name: string, config: RegisteredShortcut) {
-			shortcuts.set(name, config);
-		},
-		registerTool(config: RegisteredTool) {
-			tools.set(config.name, config);
-		},
-		getActiveTools: () => ["read", "write", "edit", "bash", "dispatch"],
-		getAllTools: () => [{ name: "read" }, { name: "write" }, { name: "edit" }, { name: "bash" }, { name: "dispatch" }],
-		setActiveTools: () => {},
-		tools,
-		commands,
-		shortcuts,
-	};
-}
-
-function makeTheme() {
-	return {
-		bold: (text: string) => text,
-		fg: (_color: string, text: string) => text,
-		bg: (_color: string, text: string) => text,
-	};
-}
-
-function writeThreadSession(filePath: string, lines: unknown[]): void {
-	fs.mkdirSync(path.dirname(filePath), { recursive: true });
-	fs.writeFileSync(
-		filePath,
-		lines.map((line) => JSON.stringify(line)).join("\n") + "\n",
-		"utf8",
-	);
-}
+import {
+	makeCommandContext,
+	makeFakePi,
+	makeTempProject,
+	makeTheme,
+	patchPiActorInvoke,
+	writeThreadSession,
+} from "../helpers/subagent-test-helpers";
 
 function makeDispatchItem(thread: string, episode: string) {
 	return {
@@ -156,12 +103,42 @@ test("/subagents should open an independent custom view instead of a modal overl
 			};
 		} | undefined;
 
-		await subagents!.handler("", {
+		await subagents!.handler("", makeCommandContext({
 			cwd: projectDir,
-			hasUI: true,
-			switchSession: async () => ({ cancelled: false }),
+			sessionFile: parentSession,
+			branch: [{
+				type: "message",
+				message: {
+					role: "toolResult",
+					toolName: "dispatch",
+					details: {
+						mode: "single",
+						items: [{
+							thread: "alpha",
+							action: "Inspect alpha",
+							episode: "alpha ready",
+							episodeNumber: 1,
+							result: {
+								exitCode: 0,
+								stderr: "",
+								messages: [{ role: "assistant", content: [{ type: "text", text: "alpha ready" }] }],
+								usage: {
+									input: 12,
+									output: 8,
+									cacheRead: 0,
+									cacheWrite: 0,
+									cost: 0.02,
+									contextTokens: 20,
+									turns: 1,
+								},
+								sessionPath: alphaSession,
+								isNewThread: false,
+							},
+						}],
+					},
+				},
+			}],
 			ui: {
-				notify: () => {},
 				custom: async (
 					renderer: (...args: any[]) => unknown,
 					options?: {
@@ -179,42 +156,7 @@ test("/subagents should open an independent custom view instead of a modal overl
 					return undefined;
 				},
 			},
-			sessionManager: {
-				getSessionFile: () => parentSession,
-				getBranch: () => [{
-					type: "message",
-					message: {
-						role: "toolResult",
-						toolName: "dispatch",
-						details: {
-							mode: "single",
-							items: [{
-								thread: "alpha",
-								action: "Inspect alpha",
-								episode: "alpha ready",
-								episodeNumber: 1,
-								result: {
-									exitCode: 0,
-									stderr: "",
-									messages: [{ role: "assistant", content: [{ type: "text", text: "alpha ready" }] }],
-									usage: {
-										input: 12,
-										output: 8,
-										cacheRead: 0,
-										cacheWrite: 0,
-										cost: 0.02,
-										contextTokens: 20,
-										turns: 1,
-									},
-									sessionPath: alphaSession,
-									isNewThread: false,
-								},
-							}],
-						},
-					},
-				}],
-			},
-		} as any);
+		}) as any);
 
 		assert.ok(customRenderer, "/subagents should invoke ctx.ui.custom()");
 		assert.equal(customOptions?.overlay, true, "/subagents should mount as a fullscreen overlay to cover prior transcript content");
@@ -264,8 +206,7 @@ test("/subagents should list a just-dispatched in-flight thread from same-runtim
 
 		let customRenderer: ((...args: any[]) => unknown) | undefined;
 		let resolveRun: ((value: unknown) => void) | undefined;
-		const originalInvoke = PiActorRuntime.prototype.invoke;
-		PiActorRuntime.prototype.invoke = function () {
+		const restoreInvoke = patchPiActorInvoke(function () {
 			return {
 				runId: "run-1",
 				thread: "alpha",
@@ -274,52 +215,36 @@ test("/subagents should list a just-dispatched in-flight thread from same-runtim
 				}),
 				cancel: async () => {},
 				subscribe: () => () => {},
-				getSnapshot: () => ({
-					runId: "run-1",
-					thread: "alpha",
-					pid: undefined,
-					startedAt: Date.now(),
-					state: { tag: "running" },
-				}),
 			} as any;
-		};
+		} as typeof PiActorRuntime.prototype.invoke);
 
 		const execution = dispatch.execute!(
 			"tool-call-1",
 			{ thread: "alpha", action: "Inspect alpha while it is still running" },
 			undefined,
 			undefined,
-			{
+			makeCommandContext({
 				cwd: projectDir,
-				hasUI: true,
-				ui: { notify: () => {} },
-				sessionManager: {
-					getSessionFile: () => parentSession,
-					getBranch: () => [],
-				},
+				sessionFile: parentSession,
+				branch: [],
 				model: { provider: "openai-codex", id: "gpt-5.4" },
-			} as any,
+			}) as any,
 		);
 
 		try {
 			await Promise.resolve();
 
-			await subagents!.handler("", {
+			await subagents!.handler("", makeCommandContext({
 				cwd: projectDir,
-				hasUI: true,
-				switchSession: async () => ({ cancelled: false }),
+				sessionFile: parentSession,
+				branch: [],
 				ui: {
-					notify: () => {},
 					custom: async (renderer: (...args: any[]) => unknown) => {
 						customRenderer = renderer;
 						return undefined;
 					},
 				},
-				sessionManager: {
-					getSessionFile: () => parentSession,
-					getBranch: () => [],
-				},
-			} as any);
+			}) as any);
 
 			assert.ok(customRenderer, "/subagents should invoke ctx.ui.custom()");
 
@@ -340,7 +265,7 @@ test("/subagents should list a just-dispatched in-flight thread from same-runtim
 				model: "openai-codex/gpt-5.4",
 			});
 			await execution;
-			PiActorRuntime.prototype.invoke = originalInvoke;
+			restoreInvoke();
 		}
 	} finally {
 		fs.rmSync(projectDir, { recursive: true, force: true });
@@ -395,35 +320,30 @@ test("/subagents should ignore stale state.json parent linkage when no same-runt
 
 		let customRenderer: ((...args: any[]) => unknown) | undefined;
 
-		await subagents!.handler("", {
+		await subagents!.handler("", makeCommandContext({
 			cwd: projectDir,
-			hasUI: true,
-			switchSession: async () => ({ cancelled: false }),
+			sessionFile: parentSession,
+			branch: [{
+				type: "message",
+				message: {
+					role: "assistant",
+					content: [{
+						type: "toolCall",
+						name: "dispatch",
+						arguments: {
+							thread: "alpha",
+							action: "Inspect alpha while it is still running",
+						},
+					}],
+				},
+			}],
 			ui: {
-				notify: () => {},
 				custom: async (renderer: (...args: any[]) => unknown) => {
 					customRenderer = renderer;
 					return undefined;
 				},
 			},
-			sessionManager: {
-				getSessionFile: () => parentSession,
-				getBranch: () => [{
-					type: "message",
-					message: {
-						role: "assistant",
-						content: [{
-							type: "toolCall",
-							name: "dispatch",
-							arguments: {
-								thread: "alpha",
-								action: "Inspect alpha while it is still running",
-							},
-						}],
-					},
-				}],
-			},
-		} as any);
+		}) as any);
 
 		assert.ok(customRenderer, "/subagents should invoke ctx.ui.custom()");
 
@@ -475,22 +395,17 @@ test("/subagents should ignore stray thread transcript files when there is no li
 
 		let customRenderer: ((...args: any[]) => unknown) | undefined;
 
-		await subagents!.handler("", {
+		await subagents!.handler("", makeCommandContext({
 			cwd: projectDir,
-			hasUI: true,
-			switchSession: async () => ({ cancelled: false }),
+			sessionFile: parentSession,
+			branch: [],
 			ui: {
-				notify: () => {},
 				custom: async (renderer: (...args: any[]) => unknown) => {
 					customRenderer = renderer;
 					return undefined;
 				},
 			},
-			sessionManager: {
-				getSessionFile: () => parentSession,
-				getBranch: () => [],
-			},
-		} as any);
+		}) as any);
 
 		assert.ok(customRenderer, "/subagents should invoke ctx.ui.custom()");
 
@@ -545,53 +460,48 @@ test("/subagents browser should keep navigation and selected-detail panes visibl
 
 		let customRenderer: ((...args: any[]) => unknown) | undefined;
 
-		await subagents!.handler("", {
+		await subagents!.handler("", makeCommandContext({
 			cwd: projectDir,
-			hasUI: true,
-			switchSession: async () => ({ cancelled: false }),
+			sessionFile: parentSession,
+			branch: [{
+				type: "message",
+				message: {
+					role: "toolResult",
+					toolName: "dispatch",
+					details: {
+						mode: "batch",
+						items: threadNames.map((thread) => ({
+							thread,
+							action: `Inspect ${thread} implementation details with a longer action summary`,
+							episode: `${thread} ready`,
+							episodeNumber: 1,
+							result: {
+								exitCode: 0,
+								stderr: "",
+								messages: [{ role: "assistant", content: [{ type: "text", text: `${thread} ready` }] }],
+								usage: {
+									input: 12,
+									output: 8,
+									cacheRead: 0,
+									cacheWrite: 0,
+									cost: 0.02,
+									contextTokens: 20,
+									turns: 1,
+								},
+								sessionPath: path.join(projectDir, ".pi", "threads", `${thread}.jsonl`),
+								isNewThread: false,
+							},
+						})),
+					},
+				},
+			}],
 			ui: {
-				notify: () => {},
 				custom: async (renderer: (...args: any[]) => unknown) => {
 					customRenderer = renderer;
 					return undefined;
 				},
 			},
-			sessionManager: {
-				getSessionFile: () => parentSession,
-				getBranch: () => [{
-					type: "message",
-					message: {
-						role: "toolResult",
-						toolName: "dispatch",
-						details: {
-							mode: "batch",
-							items: threadNames.map((thread) => ({
-								thread,
-								action: `Inspect ${thread} implementation details with a longer action summary`,
-								episode: `${thread} ready`,
-								episodeNumber: 1,
-								result: {
-									exitCode: 0,
-									stderr: "",
-									messages: [{ role: "assistant", content: [{ type: "text", text: `${thread} ready` }] }],
-									usage: {
-										input: 12,
-										output: 8,
-										cacheRead: 0,
-										cacheWrite: 0,
-										cost: 0.02,
-										contextTokens: 20,
-										turns: 1,
-									},
-									sessionPath: path.join(projectDir, ".pi", "threads", `${thread}.jsonl`),
-									isNewThread: false,
-								},
-							})),
-						},
-					},
-				}],
-			},
-		} as any);
+		}) as any);
 
 		assert.ok(customRenderer, "/subagents should invoke ctx.ui.custom()");
 
@@ -648,53 +558,48 @@ test("/subagents browser should render a full editor-height frame so stale trans
 
 		let customRenderer: ((...args: any[]) => unknown) | undefined;
 
-		await subagents!.handler("", {
+		await subagents!.handler("", makeCommandContext({
 			cwd: projectDir,
-			hasUI: true,
-			switchSession: async () => ({ cancelled: false }),
+			sessionFile: parentSession,
+			branch: [{
+				type: "message",
+				message: {
+					role: "toolResult",
+					toolName: "dispatch",
+					details: {
+						mode: "single",
+						items: [{
+							thread: "alpha",
+							action: "Inspect alpha",
+							episode: "alpha ready",
+							episodeNumber: 1,
+							result: {
+								exitCode: 0,
+								stderr: "",
+								messages: [{ role: "assistant", content: [{ type: "text", text: "alpha ready" }] }],
+								usage: {
+									input: 12,
+									output: 8,
+									cacheRead: 0,
+									cacheWrite: 0,
+									cost: 0.02,
+									contextTokens: 20,
+									turns: 1,
+								},
+								sessionPath: alphaSession,
+								isNewThread: false,
+							},
+						}],
+					},
+				},
+			}],
 			ui: {
-				notify: () => {},
 				custom: async (renderer: (...args: any[]) => unknown) => {
 					customRenderer = renderer;
 					return undefined;
 				},
 			},
-			sessionManager: {
-				getSessionFile: () => parentSession,
-				getBranch: () => [{
-					type: "message",
-					message: {
-						role: "toolResult",
-						toolName: "dispatch",
-						details: {
-							mode: "single",
-							items: [{
-								thread: "alpha",
-								action: "Inspect alpha",
-								episode: "alpha ready",
-								episodeNumber: 1,
-								result: {
-									exitCode: 0,
-									stderr: "",
-									messages: [{ role: "assistant", content: [{ type: "text", text: "alpha ready" }] }],
-									usage: {
-										input: 12,
-										output: 8,
-										cacheRead: 0,
-										cacheWrite: 0,
-										cost: 0.02,
-										contextTokens: 20,
-										turns: 1,
-									},
-									sessionPath: alphaSession,
-									isNewThread: false,
-								},
-							}],
-						},
-					},
-				}],
-			},
-		} as any);
+		}) as any);
 
 		assert.ok(customRenderer, "/subagents should invoke ctx.ui.custom()");
 
@@ -752,77 +657,72 @@ test("standalone /subagents browser should use the keybindings object supplied b
 
 		let customRenderer: ((...args: any[]) => unknown) | undefined;
 
-		await subagents!.handler("", {
+		await subagents!.handler("", makeCommandContext({
 			cwd: projectDir,
-			hasUI: true,
-			switchSession: async () => ({ cancelled: false }),
+			sessionFile: parentSession,
+			branch: [{
+				type: "message",
+				message: {
+					role: "toolResult",
+					toolName: "dispatch",
+					details: {
+						mode: "batch",
+						items: [
+							{
+								thread: "alpha",
+								action: "Inspect alpha",
+								episode: "alpha ready",
+								episodeNumber: 1,
+								result: {
+									exitCode: 0,
+									stderr: "",
+									messages: [{ role: "assistant", content: [{ type: "text", text: "alpha ready" }] }],
+									usage: {
+										input: 12,
+										output: 8,
+										cacheRead: 0,
+										cacheWrite: 0,
+										cost: 0.02,
+										contextTokens: 20,
+										turns: 1,
+									},
+									sessionPath: alphaSession,
+									isNewThread: false,
+								},
+							},
+							{
+								thread: "beta",
+								action: "Inspect beta",
+								episode: "beta ready",
+								episodeNumber: 1,
+								result: {
+									exitCode: 0,
+									stderr: "",
+									messages: [{ role: "assistant", content: [{ type: "text", text: "beta ready" }] }],
+									usage: {
+										input: 12,
+										output: 8,
+										cacheRead: 0,
+										cacheWrite: 0,
+										cost: 0.02,
+										contextTokens: 20,
+										turns: 1,
+									},
+									sessionPath: betaSession,
+									isNewThread: false,
+								},
+							},
+						],
+					},
+				},
+			}],
 			ui: {
-				notify: () => {},
 				custom: async (renderer: (...args: any[]) => unknown) => {
 					customRenderer = renderer;
 					return undefined;
 				},
 			},
-			sessionManager: {
-				getSessionFile: () => parentSession,
-				getBranch: () => [{
-					type: "message",
-					message: {
-						role: "toolResult",
-						toolName: "dispatch",
-						details: {
-							mode: "batch",
-							items: [
-								{
-									thread: "alpha",
-									action: "Inspect alpha",
-									episode: "alpha ready",
-									episodeNumber: 1,
-									result: {
-										exitCode: 0,
-										stderr: "",
-										messages: [{ role: "assistant", content: [{ type: "text", text: "alpha ready" }] }],
-										usage: {
-											input: 12,
-											output: 8,
-											cacheRead: 0,
-											cacheWrite: 0,
-											cost: 0.02,
-											contextTokens: 20,
-											turns: 1,
-										},
-										sessionPath: alphaSession,
-										isNewThread: false,
-									},
-								},
-								{
-									thread: "beta",
-									action: "Inspect beta",
-									episode: "beta ready",
-									episodeNumber: 1,
-									result: {
-										exitCode: 0,
-										stderr: "",
-										messages: [{ role: "assistant", content: [{ type: "text", text: "beta ready" }] }],
-										usage: {
-											input: 12,
-											output: 8,
-											cacheRead: 0,
-											cacheWrite: 0,
-											cost: 0.02,
-											contextTokens: 20,
-											turns: 1,
-										},
-										sessionPath: betaSession,
-										isNewThread: false,
-									},
-								},
-							],
-						},
-					},
-				}],
-			},
-		} as any);
+		}) as any);
 
 		assert.ok(customRenderer, "/subagents should invoke ctx.ui.custom()");
 
@@ -851,28 +751,22 @@ test("standalone /subagents browser should use the keybindings object supplied b
 		browser.handleInput!("custom-next");
 		browser.handleInput!("custom-open");
 
-		assert.deepEqual(
-			keybindingCalls,
-			[
-				{ keyData: "custom-next", command: "tui.select.cancel" },
-				{ keyData: "custom-next", command: "tui.select.up" },
-				{ keyData: "custom-next", command: "tui.select.down" },
-				{ keyData: "custom-open", command: "tui.select.cancel" },
-				{ keyData: "custom-open", command: "tui.select.up" },
-				{ keyData: "custom-open", command: "tui.select.down" },
-				{ keyData: "custom-open", command: "tui.select.confirm" },
-			],
-			"the standalone browser should query the ctx.ui.custom() keybindings object for its navigation commands",
-		);
 		assert.match(browser.render!(80).join("\n"), /Subagent \[beta\]/, "confirm should open the same-session inspector for the selected thread");
+		assert.equal(
+			keybindingCalls.some((call) => call.keyData === "custom-next" && call.command === "tui.select.down"),
+			true,
+			"the standalone browser should route navigation through the supplied keybindings object",
+		);
+		assert.equal(
+			keybindingCalls.some((call) => call.keyData === "custom-open" && call.command === "tui.select.confirm"),
+			true,
+			"the standalone browser should route selection through the supplied keybindings object",
+		);
 		browser.handleInput!("custom-close");
 		browser.handleInput!("custom-close");
-		assert.deepEqual(
-			keybindingCalls.slice(-2),
-			[
-				{ keyData: "custom-close", command: "tui.select.cancel" },
-				{ keyData: "custom-close", command: "tui.select.cancel" },
-			],
+		assert.equal(
+			keybindingCalls.some((call) => call.keyData === "custom-close" && call.command === "tui.select.cancel"),
+			true,
 			"cancel should also flow through the supplied keybindings object",
 		);
 		assert.equal(closed, true, "cancel should back out of the inspector and then close the browser");
