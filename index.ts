@@ -224,7 +224,12 @@ function formatUsage(usage: UsageStats, model?: string): string {
 
 // ─── Rendering Helpers ───
 
-function summarizeDispatchItem(item: SingleDispatchResult, theme: any): string {
+function wrapDispatchSummaryText(text: string, width: number): string[] {
+	const safeWidth = Math.max(1, width);
+	return wrapText(text, safeWidth, { minWidth: 1 }).map((line) => truncateToWidth(line, safeWidth));
+}
+
+function renderDispatchItemSummary(item: SingleDispatchResult, theme: any, width: number): string[] {
 	const { result } = item;
 	const isRunning = !item.episode || item.episode === "(running...)";
 	const isError = !isRunning && (result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted");
@@ -243,16 +248,34 @@ function summarizeDispatchItem(item: SingleDispatchResult, theme: any): string {
 	const lines = [headerParts.join(" ")];
 	const summaryText = isRunning ? item.action : item.episode;
 	if (summaryText) {
-		lines.push(summaryText);
+		lines.push(...wrapDispatchSummaryText(summaryText, width));
 	}
 	if (isError && result.errorMessage) {
-		lines.push(theme.fg("error", result.errorMessage));
+		lines.push(...wrapDispatchSummaryText(result.errorMessage, width).map((line) => theme.fg("error", line)));
 	}
 	const usage = formatUsage(result.usage);
 	if (usage) {
 		lines.push(theme.fg("dim", usage));
 	}
-	return lines.join("\n");
+	return lines;
+}
+
+class DispatchSummaryText extends Text {
+	constructor(
+		private readonly items: SingleDispatchResult[],
+		private readonly theme: any,
+	) {
+		super("", 0, 0);
+	}
+
+	render(width: number): string[] {
+		const lines: string[] = [];
+		for (const [index, item] of this.items.entries()) {
+			if (index > 0) lines.push("");
+			lines.push(...renderDispatchItemSummary(item, this.theme, width));
+		}
+		return lines.length > 0 ? lines : [""];
+	}
 }
 
 // ─── Extension ───
@@ -1028,7 +1051,7 @@ export default function (pi: ExtensionAPI) {
 				return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
 			}
 
-			return new Text(details.items.map((item) => summarizeDispatchItem(item, theme)).join("\n\n"), 0, 0);
+			return new DispatchSummaryText(details.items, theme);
 		},
 	});
 }
