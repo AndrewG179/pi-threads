@@ -7,6 +7,7 @@ import test from "node:test";
 import { Container, Text } from "@mariozechner/pi-tui";
 
 import { default as registerExtension } from "../../index";
+import { visibleWidth } from "../../src/pi/runtime-deps";
 import { PiActorRuntime } from "../../src/runtime/pi-actor";
 import {
 	makeCommandContext,
@@ -916,4 +917,63 @@ test("collapsed batch dispatch chat rendering should not append the inline Ctrl+
 		/\(Ctrl\+O to expand\)/,
 		"batch chat rendering should not expose the inline Ctrl+O expansion path",
 	);
+});
+
+test("dispatch result rendering should not leave embedded newlines inside width-checked rows", () => {
+	const fakePi = makeFakePi();
+	registerExtension(fakePi as any);
+
+	const dispatch = fakePi.tools.get("dispatch");
+	assert.ok(dispatch?.renderResult, "dispatch tool should expose renderResult");
+
+	const component = dispatch!.renderResult!(
+		{
+			content: [{ type: "text", text: "[l] (running...)" }],
+			details: {
+				mode: "single",
+				items: [{
+					thread: "l",
+					action: "sleep 8;echo Z",
+					episode: "(running...)",
+					episodeNumber: 1,
+					result: {
+						thread: "l",
+						action: "sleep 8;echo Z",
+						exitCode: 0,
+						messages: [],
+						stderr: "",
+						usage: {
+							input: 2200,
+							output: 118,
+							cacheRead: 0,
+							cacheWrite: 0,
+							cost: 0.0055,
+							contextTokens: 2300,
+							turns: 1,
+						},
+						model: "openai-codex/gpt-5.3-codex",
+						sessionPath: "/tmp/l.jsonl",
+						isNewThread: true,
+					},
+				}],
+			},
+		},
+		{ expanded: false },
+		makeTheme(),
+	);
+
+	const renderedLines = flattenRenderedLines(component, 80);
+	assert.ok(renderedLines.length > 0, "dispatch renderResult should emit at least one rendered row");
+	for (const line of renderedLines) {
+		assert.equal(
+			line.includes("\n"),
+			false,
+			"dispatch renderResult should split multiline summaries before the host width-checks them",
+		);
+		assert.equal(
+			visibleWidth(line) <= 80,
+			true,
+			`dispatch renderResult should keep each rendered row within the terminal width; got ${visibleWidth(line)} for ${JSON.stringify(line)}`,
+		);
+	}
 });

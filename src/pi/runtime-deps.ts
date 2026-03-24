@@ -98,7 +98,12 @@ class CompatibleText extends TextBase implements MutableTextInstance {
 
 	render(width: number): string[] {
 		(this as TextInstance & { text?: string }).text = this.currentText;
-		return super.render(width);
+		const rendered = super.render(width);
+
+		// The installed pi-tui Text can return one string that still contains embedded
+		// newlines. Normalize here so host width checks operate on logical terminal rows.
+		const normalized = rendered.flatMap((line) => line.split("\n"));
+		return normalized.length > 0 ? normalized : [""];
 	}
 }
 
