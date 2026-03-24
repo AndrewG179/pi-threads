@@ -62,19 +62,28 @@ You are a **strategic orchestrator**. You think, plan, and decide. You never exe
 8. **Shape the episode with your action.** The more specific your instructions, the more useful the episode. If you need specific information back, say so in the action (e.g., "...and list each endpoint with its HTTP method and handler function name").
 9. **Never ask for raw dumps.** The thread's response comes back into YOUR context. Never ask a thread to "show me the complete contents" of a file or "paste the full output." Instead, ask for what you actually need: "Read X and summarize its structure", "Read X and list the key sections", "Run Y and tell me if it passed or what the error was." Your context is precious — don't fill it with raw file contents or unfiltered command output.
 
+## Thinking Levels
+- Each dispatch can set a thinking level: off, minimal, low, medium, high, xhigh
+- Use "off" for simple reads, file listings, running commands, grep searches
+- Use "minimal" or "low" for straightforward edits, simple fixes
+- Use "medium" for bug fixes, moderate changes, debugging
+- Use "high" for complex implementations, architecture changes, multi-file refactors
+- Use "xhigh" for the hardest problems (only works on Opus 4.6 / GPT-5.x, clamped to high on other models)
+- If not specified, uses the global subagent thinking level
+
 ## Dispatch Examples
 
-Good — asks for specific information:
-- \`dispatch(thread: "backend", action: "Read src/api/routes.ts and list every route with its HTTP method, path, and handler function name")\`
-- \`dispatch(thread: "debug", action: "Run pytest -x and tell me if it passes. If it fails, show the first failure's test name, assertion, and traceback")\`
-- \`dispatch(thread: "infra", action: "Check if nginx is running on 10.0.1.50, and show the upstream config block for the API service")\`
+Good — with appropriate thinking levels:
+- \`dispatch(thread: "backend", action: "Read src/api/routes.ts and list every route with its HTTP method, path, and handler function name", thinking: "off")\`
+- \`dispatch(thread: "debug", action: "Run pytest -x and tell me if it passes. If it fails, show the first failure's test name, assertion, and traceback", thinking: "off")\`
+- \`dispatch(thread: "worker", action: "Implement JWT refresh token rotation with secure cookie storage", thinking: "high")\`
 
 Bad — dumps raw content into your context:
 - ~~\`dispatch(thread: "x", action: "Show me the complete contents of README.md")\`~~
 - ~~\`dispatch(thread: "x", action: "Run find . -type f and paste the output")\`~~
 
-Batch (parallel, shown side by side in groups of 3):
-- \`dispatch(tasks: [{thread: "auth", action: "Read auth middleware and list exported functions with signatures"}, {thread: "tests", action: "Run the test suite and report pass/fail counts"}, {thread: "docs", action: "Check if API docs exist and list what endpoints are documented"}])\`
+Batch (parallel, with mixed thinking levels):
+- \`dispatch(tasks: [{thread: "scout", action: "Find all auth-related files and list them", thinking: "off"}, {thread: "worker", action: "Refactor auth middleware to use RBAC pattern", thinking: "high"}, {thread: "tests", action: "Run the test suite and report pass/fail counts", thinking: "off"}])\`
 `;
 
 // ─── Types ───
@@ -291,6 +300,7 @@ async function runPiOnThread(
 	sessionPath: string,
 	message: string,
 	model: string | undefined,
+	thinking: string | undefined,
 	systemPromptFile: string | undefined,
 	signal: AbortSignal | undefined,
 	onMessage?: (msg: Message) => void,
@@ -299,6 +309,9 @@ async function runPiOnThread(
 	args.push("--session", sessionPath);
 	if (model) {
 		args.push("--model", model);
+	}
+	if (thinking) {
+		args.push("--thinking", thinking);
 	}
 	if (systemPromptFile) args.push("--append-system-prompt", systemPromptFile);
 	args.push(message);
@@ -376,6 +389,7 @@ async function runThreadAction(
 	threadName: string,
 	action: string,
 	model: string | undefined,
+	thinking: string | undefined,
 	signal: AbortSignal | undefined,
 	onUpdate: ((partial: AgentToolResult<DispatchDetails>) => void) | undefined,
 	episodeNumber: number,
@@ -444,6 +458,7 @@ async function runThreadAction(
 			sessionPath,
 			action,
 			model,
+			thinking,
 			promptTmp.filePath,
 			signal,
 			(msg) => {
@@ -612,6 +627,7 @@ export default function (pi: ExtensionAPI) {
 	const episodeCounts = new Map<string, number>();
 	const threadStats = new Map<string, ThreadStats>();
 	let subagentModel = "anthropic/claude-sonnet-4-6";
+	let subagentThinking: string | undefined = undefined;
 
 	pi.registerCommand("model-sub", {
 		description: "Set the subagent model for thread workers",
@@ -813,6 +829,37 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("thinking-sub", {
+		description: "Set the default thinking level for thread workers",
+		handler: async (args, ctx) => {
+			const input = args.trim().toLowerCase();
+			const levels = ["off", "minimal", "low", "medium", "high", "xhigh"];
+
+			if (!input) {
+				ctx.ui.notify(`🧠 Subagent thinking: ${subagentThinking || "(pi default)"}. Usage: /thinking-sub ${levels.join("|")}|reset`, "info");
+				return;
+			}
+
+			if (input === "reset" || input === "default") {
+				subagentThinking = undefined;
+				ctx.ui.notify("🧠 Subagent thinking reset to pi default", "info");
+				const thinkingLabel = subagentThinking || "default";
+				ctx.ui.setStatus("subagent-model", `\x1b[${(process.stdout.columns ?? 120) - `sub: ${subagentModel} | thinking: ${thinkingLabel}`.length + 1}G\x1b[2msub: ${subagentModel} | thinking: ${thinkingLabel}\x1b[0m`);
+				return;
+			}
+
+			if (!levels.includes(input)) {
+				ctx.ui.notify(`Invalid level. Use: ${levels.join(", ")} or "reset"`, "warn");
+				return;
+			}
+
+			subagentThinking = input;
+			ctx.ui.notify(`🧠 Subagent thinking set to: ${input}`, "info");
+			const thinkingLabel = subagentThinking || "default";
+			ctx.ui.setStatus("subagent-model", `\x1b[${(process.stdout.columns ?? 120) - `sub: ${subagentModel} | thinking: ${thinkingLabel}`.length + 1}G\x1b[2msub: ${subagentModel} | thinking: ${thinkingLabel}\x1b[0m`);
+		},
+	});
+
 	// Reconstruct state on session load
 	pi.on("session_start", async (_event, ctx) => {
 		episodeCounts.clear();
@@ -840,7 +887,8 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		ctx.ui.notify("🧵 Thread orchestrator active", "info");
-		ctx.ui.setStatus("subagent-model", `\x1b[${(process.stdout.columns ?? 120) - `sub: ${subagentModel}`.length + 1}G\x1b[2msub: ${subagentModel}\x1b[0m`);
+		const thinkingLabel = subagentThinking || "default";
+		ctx.ui.setStatus("subagent-model", `\x1b[${(process.stdout.columns ?? 120) - `sub: ${subagentModel} | thinking: ${thinkingLabel}`.length + 1}G\x1b[2msub: ${subagentModel} | thinking: ${thinkingLabel}\x1b[0m`);
 	});
 
 	// Inject orchestrator system prompt
@@ -861,6 +909,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		extra += `\n## Current Subagent Model\n${subagentModel}\n`;
+		extra += `\n## Current Subagent Thinking\n${subagentThinking || "(pi default from settings)"}\n`;
 
 		return { systemPrompt: event.systemPrompt + extra };
 	});
@@ -886,11 +935,13 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			thread: Type.Optional(Type.String({ description: "Thread name — identifies the work stream. Reuse for related actions. (single mode)" })),
 			action: Type.Optional(Type.String({ description: "Direct, concrete instructions for the thread to execute. (single mode)" })),
+			thinking: Type.Optional(Type.String({ description: "Thinking level for this dispatch: off, minimal, low, medium, high, xhigh. Defaults to global subagent thinking level." })),
 			tasks: Type.Optional(
 				Type.Array(
 					Type.Object({
 						thread: Type.String({ description: "Thread name" }),
 						action: Type.String({ description: "Action for this thread" }),
+						thinking: Type.Optional(Type.String({ description: "Thinking level for this task: off, minimal, low, medium, high, xhigh" })),
 					}),
 					{ description: "Batch mode: thread actions dispatched in parallel." },
 				),
@@ -899,6 +950,7 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const model = subagentModel;
+			const defaultThinking = subagentThinking;
 
 			// Determine mode
 			const hasBatch = params.tasks && params.tasks.length > 0;
@@ -914,7 +966,7 @@ export default function (pi: ExtensionAPI) {
 
 			const taskList = hasBatch
 				? params.tasks!
-				: [{ thread: params.thread!, action: params.action! }];
+				: [{ thread: params.thread!, action: params.action!, thinking: params.thinking }];
 
 			const mode = taskList.length > 1 ? "batch" : "single";
 
@@ -933,7 +985,7 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			// Run all tasks (parallel for batch, single for single)
-			const runOne = async (task: { thread: string; action: string }, index: number): Promise<SingleDispatchResult> => {
+			const runOne = async (task: { thread: string; action: string; thinking?: string }, index: number): Promise<SingleDispatchResult> => {
 				const episodeNumber = (episodeCounts.get(task.thread) || 0) + 1;
 
 				// For single mode, pass onUpdate directly for live streaming
@@ -951,8 +1003,9 @@ export default function (pi: ExtensionAPI) {
 							}
 						: undefined;
 
+				const thinking = task.thinking || defaultThinking;
 				const result = await runThreadAction(
-					ctx.cwd, task.thread, task.action, model, signal,
+					ctx.cwd, task.thread, task.action, model, thinking, signal,
 					taskOnUpdate,
 					episodeNumber,
 				);
