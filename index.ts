@@ -259,6 +259,7 @@ async function runThreadAction(
 	threadName: string,
 	action: string,
 	model: string | undefined,
+	signal: AbortSignal | undefined,
 	onUpdate: ((partial: AgentToolResult<DispatchDetails>) => void) | undefined,
 	episodeNumber: number,
 	runId: string,
@@ -312,9 +313,9 @@ async function runThreadAction(
 		});
 	};
 
-	// Thread work is background execution and must survive view/session switches.
-	// The host tool AbortSignal can fire for session-switch lifecycle reasons, so
-	// it is not a safe ownership boundary for worker lifetime here.
+	// Only real external tool aborts should cancel the worker. The current
+	// /subagents flow is same-session view state and no longer uses session
+	// switches as a control path for in-flight thread work.
 	const handle = piActorRuntime.invoke(
 		{
 			runId,
@@ -326,6 +327,11 @@ async function runThreadAction(
 			systemPrompt: THREAD_WORKER_PROMPT,
 		},
 	);
+	const abort = () => {
+		void handle.cancel();
+	};
+	if (signal?.aborted) abort();
+	else signal?.addEventListener("abort", abort, { once: true });
 
 	const unsubscribe = handle.subscribe((event) => {
 		if (event.type === "message") {
@@ -342,6 +348,7 @@ async function runThreadAction(
 
 	const runtimeResult = await handle.result.finally(() => {
 		unsubscribe();
+		signal?.removeEventListener("abort", abort);
 	});
 
 	result.messages = runtimeResult.messages as Message[];
@@ -350,7 +357,14 @@ async function runThreadAction(
 	result.model = runtimeResult.model ?? result.model;
 	result.stopReason = runtimeResult.stopReason;
 	result.errorMessage = runtimeResult.errorMessage;
-	result.exitCode = runtimeResult.finalState.exitCode ?? (runtimeResult.finalState.signal ? 1 : 0);
+	result.exitCode = runtimeResult.finalState.exitCode
+		?? (
+			runtimeResult.finalState.signal
+			|| runtimeResult.stopReason === "error"
+			|| runtimeResult.stopReason === "aborted"
+				? 1
+				: 0
+		);
 
 	return result;
 }
@@ -372,6 +386,24 @@ function getFinalOutput(messages: Message[]): string {
 function getDispatchFailureSummary(result: Pick<ThreadActionResult, "errorMessage" | "stderr">): string | undefined {
 	const errorText = result.errorMessage?.trim() || result.stderr.trim();
 	return errorText ? `THREAD ERROR:\n${errorText}` : undefined;
+}
+
+function findDuplicateThreads(tasks: Array<{ thread: string }>, threadsDir: string): string[] {
+	const threadsBySessionPath = new Map<string, string[]>();
+	for (const task of tasks) {
+		const sessionPath = getThreadSessionPath(threadsDir, task.thread);
+		const threads = threadsBySessionPath.get(sessionPath);
+		if (threads) {
+			threads.push(task.thread);
+		} else {
+			threadsBySessionPath.set(sessionPath, [task.thread]);
+		}
+	}
+	return [...new Set(
+		[...threadsBySessionPath.values()]
+			.filter((threads) => threads.length > 1)
+			.flat(),
+	)];
 }
 
 // ─── Rendering Helpers ───
@@ -488,9 +520,17 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.setStatus("pi-threads", undefined);
 		}
 
-		ctx.ui.setWidget("pi-threads-subagent-banner", undefined);
 		rebuildEpisodeCounts(ctx.sessionManager);
 		return behavior;
+	};
+
+	const reconcileCompletedSubagentHistory = (
+		parentSessionFile: string | undefined,
+		cwd: string,
+		parentBranchEntries: Array<{ type: string; message: { role: string; toolName?: string; details?: unknown } }>,
+	) => {
+		if (!parentSessionFile) return;
+		subagentRunStore.seedCompletedFromParent(parentSessionFile, cwd, parentBranchEntries);
 	};
 
 	const openSubagentsBrowser = async (ctx: {
@@ -518,13 +558,11 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify("Current session is not persisted, so /subagents has no session-scoped run store yet.", "warning");
 			return;
 		}
+		reconcileCompletedSubagentHistory(sessionFile, ctx.cwd, ctx.sessionManager.getBranch());
 
 		await ctx.ui.custom<void | undefined>(
 			(tui, theme, keybindings, done) =>
-				new SubagentBrowser(() => {
-					subagentRunStore.seedCompletedFromParent(sessionFile, ctx.cwd, ctx.sessionManager.getBranch());
-					return subagentRunStore.getCards(sessionFile);
-				}, tui, theme, keybindings, done),
+				new SubagentBrowser(() => subagentRunStore.getCards(sessionFile), tui, theme, keybindings, done),
 			{
 				overlay: true,
 				overlayOptions: {
@@ -628,7 +666,7 @@ export default function (pi: ExtensionAPI) {
 			),
 		}),
 
-		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 			const sessionContext = resolveSessionContext(ctx);
 			const parentSessionFile = sessionContext.sessionFile;
@@ -647,11 +685,20 @@ export default function (pi: ExtensionAPI) {
 			}
 			const mode = taskList.length > 1 ? "batch" : "single";
 			const threadsDir = getThreadsDir(ctx.cwd);
+			const duplicateThreads = mode === "batch" ? findDuplicateThreads(taskList, threadsDir) : [];
+			if (duplicateThreads.length > 0) {
+				return {
+					content: [{
+						type: "text",
+						text: `Duplicate worker session targets in one batch are not supported: ${duplicateThreads.join(", ")}. These thread names normalize to the same worker session. Split this into separate dispatches or use different thread names.`,
+					}],
+					details: { mode, items: [] },
+					isError: true,
+				};
+			}
 			const taskSessionPaths = new Map(taskList.map((task) => [task.thread, getThreadSessionPath(threadsDir, task.thread)]));
 			const allItems: (SingleDispatchResult | null)[] = taskList.map(() => null);
-			if (parentSessionFile) {
-				subagentRunStore.seedCompletedFromParent(parentSessionFile, ctx.cwd, ctx.sessionManager.getBranch());
-			}
+			reconcileCompletedSubagentHistory(parentSessionFile, ctx.cwd, ctx.sessionManager.getBranch());
 
 			const emitBatchUpdate = () => {
 				if (!onUpdate) return;
@@ -709,7 +756,7 @@ export default function (pi: ExtensionAPI) {
 				});
 
 				const result = await runThreadAction(
-					ctx.cwd, task.thread, task.action, model,
+					ctx.cwd, task.thread, task.action, model, signal,
 					taskOnUpdate,
 					episodeNumber,
 					runId,

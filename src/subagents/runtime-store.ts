@@ -190,12 +190,13 @@ export class SubagentRunStore {
 				const sessionPath = normalizeSessionPath(item.result?.sessionPath) ?? getThreadSessionPath(threadsDir, item.thread);
 				const record = this.upsert(normalizedParent, item.thread, sessionPath);
 				if (!record) continue;
-
-				record.latestAction = item.action;
-				record.status = toSubagentStatus(item.result);
-
 				const messages = Array.isArray(item.result?.messages) ? item.result.messages : [];
-				if (messages.length > 0) applyMessageSummary(record, messages);
+
+				if (!record.activeRunId) {
+					record.latestAction = item.action;
+					record.status = toSubagentStatus(item.result);
+					if (messages.length > 0) applyMessageSummary(record, messages);
+				}
 
 				const resultKey = getResultKey({
 					thread: item.thread,

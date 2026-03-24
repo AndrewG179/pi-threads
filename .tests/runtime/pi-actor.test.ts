@@ -83,6 +83,19 @@ process.stdout.write(JSON.stringify({
 }) + "\\n");
 `;
 
+const SLOW_WORKER_SCRIPT = `
+setTimeout(() => {
+  process.stdout.write(JSON.stringify({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "done" }]
+    }
+  }) + "\\n");
+  process.exit(0);
+}, 400);
+`;
+
 type SettledResult =
 	| { type: "result"; result: Awaited<ReturnType<PiActorRuntime["invoke"]>["result"]> }
 	| { type: "timeout" };
@@ -325,6 +338,38 @@ test("PiActorRuntime writes system prompts to a temp file for the child and clea
 		assert.equal(typeof captured.systemPromptFile, "string");
 		assert.equal(fs.existsSync(captured.systemPromptFile), false);
 		assert.equal(fs.existsSync(path.dirname(captured.systemPromptFile)), false);
+	} finally {
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("PiActorRuntime cancel() settles early and reports stopReason=aborted", async () => {
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-actor-cancel-"));
+
+	try {
+		const runtime = new PiActorRuntime({
+			command: process.execPath,
+			buildArgs: () => ["-e", SLOW_WORKER_SCRIPT],
+		});
+
+		const handle = runtime.invoke({
+			runId: "cancel-runtime-run",
+			thread: "alpha",
+			cwd: tmpDir,
+			action: "noop",
+		});
+
+		setTimeout(() => {
+			void handle.cancel();
+		}, 50);
+
+		const startedAt = Date.now();
+		const result = await handle.result;
+		const durationMs = Date.now() - startedAt;
+
+		assert.equal(result.stopReason, "aborted");
+		assert.notEqual(result.finalState.exitCode, 0);
+		assert.equal(durationMs < 250, true);
 	} finally {
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 	}

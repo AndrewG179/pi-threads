@@ -53,6 +53,16 @@ function parseWindows(markerFilePath: string): Map<string, RunWindow> {
 	return windows;
 }
 
+async function waitForRunStart(markerFilePath: string, runId: string, timeoutMs = 2_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		const window = parseWindows(markerFilePath).get(runId);
+		if (window && Number.isFinite(window.start)) return;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	assert.fail(`Timed out waiting for ${runId} to start`);
+}
+
 test("PiActorRuntime serializes same-session invocations while allowing different sessions to overlap", async () => {
 	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-actor-runtime-"));
 	const markerFilePath = path.join(tmpDir, "markers.log");
@@ -144,6 +154,48 @@ test("PiActorRuntime allows matching thread names to overlap when they target di
 			overlapEnd > overlapStart,
 			true,
 			`Expected overlap for same thread name across different sessions, got A=[${runA.start},${runA.end}] B=[${runB.start},${runB.end}]`,
+		);
+	} finally {
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("PiActorRuntime should keep same-session serialization after canceling a queued invocation", async () => {
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-actor-runtime-queued-cancel-"));
+	const markerFilePath = path.join(tmpDir, "markers.log");
+	const delayMs = 500;
+
+	const runtime = new PiActorRuntime({
+		command: process.execPath,
+		buildArgs: (request) => ["-e", WINDOW_WORKER_SCRIPT, markerFilePath, request.runId, String(delayMs)],
+	});
+
+	try {
+		const firstHandle = runtime.invoke({ runId: "same-A", thread: "same-thread", cwd: tmpDir, action: "noop" });
+		await waitForRunStart(markerFilePath, "same-A");
+
+		const queuedHandle = runtime.invoke({ runId: "same-B", thread: "same-thread", cwd: tmpDir, action: "noop" });
+		void queuedHandle.cancel();
+		const queuedResult = await queuedHandle.result;
+		assert.equal(queuedResult.stopReason, "aborted");
+
+		const laterHandle = runtime.invoke({ runId: "same-C", thread: "same-thread", cwd: tmpDir, action: "noop" });
+		const [firstResult, laterResult] = await Promise.all([firstHandle.result, laterHandle.result]);
+
+		assert.equal(firstResult.finalState.tag, "exited");
+		assert.equal(laterResult.finalState.tag, "exited");
+
+		const windows = parseWindows(markerFilePath);
+		const firstRun = windows.get("same-A");
+		const laterRun = windows.get("same-C");
+
+		assert.equal(windows.has("same-B"), false, "the canceled queued invocation should never start a child worker");
+		assert.equal(firstRun !== undefined, true);
+		assert.equal(laterRun !== undefined, true);
+		assert.equal(
+			(laterRun as RunWindow).start >= (firstRun as RunWindow).end,
+			true,
+			`Expected queued-cancel serialization to keep same-C behind same-A, got same-A=[${(firstRun as RunWindow).start},${(firstRun as RunWindow).end}] same-C=[${(laterRun as RunWindow).start},${(laterRun as RunWindow).end}]`,
 		);
 	} finally {
 		fs.rmSync(tmpDir, { recursive: true, force: true });

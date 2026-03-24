@@ -229,3 +229,64 @@ test("SubagentRunStore does not double-count finished cost when parent toolResul
 	assert.equal(card.accumulatedCost, 0.75);
 	assert.equal(card.status, "done");
 });
+
+test("SubagentRunStore reseeding completed parent history should not overwrite newer live action, output, or status", () => {
+	const store = new SubagentRunStore();
+	const cwd = "/tmp/runtime-store-reseed-live";
+	const parentSession = path.join(cwd, ".pi", "sessions", "parent.jsonl");
+	const threadSession = path.join(cwd, ".pi", "threads", "alpha.jsonl");
+
+	store.seedCompletedFromParent(parentSession, cwd, [
+		dispatchToolResult([
+			{
+				thread: "alpha",
+				action: "Historical alpha task",
+				episodeNumber: 1,
+				result: {
+					exitCode: 0,
+					messages: [assistantText("historical done")],
+					usage: { cost: 0.5 },
+				},
+			},
+		]),
+	]);
+
+	store.startRun({
+		parentSessionFile: parentSession,
+		runId: "run-2",
+		thread: "alpha",
+		sessionPath: threadSession,
+		action: "Live alpha task",
+	});
+	store.recordMessage({
+		parentSessionFile: parentSession,
+		runId: "run-2",
+		thread: "alpha",
+		message: assistantWithTool("live progress", "echo live"),
+		liveCost: 0.2,
+	});
+
+	store.seedCompletedFromParent(parentSession, cwd, [
+		dispatchToolResult([
+			{
+				thread: "alpha",
+				action: "Historical alpha task",
+				episodeNumber: 1,
+				result: {
+					exitCode: 0,
+					messages: [assistantText("historical done")],
+					usage: { cost: 0.5 },
+				},
+			},
+		]),
+	]);
+
+	const card = store.getCards(parentSession)[0];
+
+	assert.equal(card.latestAction, "Live alpha task");
+	assert.equal(card.outputPreview, "live progress");
+	assert.deepEqual(card.outputTail, ["live progress"]);
+	assert.equal(card.toolPreview, "$ echo live");
+	assert.equal(card.status, "unknown");
+	assert.equal(card.accumulatedCost, 0.7);
+});

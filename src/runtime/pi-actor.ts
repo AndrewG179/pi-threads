@@ -110,6 +110,7 @@ export type PiActorEvent =
 export interface PiActorHandle {
 	readonly result: Promise<PiActorResult>;
 	subscribe(listener: (event: PiActorEvent) => void): () => void;
+	cancel(): void | Promise<void>;
 }
 
 function toNumber(value: unknown): number {
@@ -244,6 +245,34 @@ function createFinalState(exitCode: number | null, signal: NodeJS.Signals | null
 	return { tag: "exited", exitCode, signal };
 }
 
+function createAbortedResult(request: PiActorInvocationRequest): PiActorResult {
+	return {
+		runId: request.runId,
+		thread: request.thread,
+		finalState: createFinalState(1, null),
+		messages: [],
+		stderr: "",
+		usage: { ...EMPTY_PI_ACTOR_USAGE_STATS },
+		model: request.model,
+		stopReason: "aborted",
+	};
+}
+
+function killChild(child: ChildProcess | null): void {
+	if (!child) return;
+	if (child.exitCode !== null || child.signalCode !== null) return;
+	try {
+		child.kill("SIGTERM");
+	} catch {
+		/* ignore kill failures */
+	}
+}
+
+function waitForAbort(signal: AbortSignal): Promise<void> {
+	if (signal.aborted) return Promise.resolve();
+	return new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+}
+
 function wireOutput(
 	child: ChildProcess,
 	onMessage: (message: RuntimeMessage) => void,
@@ -294,8 +323,10 @@ async function runInvocation(params: {
 	command: string;
 	argsBuilder: PiActorArgsBuilder;
 	emit: (event: PiActorEvent) => void;
+	signal: AbortSignal;
+	setChild(child: ChildProcess | null): void;
 }): Promise<PiActorResult> {
-	const { request, command, argsBuilder, emit } = params;
+	const { request, command, argsBuilder, emit, signal, setChild } = params;
 	const messages: RuntimeMessage[] = [];
 	const usage: PiActorUsageStats = { ...EMPTY_PI_ACTOR_USAGE_STATS };
 	let promptFile: PromptFile | null = null;
@@ -305,6 +336,7 @@ async function runInvocation(params: {
 	let errorMessage: string | undefined;
 	let finalExitCode: number | null = null;
 	let finalSignal: NodeJS.Signals | null = null;
+	let cleanupAbortListener = () => {};
 
 	const handleMessage = (message: RuntimeMessage) => {
 		messages.push(message);
@@ -327,6 +359,10 @@ async function runInvocation(params: {
 	};
 
 	try {
+		if (signal.aborted) {
+			return createAbortedResult(request);
+		}
+
 		const sessionPath = resolveSessionPath(request);
 		ensureSessionDirectory(sessionPath);
 		if (request.systemPrompt) promptFile = writePromptFile(request.systemPrompt);
@@ -340,6 +376,7 @@ async function runInvocation(params: {
 			stdio: ["ignore", "pipe", "pipe"],
 			shell: false,
 		});
+		setChild(child);
 
 		const flushStdout = wireOutput(
 			child,
@@ -350,6 +387,14 @@ async function runInvocation(params: {
 			},
 		);
 
+		const onAbort = () => {
+			stopReason = "aborted";
+			killChild(child);
+		};
+		signal.addEventListener("abort", onAbort);
+		cleanupAbortListener = () => signal.removeEventListener("abort", onAbort);
+		if (signal.aborted) onAbort();
+
 		const closePromise = waitForClose(child).then(() => {
 			flushStdout();
 		});
@@ -359,13 +404,24 @@ async function runInvocation(params: {
 		finalSignal = exited.signal;
 		await closePromise;
 
-		if (!stopReason && finalExitCode !== null && finalExitCode !== 0) {
+		if (signal.aborted) {
+			stopReason = "aborted";
+			if (finalExitCode === null && finalSignal === null) finalExitCode = 1;
+		} else if (!stopReason && finalExitCode !== null && finalExitCode !== 0) {
 			stopReason = "error";
 		}
 	} catch (error) {
-		errorMessage = toErrorMessage(error);
-		stopReason = "error";
+		if (signal.aborted) {
+			stopReason = "aborted";
+			finalExitCode ??= 1;
+		} else {
+			errorMessage = toErrorMessage(error);
+			stopReason = "error";
+			finalExitCode ??= 1;
+		}
 	} finally {
+		cleanupAbortListener();
+		setChild(null);
 		cleanupPromptFile(promptFile);
 	}
 
@@ -402,6 +458,8 @@ export class PiActorRuntime {
 
 	invoke(request: PiActorInvocationRequest): PiActorHandle {
 		const listeners = new Set<(event: PiActorEvent) => void>();
+		const controller = new AbortController();
+		let child: ChildProcess | null = null;
 		const emit = (event: PiActorEvent) => {
 			for (const listener of listeners) {
 				try {
@@ -423,19 +481,34 @@ export class PiActorRuntime {
 		this.sessionQueues.set(sessionKey, queueTail);
 
 		const result = (async () => {
-			await previous;
 			try {
+				const gate = await Promise.race([
+					previous.then(() => "ready" as const),
+					waitForAbort(controller.signal).then(() => "aborted" as const),
+				]);
+				if (gate === "aborted") {
+					return createAbortedResult(request);
+				}
+
 				return await runInvocation({
 					request,
 					command: this.command,
 					argsBuilder: this.argsBuilder,
 					emit,
+					signal: controller.signal,
+					setChild(nextChild) {
+						child = nextChild;
+						if (controller.signal.aborted) killChild(child);
+					},
 				});
 			} finally {
+				child = null;
 				releaseTurn();
-				if (this.sessionQueues.get(sessionKey) === queueTail) {
-					this.sessionQueues.delete(sessionKey);
-				}
+				void queueTail.finally(() => {
+					if (this.sessionQueues.get(sessionKey) === queueTail) {
+						this.sessionQueues.delete(sessionKey);
+					}
+				});
 			}
 		})();
 
@@ -444,6 +517,11 @@ export class PiActorRuntime {
 			subscribe(listener: (event: PiActorEvent) => void): () => void {
 				listeners.add(listener);
 				return () => listeners.delete(listener);
+			},
+			cancel(): void {
+				if (controller.signal.aborted) return;
+				controller.abort();
+				killChild(child);
 			},
 		};
 	}
