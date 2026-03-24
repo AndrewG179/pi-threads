@@ -1,0 +1,172 @@
+Code Quality Review
+Date: 2026-03-24 UTC
+
+Assumptions / scope
+- This review is based on reading the current dirty worktree only. I did not edit code, run tests, or live-drive anything in this pass.
+- “Code quality” here means clarity, precision, local reasoning cost, unnecessary volume, and whether the current code expresses the rewritten model cleanly.
+- Claims below are tied to the files and line ranges I read in the current worktree.
+
+Files read
+- index.ts
+- src/runtime/pi-actor.ts
+- src/subagents/metadata.ts
+- src/subagents/mode.ts
+- src/subagents/runtime-store.ts
+- src/subagents/view.ts
+- .tests/runtime/dispatch-summary.test.ts
+- .tests/runtime/pi-actor.test.ts
+- .tests/runtime/thread-supervisor.test.ts
+- .tests/subagents/runtime-simplify-contract.test.ts
+- .tests/subagents/view-model-contract.test.ts
+
+Overall grade
+- C+
+
+Bottom line
+- The branch is architecturally simpler than the pre-rewrite versions, but the code quality still lags the architecture badly.
+- The worst problem is not one catastrophic bug. It is that too much of the implementation still reads like transitional code: huge god-file ownership in `index.ts`, clever promise choreography in `src/runtime/pi-actor.ts`, weak typing at important boundaries, and a test suite that is noisy enough to hide stale concepts instead of flushing them out.
+
+Worst offenders
+- `index.ts`
+- `src/runtime/pi-actor.ts`
+- `.tests/subagents/view-model-contract.test.ts`
+- `.tests/subagents/runtime-simplify-contract.test.ts`
+- `.tests/runtime/dispatch-summary.test.ts`
+
+Real defects / precision failures
+
+1. Worker protocol corruption is silently swallowed instead of being surfaced as an error.
+- Evidence: `src/runtime/pi-actor.ts:276-318`.
+- `wireOutput()` catches JSON parse failures for stdout lines and does nothing. It also ignores trailing non-JSON on flush.
+- In a system started with `--mode json`, that is a bad contract. If the child emits malformed protocol output, the runtime should not quietly continue with partial state and hope the final summary makes sense.
+- Why this is a real defect: it converts a concrete protocol failure into silent data loss. That is how you get confusing “no output” style behavior instead of a truthful error.
+
+2. The orchestrator is told about “Active Threads”, but that list is really just “all `.jsonl` files under `.pi/threads`”.
+- Evidence: `index.ts:156-166`, `index.ts:589-606`.
+- `listThreads()` does a synchronous directory scan of every thread transcript file, and `before_agent_start` injects that into the system prompt under the heading `## Active Threads`.
+- That label is imprecise. It is not “active”, not scoped to the current parent session, and not derived from runtime-owned live state.
+- Why this is a real defect: it gives the model false semantics. Stale disk history is being presented as live/project-current activity.
+
+3. The tests still model dead or irrelevant host/runtime APIs, which weakens their ability to catch real regressions.
+- Evidence:
+  - `.tests/runtime/dispatch-summary.test.ts:94-119`
+  - `.tests/subagents/view-model-contract.test.ts:147-160`, `247-264`, `287-302`, `378-388`, `458-467`, `528-537`, `631-641`, `735-744`
+  - `.tests/subagents/runtime-simplify-contract.test.ts:123-175`, `195-210`, `346-430`, `445-553`
+  - `rg` also showed repeated `switchSession`, `getSnapshot`, and `registerShortcut` stubs across tests.
+- These tests keep stubbing `switchSession` even though the current `/subagents` model is same-session UI, and they keep returning `getSnapshot()` from `PiActorRuntime.prototype.invoke` even though `PiActorHandle` no longer exposes that method.
+- Why this is a real defect: a test suite that carries dead surface area gives false confidence. It proves that the fake world still works, not necessarily the real interface contract.
+
+Maintainability / style findings
+
+1. `index.ts` is still an overgrown god file.
+- Evidence:
+  - giant prompt/constants section: `index.ts:1-85`
+  - thread runtime adapter: `index.ts:257-369`
+  - dispatch summarization/render helpers: `index.ts:374-440`
+  - session/tool-mode policy: `index.ts:444-525`
+  - subagent browser wiring: `index.ts:527-577`
+  - event handlers + command registration + dispatch tool + renderers: `index.ts:580-859`
+- This file is 859 lines and still owns too many unrelated concerns: prompt policy, filesystem helpers, runtime adaptation, UI rendering, session-mode state, event hooks, and tool registration.
+- Why this is bad: there is no clean place to look for one invariant. Every change drags unrelated context into scope.
+
+2. `runThreadAction()` is noisy, mutation-heavy glue code that partially re-implements the runtime it wraps.
+- Evidence: `index.ts:257-369`.
+- It builds a mutable `result`, incrementally mutates usage/model/stop reason during streaming, then overwrites large parts of that same object again from `runtimeResult`.
+- `result.messages = runtimeResult.messages as Message[]` after earlier `result.messages.push(...)` is especially clumsy.
+- Why this is bad: this is not crisp adaptation code. It is state churn. The function does too much work to translate one result shape into another.
+
+3. `PiActorRuntime.invoke()` is clever in the bad way.
+- Evidence: `src/runtime/pi-actor.ts:459-526`.
+- The same-session queue is encoded with `previous`, `turn`, `releaseTurn`, `queueTail`, `Promise.race`, and a `finally` block that mutates shared queue state.
+- It may currently work, but it is harder to trust than it should be. You have to mentally simulate promise lifetimes to prove basic queueing behavior.
+- Why this is bad: cancellation/serialization code should be boring. This is not boring.
+
+4. `runInvocation()` is still a “mutable locals soup” function.
+- Evidence: `src/runtime/pi-actor.ts:321-439`.
+- It keeps mutable locals for prompt file, stderr, model, stopReason, errorMessage, exit code, signal, and an abort-listener cleanup closure, then threads them through nested side effects.
+- Why this is bad: the control flow is readable only if you keep the whole function in your head. That is exactly the opposite of what you want in process-management code.
+
+5. Type precision is weak exactly where the code crosses important boundaries.
+- Evidence:
+  - `index.ts:192`, `411`, `488`, `546`
+  - `src/subagents/view.ts:48`, `53`, `65`
+  - repeated inline session-branch structural types at `index.ts:453`, `486`, `530`, `541`
+- `theme: any` is still in production code. The session branch shape is repeated as long inline object types with `details?: unknown`. UI factories are typed as `(tui: any, theme: any, keybindings: any, done: ...)`.
+- Why this is bad: the code is not using TypeScript to pin down its real contracts. It is using TypeScript as decorative syntax around dynamic objects.
+
+6. Session-path logic is duplicated in multiple places instead of having one authority.
+- Evidence:
+  - `src/runtime/pi-actor.ts:155-158` (`makeSessionPath`)
+  - `src/subagents/metadata.ts:43-45` (`getThreadSessionPath`)
+- Both normalize thread names with the same regex and assemble the same path shape.
+- Why this is bad: duplicated normalization logic is a classic “drift later, bug later” setup. One of these should not exist.
+
+7. `SubagentRunStore.seedCompletedFromParent()` packs too many responsibilities into one dense loop.
+- Evidence: `src/subagents/runtime-store.ts:172-213`.
+- In one pass it:
+  - parses parent branch entries,
+  - filters `dispatch` tool results,
+  - derives session paths,
+  - upserts run records,
+  - conditionally mutates visible record state,
+  - dedupes result keys,
+  - accumulates persisted cost.
+- Why this is bad: the logic is compact, but not clean. It is the kind of method that stays “fine” until the next invariant arrives, then becomes a trap.
+
+8. `SubagentRunStore` still relies on upstream invariants it does not own.
+- Evidence: `src/subagents/runtime-store.ts:127-170`, `246-271`, `273-289`.
+- The nested record map is keyed by raw `thread` string, not canonical session path, while correctness depends on upstream normalized-session-path collision rejection in `index.ts:391-407` and `index.ts:688-699`.
+- Why this is bad: the store looks more authoritative than it is. Its correctness still depends on callers remembering to normalize and reject collisions first.
+
+9. `src/subagents/view.ts` is serviceable, but still low-grade UI code.
+- Evidence: `src/subagents/view.ts:16-23`, `29-31`, `48-68`, `111-194`.
+- Specific problems:
+  - nested ternary in `formatStatus()` (`29-31`)
+  - `theme: any` everywhere (`48`, `53`, `65`)
+  - magic layout numbers and ratios (`16-18`, `172-176`)
+  - `invalidate()` is basically a no-op wrapper around `this.cards()` (`93-95`)
+  - input handling, selection state, layout, and rendering all live in one class
+- Why this is bad: it is short enough to survive, but not clean enough to admire.
+
+10. The test suite is too big, too repetitive, and too willing to lie.
+- Evidence:
+  - `.tests/subagents/view-model-contract.test.ts` is 936 lines
+  - `.tests/subagents/runtime-simplify-contract.test.ts` is 750 lines
+  - `.tests/runtime/dispatch-summary.test.ts` is 434 lines
+  - repeated fake host builders and direct prototype monkeypatching throughout those files
+- Specific bad patterns:
+  - repeated `makeFakePi()` scaffolds instead of one contract-shaped harness
+  - direct `PiActorRuntime.prototype.invoke = function (...) { ... }` monkeypatching
+  - wide use of `as any`
+  - stale `switchSession` and `getSnapshot` stubs
+- Why this is bad: the tests are verbose in the least valuable way. They spend too many lines rebuilding fake worlds and too few lines expressing crisp invariants.
+
+11. Naming cleanup did not keep up with architecture cleanup.
+- Evidence: `.tests/runtime/thread-supervisor.test.ts:1-203`.
+- The `ThreadSupervisor` layer was deleted, but a runtime test file is still named `thread-supervisor.test.ts`.
+- Why this is bad: stale names matter. They tell future readers that the cleanup stopped at behavior, not language or structure.
+
+12. `index.ts` repeats ugly inline structural types instead of naming them once.
+- Evidence:
+  - `index.ts:453`
+  - `index.ts:486`
+  - `index.ts:530`
+  - `index.ts:541`
+- The same branch-entry/session-manager shape appears multiple times as inline anonymous types.
+- Why this is bad: this is verbose and imprecise at the same time. It makes the file longer and the contract weaker.
+
+What is actually decent
+- `src/subagents/mode.ts:1-78` is relatively clean and small. It is one of the few places where the code says exactly one thing and stops.
+- `src/subagents/metadata.ts:17-105` is mostly straightforward, aside from duplicated path normalization ownership with `pi-actor.ts`.
+
+Most important cleanup targets if quality, not features, is the goal
+1. Split `index.ts` by responsibility. The best immediate cut is to move dispatch execution/adaptation out first, not just UI helpers.
+2. Simplify `PiActorRuntime.invoke()` into explicit queue state instead of promise choreography.
+3. Stop tests from stubbing dead APIs. Delete `switchSession` and `getSnapshot` from fake worlds unless a test is explicitly about those boundaries.
+4. Replace repeated inline branch/session types with named interfaces at the extension boundary.
+5. Collapse session-path normalization to one authority.
+
+Final judgment
+- This codebase is no longer architecturally confused in the old way, but it is still written in a transitional, overly hand-rolled style.
+- The main production path is not concise enough, not typed precisely enough, and not honest enough about where its contracts really are.
+- The branch is good enough to keep moving on behavior, but not good enough to call “clean”. `C+` is deserved.
