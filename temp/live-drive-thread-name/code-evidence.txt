@@ -1,5 +1,0 @@
-index.ts:
-159:	const safe = threadName.replace(/[^\w.-]+/g, "_");
-
-src/runtime/pi-actor.ts:
-181:	const safe = thread.replace(/[^\w.-]+/g, "_");

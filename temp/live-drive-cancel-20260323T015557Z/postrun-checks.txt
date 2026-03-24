@@ -1,5 +1,0 @@
-# bugabort thread session files after run
-
-# recorded child pids now
-
-# live process matches now
