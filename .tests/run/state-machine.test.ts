@@ -30,3 +30,44 @@ test("transitionRunState is typed: invalid transitions do not compile", () => {
 
 	assert.equal(exited.tag, "exited");
 });
+
+test("transitionRunState preserves runtime metadata on exits and ignores unrelated runtime events", () => {
+	const queued: RunState = { tag: "queued" };
+
+	const queuedAfterTerminationRequest = transitionRunState(
+		queued as Extract<RunState, { tag: "queued" }>,
+		{ type: "terminationRequested", reason: "abort" } as any,
+	);
+	assert.deepEqual(queuedAfterTerminationRequest, queued);
+
+	const running = transitionRunState({ tag: "queued" }, { type: "started", pid: 4242 });
+	const runningAfterDuplicateStart = transitionRunState(
+		running as Extract<RunState, { tag: "running" }>,
+		{ type: "started", pid: 7 } as any,
+	);
+	assert.deepEqual(runningAfterDuplicateStart, running);
+
+	const exitedFromRunning = transitionRunState(running, { type: "exited", exitCode: 1, signal: "SIGTERM" });
+	assert.deepEqual(exitedFromRunning, {
+		tag: "exited",
+		pid: 4242,
+		exitCode: 1,
+		signal: "SIGTERM",
+	});
+
+	const terminating = transitionRunState(running, { type: "terminationRequested", reason: "shutdown" });
+	const terminatingAfterDuplicateRequest = transitionRunState(
+		terminating as Extract<RunState, { tag: "terminating" }>,
+		{ type: "terminationRequested", reason: "abort" } as any,
+	);
+	assert.deepEqual(terminatingAfterDuplicateRequest, terminating);
+
+	const exitedFromTerminating = transitionRunState(terminating, { type: "exited", exitCode: null, signal: "SIGKILL" });
+	assert.deepEqual(exitedFromTerminating, {
+		tag: "exited",
+		pid: 4242,
+		exitCode: null,
+		signal: "SIGKILL",
+		requestedTerminationReason: "shutdown",
+	});
+});

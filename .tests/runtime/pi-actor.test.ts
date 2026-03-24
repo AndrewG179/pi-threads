@@ -25,6 +25,64 @@ try {
 process.exit(0);
 `;
 
+const MIXED_OUTPUT_WORKER_SCRIPT = `
+process.stderr.write("warn-one\\n");
+process.stdout.write("not-json\\n");
+process.stdout.write(JSON.stringify({
+  type: "message_end",
+  message: {
+    role: "assistant",
+    model: "openai-codex/gpt-5.4",
+    usage: {
+      input: 3,
+      output: 4,
+      cacheRead: 1,
+      cacheWrite: 2,
+      totalTokens: 7,
+      cost: { total: 0.25 }
+    },
+    content: [{ type: "text", text: "first" }]
+  }
+}) + "\\n");
+process.stdout.write(JSON.stringify({
+  type: "tool_result_end",
+  message: {
+    role: "toolResult",
+    content: [{ type: "text", text: "tool output" }]
+  }
+}) + "\\n");
+
+setTimeout(() => {
+  process.stderr.write("warn-two");
+  process.stdout.write(JSON.stringify({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      stopReason: "completed",
+      errorMessage: "worker-note",
+      usage: {
+        input: 2,
+        output: 3,
+        totalTokens: 9,
+        cost: { total: 0.5 }
+      },
+      content: [{ type: "text", text: "second" }]
+    }
+  }));
+  process.exit(0);
+}, 10);
+`;
+
+const SIMPLE_MESSAGE_WORKER_SCRIPT = `
+process.stdout.write(JSON.stringify({
+  type: "message_end",
+  message: {
+    role: "assistant",
+    content: [{ type: "text", text: "ok" }]
+  }
+}) + "\\n");
+`;
+
 type SettledResult =
 	| { type: "result"; result: Awaited<ReturnType<PiActorRuntime["invoke"]>["result"]> }
 	| { type: "timeout" };
@@ -167,6 +225,114 @@ test("dispatch should split canonical provider/model references into CLI provide
 		assert.equal(args.includes("google/gemini-2.5-flash"), false);
 	} finally {
 		process.argv.splice(0, process.argv.length, ...originalArgv);
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("PiActorRuntime parses streamed stdout events, flushes the trailing JSON message, and aggregates stderr + usage", async () => {
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-actor-stream-parse-"));
+
+	const runtime = new PiActorRuntime({
+		command: process.execPath,
+		buildArgs: () => ["-e", MIXED_OUTPUT_WORKER_SCRIPT],
+		defaultSigtermGraceMs: 25,
+	});
+
+	const handle = runtime.invoke({
+		runId: "stream-parse",
+		thread: "stream-thread",
+		cwd: tmpDir,
+		action: "noop",
+	});
+
+	const eventTypes: string[] = [];
+	const stderrChunks: string[] = [];
+	const unsubscribe = handle.subscribe((event) => {
+		eventTypes.push(event.type);
+		if (event.type === "stderr") stderrChunks.push(event.chunk);
+	});
+
+	try {
+		const result = await handle.result;
+		unsubscribe();
+
+		assert.equal(result.finalState.tag, "exited");
+		assert.equal(result.messages.length, 3);
+		assert.equal(result.messages[0]?.role, "assistant");
+		assert.equal(result.messages[1]?.role, "toolResult");
+		assert.equal(result.messages[2]?.role, "assistant");
+		assert.equal(result.messages[2]?.content[0]?.type, "text");
+		assert.equal(result.messages[2]?.content[0]?.text, "second");
+
+		assert.deepEqual(result.usage, {
+			input: 5,
+			output: 7,
+			cacheRead: 1,
+			cacheWrite: 2,
+			cost: 0.75,
+			contextTokens: 9,
+			turns: 2,
+		});
+		assert.equal(result.model, "openai-codex/gpt-5.4");
+		assert.equal(result.stopReason, "completed");
+		assert.equal(result.errorMessage, "worker-note");
+		assert.match(result.stderr, /warn-one/);
+		assert.match(result.stderr, /warn-two/);
+
+		assert.equal(eventTypes.includes("state"), true);
+		assert.equal(eventTypes.filter((type) => type === "message").length, 3);
+		assert.equal(eventTypes.includes("stderr"), true);
+		assert.equal(stderrChunks.join(""), "warn-one\nwarn-two");
+		assert.equal(handle.getSnapshot().state.tag, "exited");
+	} finally {
+		await handle.cancel("abort").catch(() => {});
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("PiActorRuntime writes system prompts to a temp file for the child and cleans that file up afterwards", async () => {
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-actor-system-prompt-"));
+	const capturedContextPath = path.join(tmpDir, "context.json");
+
+	try {
+		const runtime = new PiActorRuntime({
+			command: process.execPath,
+			buildArgs: (_request, context) => {
+				fs.writeFileSync(
+					capturedContextPath,
+					JSON.stringify({
+						sessionPath: context.sessionPath,
+						systemPromptFile: context.systemPromptFile,
+						systemPrompt: context.systemPromptFile ? fs.readFileSync(context.systemPromptFile, "utf8") : null,
+					}),
+					"utf8",
+				);
+				return ["-e", SIMPLE_MESSAGE_WORKER_SCRIPT];
+			},
+			defaultSigtermGraceMs: 25,
+		});
+
+		const result = await runtime.invoke({
+			runId: "system-prompt-file",
+			thread: "alpha",
+			cwd: tmpDir,
+			action: "noop",
+			systemPrompt: "SYSTEM PROMPT BODY",
+		}).result;
+
+		const captured = JSON.parse(fs.readFileSync(capturedContextPath, "utf8")) as {
+			sessionPath: string;
+			systemPromptFile: string;
+			systemPrompt: string | null;
+		};
+
+		assert.equal(result.finalState.tag, "exited");
+		assert.equal(captured.sessionPath, path.join(tmpDir, ".pi", "threads", "alpha.jsonl"));
+		assert.equal(captured.systemPrompt, "SYSTEM PROMPT BODY");
+		assert.equal(typeof captured.systemPromptFile, "string");
+		assert.equal(fs.existsSync(captured.systemPromptFile), false);
+		assert.equal(fs.existsSync(path.dirname(captured.systemPromptFile)), false);
+	} finally {
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 	}
 });
