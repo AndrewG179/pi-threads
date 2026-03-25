@@ -649,6 +649,107 @@ test("/subagents browser selected pane should prioritize more action and output 
 	assert.doesNotMatch(rendered, /OUTPUT-12/, "the browser should still truncate output to fit the pane instead of dumping the full tail");
 });
 
+test("/subagents browser should stay summary-oriented instead of turning the selected pane into a partial inspector when many cards exist", () => {
+	const longAction = "Work only in the worktree at /tmp/pi-threads-native-child-chat. Inspect index.ts plus the main subagents/dispatch files involved in native child opening: src/subagents/view.ts, src/subagents/runtime-store.ts, src/dispatch/supervisor.ts, and src/dispatch/journal.ts. Summarize the implemented architecture and flag any obvious code/documentation mismatches or remaining risky seams relevant to continuing subagents work.";
+	const longOutput = [
+		"## Bottom line",
+		"As implemented today, the architecture is:",
+		"- discovery/status = extension-owned session run store",
+		"- background execution = detached supervisor + run journal",
+		"- native child opening = browser returns sessionPath, then host switchSession(...)",
+		"- survival across open-child navigation = abort-to-detach hack in the parent dispatch path",
+	];
+
+	const browser = new SubagentBrowser(
+		() => [
+			{
+				thread: "subagents-code",
+				sessionPath: "/tmp/subagents-code.jsonl",
+				latestAction: longAction,
+				outputLines: longOutput,
+				outputPreview: longOutput[1],
+				outputTail: longOutput,
+				toolPreview: "read file",
+				accumulatedCost: 0.10,
+				status: "unknown",
+			},
+			{
+				thread: "subagents-docs",
+				sessionPath: "/tmp/subagents-docs.jsonl",
+				latestAction: "Work only in the worktree at /tmp/pi-threads-native-child-chat. Read docs/README.md, docs/subagents.md, and docs/subagents-native-child-chat.md.",
+				outputLines: ["docs note"],
+				outputPreview: "docs note",
+				outputTail: ["docs note"],
+				toolPreview: "read file",
+				accumulatedCost: 0.11,
+				status: "unknown",
+			},
+			{
+				thread: "subagents-gap",
+				sessionPath: "/tmp/subagents-gap.jsonl",
+				latestAction: "Does normal /resume already ignore .pi/threads child sessions?",
+				outputLines: ["gap note"],
+				outputPreview: "gap note",
+				outputTail: ["gap note"],
+				toolPreview: "read file",
+				accumulatedCost: 0.12,
+				status: "unknown",
+			},
+			{
+				thread: "subagents-livedrive",
+				sessionPath: "/tmp/subagents-livedrive.jsonl",
+				latestAction: "Work only in the worktree at /tmp/pi-threads-native-child-chat. Live drive the new session behavior.",
+				outputLines: ["livedrive note"],
+				outputPreview: "livedrive note",
+				outputTail: ["livedrive note"],
+				toolPreview: "read file",
+				accumulatedCost: 0.13,
+				status: "unknown",
+			},
+			{
+				thread: "subagents-resume",
+				sessionPath: "/tmp/subagents-resume.jsonl",
+				latestAction: "Cleanup now. Move...",
+				outputLines: ["resume note"],
+				outputPreview: "resume note",
+				outputTail: ["resume note"],
+				toolPreview: "read file",
+				accumulatedCost: 0.14,
+				status: "unknown",
+			},
+			{
+				thread: "subagents-tests",
+				sessionPath: "/tmp/subagents-tests.jsonl",
+				latestAction: "Work only in the worktree at /tmp/pi-threads-native-child-chat. Inspect the subagents-related tests.",
+				outputLines: ["tests note"],
+				outputPreview: "tests note",
+				outputTail: ["tests note"],
+				toolPreview: "read file",
+				accumulatedCost: 0.15,
+				status: "unknown",
+			},
+		],
+		{ terminal: { rows: 24 } },
+		makeTheme(),
+		makeSelectKeybindings(),
+		() => {},
+	);
+
+	const rendered = browser.render(120).join("\n");
+	assert.match(rendered, /\[subagents-code\]/, "the selected card should still be visible in the browser");
+	assert.match(rendered, /\[subagents-tests\]/, "the browser should still keep the later session rows visible");
+	assert.doesNotMatch(
+		rendered,
+		/switchSession\(\.\.\.\)/,
+		"browser mode should stay summary-oriented; deep output detail belongs behind Enter inspect",
+	);
+	assert.doesNotMatch(
+		rendered,
+		/remaining risky seams relevant to continuing subagents work\./,
+		"browser mode should not dump the later long-action detail of the selected card when many sessions exist",
+	);
+});
+
 test("/subagents inspector should scroll through the existing detail document instead of hard-capping section lines", () => {
 	const browser = new SubagentBrowser(
 		() => [{

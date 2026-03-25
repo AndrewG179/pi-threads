@@ -21,7 +21,9 @@ const EMPTY_ACTION = "(no action)";
 const EMPTY_OUTPUT = "(no output yet)";
 const EMPTY_TOOL = "(no recent tool calls)";
 const BROWSER_SECTION_CAPS = [20, 10, 2] as const;
-const BROWSER_SECTION_WEIGHTS = [0.6, 0.3, 0.1] as const;
+const DENSE_BROWSER_SECTION_CAPS = [6, 4, 1] as const;
+const BROWSER_SECTION_WEIGHTS = [0.5, 0.4, 0.1] as const;
+const DENSE_BROWSER_SECTION_WEIGHTS = [0.6, 0.3, 0.1] as const;
 
 function formatCost(cost: number): string {
 	if (cost <= 0) return "$0";
@@ -48,17 +50,19 @@ function wrapLines(text: string, width: number, maxLines: number, fallback = "(n
 	return Number.isFinite(maxLines) ? wrapped.slice(0, maxLines) : wrapped;
 }
 
-function allocateBrowserSectionLines(available: number): number[] {
+function allocateBrowserSectionLines(available: number, cardCount: number): number[] {
 	if (available <= 0) return [0, 0, 0];
+	const caps = cardCount >= 5 ? DENSE_BROWSER_SECTION_CAPS : BROWSER_SECTION_CAPS;
+	const weights = cardCount >= 5 ? DENSE_BROWSER_SECTION_WEIGHTS : BROWSER_SECTION_WEIGHTS;
 
-	const budgets = BROWSER_SECTION_CAPS.map(() => 0);
+	const budgets = caps.map(() => 0);
 	let remaining = available;
 	for (let index = 0; index < budgets.length && remaining > 0; index++) {
 		budgets[index] = 1;
 		remaining--;
 	}
 
-	const desired = BROWSER_SECTION_CAPS.map((cap, index) => Math.min(cap, Math.floor(available * BROWSER_SECTION_WEIGHTS[index])));
+	const desired = caps.map((cap, index) => Math.min(cap, Math.floor(available * weights[index])));
 	for (let index = 0; index < budgets.length && remaining > 0; index++) {
 		const addition = Math.min(Math.max(0, desired[index] - budgets[index]), remaining);
 		budgets[index] += addition;
@@ -68,7 +72,7 @@ function allocateBrowserSectionLines(available: number): number[] {
 	while (remaining > 0) {
 		let grew = false;
 		for (let index = 0; index < budgets.length && remaining > 0; index++) {
-			if (budgets[index] >= BROWSER_SECTION_CAPS[index]) continue;
+			if (budgets[index] >= caps[index]) continue;
 			budgets[index]++;
 			remaining--;
 			grew = true;
@@ -180,7 +184,7 @@ export class SubagentBrowser {
 		return frame(lines, width, height);
 	}
 
-	private renderSelected(card: SubagentCard | undefined, width: number, height: number, inspector: boolean): string[] {
+	private renderSelected(card: SubagentCard | undefined, width: number, height: number, inspector: boolean, browserCardCount = 1): string[] {
 		if (!card) return frame([this.theme.fg("muted", EMPTY_SESSION)], width, height);
 
 		const output = inspector
@@ -190,7 +194,7 @@ export class SubagentBrowser {
 		const lines = inspector
 			? [headerLine(card, this.theme, false, `Subagent [${card.thread}]`), this.theme.fg("dim", card.sessionPath), ""]
 			: [this.theme.fg("muted", "Selected"), headerLine(card, this.theme)];
-		const browserBudgets = allocateBrowserSectionLines(Math.max(0, height - lines.length - 3));
+		const browserBudgets = allocateBrowserSectionLines(Math.max(0, height - lines.length - 3), browserCardCount);
 		const sections = inspector
 			? [
 				["Action", [card.latestAction || EMPTY_ACTION], "text", Number.POSITIVE_INFINITY],
@@ -208,10 +212,16 @@ export class SubagentBrowser {
 			if (!inspector && lines.length >= height) break;
 			lines.push(this.theme.fg("muted", label));
 			if (!inspector && maxLines <= 0) continue;
+			let remainingSectionLines = maxLines;
 			for (const entry of entries) {
-				for (const line of wrapLines(entry, width, maxLines)) {
+				if (!inspector && remainingSectionLines <= 0) break;
+				for (const line of wrapLines(entry, width, inspector ? maxLines : remainingSectionLines)) {
 					if (!inspector && lines.length >= height) break;
 					lines.push(this.theme.fg(color, line));
+					if (!inspector) {
+						remainingSectionLines--;
+						if (remainingSectionLines <= 0) break;
+					}
 				}
 			}
 		}
@@ -229,14 +239,14 @@ export class SubagentBrowser {
 			return [
 				...this.renderSessions(cards, width, sessionsHeight),
 				"",
-				...this.renderSelected(selected, width, Math.max(4, height - 1 - sessionsHeight), false),
+				...this.renderSelected(selected, width, Math.max(4, height - 1 - sessionsHeight), false, cards.length),
 			];
 		}
 
 		const leftWidth = Math.max(24, Math.floor((Math.max(24, width - 3)) * 0.42));
 		const rightWidth = Math.max(24, Math.max(24, width - 3) - leftWidth);
 		const left = this.renderSessions(cards, leftWidth, height);
-		const right = this.renderSelected(selected, rightWidth, height, false);
+		const right = this.renderSelected(selected, rightWidth, height, false, cards.length);
 		return Array.from({ length: height }, (_, index) => `${pad(left[index] ?? "", leftWidth)} | ${pad(right[index] ?? "", rightWidth)}`);
 	}
 
