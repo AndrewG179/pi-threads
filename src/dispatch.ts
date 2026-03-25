@@ -31,7 +31,7 @@ export async function runPiOnThread(
 	signal: AbortSignal | undefined,
 	onMessage?: (msg: Message) => void,
 ): Promise<{ exitCode: number; messages: Message[]; stderr: string; compaction?: { tokensBefore: number; tokensAfter: number } }> {
-	const args: string[] = ["--mode", "json", "-p", "--no-extensions", "--no-skills", "--no-prompt-templates"];
+	const args: string[] = ["--mode", "json", "-p", "--no-skills", "--no-prompt-templates"];
 	args.push("--session", sessionPath);
 	if (model) {
 		args.push("--model", model);
