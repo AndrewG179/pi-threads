@@ -629,7 +629,7 @@ test("/subagents browser should render a full editor-height frame so stale trans
 	}
 });
 
-test("/subagents browser selected pane should prioritize more action and output detail before truncating", () => {
+test("/subagents browser selected pane should stay compact, preview-only, and avoid full-width selected-row styling", () => {
 	const browser = new SubagentBrowser(
 		() => [{
 			thread: "loc-scan",
@@ -643,15 +643,22 @@ test("/subagents browser selected pane should prioritize more action and output 
 			status: "done",
 		}],
 		{ terminal: { rows: 24 } },
-		makeTheme(),
+		{
+			bold: (text: string) => text,
+			fg: (_color: string, text: string) => text,
+			bg: (_color: string, text: string) => `BG(${text})`,
+		},
 		makeSelectKeybindings(),
 		() => {},
 	);
 
 	const rendered = browser.render(84).join("\n");
-	assert.match(rendered, /ACTION-12/, "the browser selected pane should expose substantially more wrapped action text than the old two-line cap");
-	assert.match(rendered, /OUTPUT-06/, "the browser selected pane should show multiple output tail lines, not just a single preview line");
-	assert.doesNotMatch(rendered, /OUTPUT-12/, "the browser should still truncate output to fit the pane instead of dumping the full tail");
+	assert.doesNotMatch(rendered, /BG\(/, "browser mode should not use background-styled full-width rows for the selected session");
+	assert.match(rendered, /ACTION-01/, "the browser should still show the start of the selected action");
+	assert.doesNotMatch(rendered, /ACTION-20/, "browser mode should not expose deep action detail before Enter opens the inspector");
+	assert.match(rendered, /OUTPUT-12/, "the browser should show the latest output preview line");
+	assert.doesNotMatch(rendered, /OUTPUT-06/, "browser mode should not dump older output tail lines");
+	assert.match(rendered, /TypeScrip\.\.\./, "browser mode should keep the recent-tool row as a short truncated preview");
 });
 
 test("/subagents browser should stay summary-oriented instead of turning the selected pane into a partial inspector when many cards exist", () => {
@@ -753,6 +760,47 @@ test("/subagents browser should stay summary-oriented instead of turning the sel
 		/remaining risky seams relevant to continuing subagents work\./,
 		"browser mode should not dump the later long-action detail of the selected card when many sessions exist",
 	);
+});
+
+test("/subagents browser should request a re-render after navigation state changes", () => {
+	let renderRequests = 0;
+	const browser = new SubagentBrowser(
+		() => [
+			{
+				thread: "alpha",
+				sessionPath: "/tmp/alpha.jsonl",
+				latestAction: "Inspect alpha",
+				outputLines: ["alpha output"],
+				outputPreview: "alpha output",
+				outputTail: ["alpha output"],
+				toolPreview: "read file",
+				accumulatedCost: 0.01,
+				status: "unknown",
+			},
+			{
+				thread: "beta",
+				sessionPath: "/tmp/beta.jsonl",
+				latestAction: "Inspect beta",
+				outputLines: ["beta output"],
+				outputPreview: "beta output",
+				outputTail: ["beta output"],
+				toolPreview: "read file",
+				accumulatedCost: 0.02,
+				status: "unknown",
+			},
+		],
+		{ terminal: { rows: 18 }, requestRender: () => { renderRequests++; } },
+		makeTheme(),
+		makeSelectKeybindings(),
+		() => {},
+	);
+
+	browser.handleInput("DOWN");
+	browser.handleInput("ENTER");
+	browser.handleInput("DOWN");
+	browser.handleInput("ESC");
+
+	assert.equal(renderRequests, 4, "browser navigation and inspector transitions should trigger tui.requestRender() so the live view updates immediately");
 });
 
 test("/subagents inspector should scroll through the existing detail document instead of hard-capping section lines", () => {

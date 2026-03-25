@@ -11,6 +11,7 @@ type TuiLike = {
 	terminal?: {
 		rows?: number;
 	};
+	requestRender?(): void;
 };
 
 const WIDE_LAYOUT_MIN_WIDTH = 56;
@@ -20,10 +21,9 @@ const EMPTY_SESSION = "No subagent runs in this session.";
 const EMPTY_ACTION = "(no action)";
 const EMPTY_OUTPUT = "(no output yet)";
 const EMPTY_TOOL = "(no recent tool calls)";
-const BROWSER_SECTION_CAPS = [20, 10, 2] as const;
-const DENSE_BROWSER_SECTION_CAPS = [6, 4, 1] as const;
-const BROWSER_SECTION_WEIGHTS = [0.5, 0.4, 0.1] as const;
-const DENSE_BROWSER_SECTION_WEIGHTS = [0.6, 0.3, 0.1] as const;
+const BROWSER_ACTION_PREVIEW_LINES = 2;
+const BROWSER_OUTPUT_PREVIEW_LINES = 2;
+const BROWSER_TOOL_PREVIEW_LINES = 1;
 
 function formatCost(cost: number): string {
 	if (cost <= 0) return "$0";
@@ -42,7 +42,7 @@ function pad(input: string, width: number): string {
 function frame(lines: string[], width: number, height: number): string[] {
 	const filled = lines.slice(0, height);
 	while (filled.length < height) filled.push("");
-	return filled.map((line) => truncateToWidth(pad(line, width), width));
+	return filled.map((line) => pad(line, width));
 }
 
 function wrapLines(text: string, width: number, maxLines: number, fallback = "(none)"): string[] {
@@ -50,47 +50,13 @@ function wrapLines(text: string, width: number, maxLines: number, fallback = "(n
 	return Number.isFinite(maxLines) ? wrapped.slice(0, maxLines) : wrapped;
 }
 
-function allocateBrowserSectionLines(available: number, cardCount: number): number[] {
-	if (available <= 0) return [0, 0, 0];
-	const caps = cardCount >= 5 ? DENSE_BROWSER_SECTION_CAPS : BROWSER_SECTION_CAPS;
-	const weights = cardCount >= 5 ? DENSE_BROWSER_SECTION_WEIGHTS : BROWSER_SECTION_WEIGHTS;
-
-	const budgets = caps.map(() => 0);
-	let remaining = available;
-	for (let index = 0; index < budgets.length && remaining > 0; index++) {
-		budgets[index] = 1;
-		remaining--;
-	}
-
-	const desired = caps.map((cap, index) => Math.min(cap, Math.floor(available * weights[index])));
-	for (let index = 0; index < budgets.length && remaining > 0; index++) {
-		const addition = Math.min(Math.max(0, desired[index] - budgets[index]), remaining);
-		budgets[index] += addition;
-		remaining -= addition;
-	}
-
-	while (remaining > 0) {
-		let grew = false;
-		for (let index = 0; index < budgets.length && remaining > 0; index++) {
-			if (budgets[index] >= caps[index]) continue;
-			budgets[index]++;
-			remaining--;
-			grew = true;
-		}
-		if (!grew) break;
-	}
-
-	return budgets;
+function highlight(_theme: any, line: string, _selected: boolean, width: number): string {
+	return pad(line, width);
 }
 
-function highlight(theme: any, line: string, selected: boolean, width: number): string {
-	const padded = pad(line, width);
-	return selected && typeof theme.bg === "function" ? theme.bg("selectedBg", padded) : padded;
-}
-
-function headerLine(card: SubagentCard, theme: any, selected = false, title = `[${card.thread}]`): string {
+function headerLine(card: SubagentCard, _theme: any, selected = false, title = `[${card.thread}]`): string {
 	const prefix = selected ? "> " : "";
-	return `${prefix}${theme.fg("accent", title)} ${theme.fg("dim", `${formatStatus(card.status)} ${formatCost(card.accumulatedCost)}`)}`;
+	return `${prefix}${title} ${formatStatus(card.status)} ${formatCost(card.accumulatedCost)}`;
 }
 
 export class SubagentBrowser {
@@ -106,6 +72,10 @@ export class SubagentBrowser {
 		private readonly done: (result: void | undefined) => void,
 	) {}
 
+	private requestRender(): void {
+		this.tui?.requestRender?.();
+	}
+
 	handleInput(keyData: string): void {
 		const kb = this.keybindings;
 		if (!kb) return;
@@ -114,6 +84,7 @@ export class SubagentBrowser {
 			if (this.mode === "inspector") {
 				this.mode = "browser";
 				this.inspectorScroll = 0;
+				this.requestRender();
 			}
 			else this.done(undefined);
 			return;
@@ -121,25 +92,34 @@ export class SubagentBrowser {
 		if (this.mode === "inspector") {
 			if (kb.matches(keyData, "tui.select.up")) {
 				this.inspectorScroll = Math.max(0, this.inspectorScroll - 1);
+				this.requestRender();
 				return;
 			}
 			if (kb.matches(keyData, "tui.select.down")) {
 				this.inspectorScroll++;
+				this.requestRender();
 				return;
 			}
 			return;
 		}
 		if (kb.matches(keyData, "tui.select.up")) {
-			if (cards.length > 0) this.selectedIndex = this.selectedIndex === 0 ? cards.length - 1 : this.selectedIndex - 1;
+			if (cards.length > 0) {
+				this.selectedIndex = this.selectedIndex === 0 ? cards.length - 1 : this.selectedIndex - 1;
+				this.requestRender();
+			}
 			return;
 		}
 		if (kb.matches(keyData, "tui.select.down")) {
-			if (cards.length > 0) this.selectedIndex = this.selectedIndex === cards.length - 1 ? 0 : this.selectedIndex + 1;
+			if (cards.length > 0) {
+				this.selectedIndex = this.selectedIndex === cards.length - 1 ? 0 : this.selectedIndex + 1;
+				this.requestRender();
+			}
 			return;
 		}
 		if (kb.matches(keyData, "tui.select.confirm") && cards.length > 0) {
 			this.mode = "inspector";
 			this.inspectorScroll = 0;
+			this.requestRender();
 		}
 	}
 
@@ -162,8 +142,8 @@ export class SubagentBrowser {
 	}
 
 	private renderSessions(cards: SubagentCard[], width: number, height: number): string[] {
-		const lines = [this.theme.fg("muted", "Sessions")];
-		if (cards.length === 0) return frame([...lines, this.theme.fg("muted", EMPTY_SESSION)], width, height);
+		const lines = ["Sessions"];
+		if (cards.length === 0) return frame([...lines, EMPTY_SESSION], width, height);
 
 		const visible = Math.max(1, Math.floor((height - 1) / SESSION_CARD_ROWS));
 		const maxStart = Math.max(0, cards.length - visible);
@@ -175,57 +155,59 @@ export class SubagentBrowser {
 			const selected = index === this.selectedIndex;
 			lines.push(highlight(this.theme, headerLine(card, this.theme, selected), selected, width));
 			if (lines.length >= height) break;
-			lines.push(highlight(this.theme, `  ${this.theme.fg("dim", wrapLines(card.latestAction, width - 2, 1, EMPTY_ACTION)[0] ?? EMPTY_ACTION)}`, selected, width));
+			lines.push(highlight(this.theme, `  ${wrapLines(card.latestAction, width - 2, 1, EMPTY_ACTION)[0] ?? EMPTY_ACTION}`, selected, width));
 		}
 
 		if (end < cards.length && lines.length < height) {
-			lines.push(this.theme.fg("dim", `... ${cards.length - end} more`));
+			lines.push(`... ${cards.length - end} more`);
 		}
 		return frame(lines, width, height);
 	}
 
-	private renderSelected(card: SubagentCard | undefined, width: number, height: number, inspector: boolean, browserCardCount = 1): string[] {
-		if (!card) return frame([this.theme.fg("muted", EMPTY_SESSION)], width, height);
+	private renderBrowserSelected(card: SubagentCard | undefined, width: number, height: number): string[] {
+		if (!card) return frame([EMPTY_SESSION], width, height);
 
-		const output = inspector
-			? (card.outputLines.length > 0 ? card.outputLines : [card.outputPreview || EMPTY_OUTPUT])
-			: (card.outputTail.length > 0 ? card.outputTail : [card.outputPreview || EMPTY_OUTPUT]);
-		const toolPreview = inspector ? (card.toolPreview || EMPTY_TOOL) : truncateToWidth(card.toolPreview || EMPTY_TOOL, Math.min(width, 50));
-		const lines = inspector
-			? [headerLine(card, this.theme, false, `Subagent [${card.thread}]`), this.theme.fg("dim", card.sessionPath), ""]
-			: [this.theme.fg("muted", "Selected"), headerLine(card, this.theme)];
-		const browserBudgets = allocateBrowserSectionLines(Math.max(0, height - lines.length - 3), browserCardCount);
-		const sections = inspector
-			? [
-				["Action", [card.latestAction || EMPTY_ACTION], "text", Number.POSITIVE_INFINITY],
-				["Output", output, "text", Number.POSITIVE_INFINITY],
-				["Recent Tool", [toolPreview], "dim", Number.POSITIVE_INFINITY],
-			] as const
-			: [
-				["Action", [card.latestAction || EMPTY_ACTION], "text", browserBudgets[0]],
-				["Output", output, "text", browserBudgets[1]],
-				["Recent Tool", [toolPreview], "dim", browserBudgets[2]],
-			] as const;
+		const lines = ["Selected", headerLine(card, this.theme)];
+		const sections = [
+			["Action", card.latestAction || EMPTY_ACTION, "text", BROWSER_ACTION_PREVIEW_LINES],
+			["Output", card.outputPreview || EMPTY_OUTPUT, "text", BROWSER_OUTPUT_PREVIEW_LINES],
+			["Recent Tool", truncateToWidth(card.toolPreview || EMPTY_TOOL, Math.min(width, 50)), "dim", BROWSER_TOOL_PREVIEW_LINES],
+		] as const;
 
-		for (const [index, [label, entries, color, maxLines]] of sections.entries()) {
-			if (inspector && index > 0 && lines.length < height) lines.push("");
-			if (!inspector && lines.length >= height) break;
-			lines.push(this.theme.fg("muted", label));
-			if (!inspector && maxLines <= 0) continue;
-			let remainingSectionLines = maxLines;
+		for (const [label, entry, _color, maxLines] of sections) {
+			if (lines.length >= height) break;
+			lines.push(label);
+			if (lines.length >= height) break;
+
+			for (const line of wrapLines(entry, width, maxLines)) {
+				if (lines.length >= height) break;
+				lines.push(line);
+			}
+		}
+
+		return frame(lines, width, height);
+	}
+
+	private renderInspector(card: SubagentCard | undefined, width: number, height: number): string[] {
+		if (!card) return frame([EMPTY_SESSION], width, height);
+
+		const output = card.outputLines.length > 0 ? card.outputLines : [card.outputPreview || EMPTY_OUTPUT];
+		const lines = [headerLine(card, this.theme, false, `Subagent [${card.thread}]`), card.sessionPath, ""];
+		const sections = [
+			["Action", [card.latestAction || EMPTY_ACTION], "text"],
+			["Output", output, "text"],
+			["Recent Tool", [card.toolPreview || EMPTY_TOOL], "dim"],
+		] as const;
+
+		for (const [index, [label, entries, _color]] of sections.entries()) {
+			if (index > 0 && lines.length < height) lines.push("");
+			lines.push(label);
 			for (const entry of entries) {
-				if (!inspector && remainingSectionLines <= 0) break;
-				for (const line of wrapLines(entry, width, inspector ? maxLines : remainingSectionLines)) {
-					if (!inspector && lines.length >= height) break;
-					lines.push(this.theme.fg(color, line));
-					if (!inspector) {
-						remainingSectionLines--;
-						if (remainingSectionLines <= 0) break;
-					}
+				for (const line of wrapLines(entry, width, Number.POSITIVE_INFINITY)) {
+					lines.push(line);
 				}
 			}
 		}
-		if (!inspector) return frame(lines, width, height);
 
 		const maxScroll = Math.max(0, lines.length - height);
 		this.inspectorScroll = Math.max(0, Math.min(this.inspectorScroll, maxScroll));
@@ -239,14 +221,14 @@ export class SubagentBrowser {
 			return [
 				...this.renderSessions(cards, width, sessionsHeight),
 				"",
-				...this.renderSelected(selected, width, Math.max(4, height - 1 - sessionsHeight), false, cards.length),
+				...this.renderBrowserSelected(selected, width, Math.max(4, height - 1 - sessionsHeight)),
 			];
 		}
 
 		const leftWidth = Math.max(24, Math.floor((Math.max(24, width - 3)) * 0.42));
 		const rightWidth = Math.max(24, Math.max(24, width - 3) - leftWidth);
 		const left = this.renderSessions(cards, leftWidth, height);
-		const right = this.renderSelected(selected, rightWidth, height, false, cards.length);
+		const right = this.renderBrowserSelected(selected, rightWidth, height);
 		return Array.from({ length: height }, (_, index) => `${pad(left[index] ?? "", leftWidth)} | ${pad(right[index] ?? "", rightWidth)}`);
 	}
 
@@ -254,15 +236,15 @@ export class SubagentBrowser {
 		const cards = this.cards();
 		const height = this.height();
 		const header = [
-			this.theme.fg("toolTitle", "Subagents"),
-			this.theme.fg("dim", this.mode === "inspector" ? "Live inspector. Up/Down scroll, Esc back to the browser" : "Current session only. Up/Down browse, Enter inspect, Esc close"),
+			"Subagents",
+			this.mode === "inspector" ? "Live inspector. Up/Down scroll, Esc back to the browser" : "Current session only. Up/Down browse, Enter inspect, Esc close",
 			"",
 		];
 		const bodyHeight = Math.max(6, height - header.length - 1);
 		const body = cards.length === 0
-			? [this.theme.fg("muted", EMPTY_SESSION)]
+			? [EMPTY_SESSION]
 			: this.mode === "inspector"
-				? this.renderSelected(this.selected(cards), width, bodyHeight, true)
+				? this.renderInspector(this.selected(cards), width, bodyHeight)
 				: this.renderBrowser(cards, width, bodyHeight);
 		return frame([...header, ...body, ""], width, height);
 	}
