@@ -3,15 +3,6 @@
   "version": "1.0.0",
   "description": "Thread-based orchestrator extension for pi — dispatch actions to persistent worker threads",
   "keywords": ["pi-package"],
-  "scripts": {
-    "test": "tsx --test \".tests/**/*.test.ts\"",
-    "typecheck": "tsc --noEmit"
-  },
-  "devDependencies": {
-    "@types/node": "^24.0.0",
-    "tsx": "^4.20.4",
-    "typescript": "^5.9.2"
-  },
   "pi": {
     "extensions": ["./index.ts"]
   }

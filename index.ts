@@ -13,51 +13,33 @@
  * fails outside their scope, they stop and report back.
  */
 
+import { spawn } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
-import { type ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Container, DynamicBorder, Text, createSearchInput, truncateToWidth, visibleWidth } from "./src/pi/runtime-deps";
-
-import {
-	collectCompletedDispatchItems,
-	rebuildEpisodeCounts as rebuildDispatchEpisodeCounts,
-} from "./src/dispatch/history";
-import {
-	createEmptyThreadActionResult,
-	type DispatchTask,
-	findDuplicateThreads,
-	getDispatchFailureSummary,
-	getThreadsDir,
-	resolveDispatchSessionPath,
-	type DispatchDetails,
-	type SingleDispatchResult,
-	type UsageStats,
-} from "./src/dispatch/contract";
-import { runThreadAction } from "./src/dispatch/runner";
-import { buildEpisode as buildThreadEpisode } from "./src/episode/builder";
-import { PiActorRuntime } from "./src/runtime/pi-actor";
-import { getThreadSessionPath, normalizeSessionPath, toSubagentStatus } from "./src/subagents/metadata";
-import {
-	buildSubagentModelPromptSection,
-	buildSubagentModelStatusText,
-	findFuzzyModelMatches,
-	formatModelIdentifier,
-	getAvailableModels,
-	isModelOverrideResetQuery,
-	resolveEffectiveSubagentModel,
-	toModelDescriptor,
-	type ModelDescriptor,
-	type ModelLike,
-} from "./src/subagents/model-selection";
-import { deriveSessionBehavior, resolveActiveToolsForBehavior } from "./src/subagents/mode";
-import { SubagentRunStore } from "./src/subagents/runtime-store";
-import { loadThreadsState, saveThreadsState } from "./src/subagents/state";
-import { SubagentBrowser } from "./src/subagents/view";
-import { wrapText } from "./src/text/wrap";
+import type { Message } from "@mariozechner/pi-ai";
+import { type ExtensionAPI, getMarkdownTheme } from "@mariozechner/pi-coding-agent";
+import { Container, Markdown, Spacer, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { Type } from "@sinclair/typebox";
 
 // ─── Constants ───
 
-const piActorRuntime = new PiActorRuntime();
+const THREADS_DIR = ".pi/threads";
+
+const THREAD_WORKER_PROMPT = `You are a thread — an execution worker controlled by an orchestrator.
+
+## Your Role
+Execute the instructions given to you. You are the hands, not the brain.
+
+## Rules
+1. **Follow instructions precisely.** Do exactly what you're told.
+2. **Handle tactical details.** Missing imports, typos, small fixups needed to complete your task — just handle them.
+3. **Never make strategic decisions.** If something is ambiguous, if you face a fork where different approaches are possible, or if you encounter something unexpected — STOP and report back. Do not guess.
+4. **If you fail, report clearly.** Don't try alternative approaches. Describe what went wrong and what state things are in now.
+5. **Be thorough within scope.** Complete all parts of your instructions.`;
+
+
 
 const ORCHESTRATOR_PROMPT = `
 # Thread-Based Execution Model
@@ -95,53 +77,98 @@ Batch (parallel, shown side by side in groups of 3):
 - \`dispatch(tasks: [{thread: "auth", action: "Read auth middleware and list exported functions with signatures"}, {thread: "tests", action: "Run the test suite and report pass/fail counts"}, {thread: "docs", action: "Check if API docs exist and list what endpoints are documented"}])\`
 `;
 
-const DISPATCH_TOOL_PARAMETERS = {
-	type: "object",
-	properties: {
-		thread: {
-			type: "string",
-			description: "Thread name — identifies the work stream. Reuse for related actions. (single mode)",
-		},
-		action: {
-			type: "string",
-			description: "Direct, concrete instructions for the thread to execute. (single mode)",
-		},
-		tasks: {
-			type: "array",
-			description: "Batch mode: thread actions dispatched in parallel.",
-			minItems: 1,
-			items: {
-				type: "object",
-				properties: {
-					thread: {
-						type: "string",
-						description: "Thread name",
-					},
-					action: {
-						type: "string",
-						description: "Action for this thread",
-					},
-				},
-				required: ["thread", "action"],
-				additionalProperties: false,
-			},
-		},
-	},
-	additionalProperties: false,
-} as const;
+// ─── Types ───
 
-function listThreadSessionNames(cwd: string): string[] {
+interface UsageStats {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cost: number;
+	contextTokens: number;
+	turns: number;
+}
+
+interface ThreadActionResult {
+	thread: string;
+	action: string;
+	exitCode: number;
+	messages: Message[];
+	stderr: string;
+	usage: UsageStats;
+	model?: string;
+	stopReason?: string;
+	errorMessage?: string;
+	sessionPath: string;
+	isNewThread: boolean;
+}
+
+interface SingleDispatchResult {
+	thread: string;
+	action: string;
+	episode: string;
+	episodeNumber: number;
+	result: ThreadActionResult;
+}
+
+interface DispatchDetails {
+	mode: "single" | "batch";
+	items: SingleDispatchResult[];
+}
+
+// ─── Helpers ───
+
+function getThreadsDir(cwd: string): string {
+	return path.join(cwd, THREADS_DIR);
+}
+
+function getThreadSessionPath(cwd: string, threadName: string): string {
+	const safe = threadName.replace(/[^\w.-]+/g, "_");
+	return path.join(getThreadsDir(cwd), `${safe}.jsonl`);
+}
+
+function listThreads(cwd: string): string[] {
 	const dir = getThreadsDir(cwd);
 	if (!fs.existsSync(dir)) return [];
 	try {
 		return fs
 			.readdirSync(dir)
-			.filter((fileName) => fileName.endsWith(".jsonl"))
-			.map((fileName) => fileName.replace(/\.jsonl$/, ""));
+			.filter((f) => f.endsWith(".jsonl"))
+			.map((f) => f.replace(/\.jsonl$/, ""));
 	} catch {
 		return [];
 	}
 }
+
+function ensureThreadsDir(cwd: string): void {
+	const dir = getThreadsDir(cwd);
+	if (!fs.existsSync(dir)) {
+		fs.mkdirSync(dir, { recursive: true });
+	}
+}
+
+function writeTempFile(prefix: string, content: string): { dir: string; filePath: string } {
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-thread-${prefix}-`));
+	const filePath = path.join(tmpDir, `${prefix}.md`);
+	fs.writeFileSync(filePath, content, { encoding: "utf-8", mode: 0o600 });
+	return { dir: tmpDir, filePath };
+}
+
+function cleanupTemp(dir: string | null, file: string | null): void {
+	if (file)
+		try {
+			fs.unlinkSync(file);
+		} catch {
+			/* ignore */
+		}
+	if (dir)
+		try {
+			fs.rmdirSync(dir);
+		} catch {
+			/* ignore */
+		}
+}
+
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -209,6 +236,30 @@ function renderColumnsInRows(
 	return output;
 }
 
+function wrapText(text: string | undefined, width: number): string[] {
+	if (!text) return [""];
+	if (width < 10) return [text];
+	const lines: string[] = [];
+	for (const paragraph of text.split("\n")) {
+		if (!paragraph.trim()) {
+			lines.push("");
+			continue;
+		}
+		const words = paragraph.split(/\s+/);
+		let current = "";
+		for (const word of words) {
+			if (current.length + word.length + 1 > width && current.length > 0) {
+				lines.push(current);
+				current = word;
+			} else {
+				current = current ? current + " " + word : word;
+			}
+		}
+		if (current) lines.push(current);
+	}
+	return lines.length > 0 ? lines : [""];
+}
+
 function formatUsage(usage: UsageStats, model?: string): string {
 	const parts: string[] = [];
 	if (usage.turns) parts.push(`${usage.turns} turn${usage.turns > 1 ? "s" : ""}`);
@@ -222,586 +273,573 @@ function formatUsage(usage: UsageStats, model?: string): string {
 	return parts.join(" ");
 }
 
+// ─── Thread Execution ───
+
+/**
+ * Run a pi process against a thread session. Used for both the action
+ * and the episode extraction (same session = cached context).
+ */
+async function runPiOnThread(
+	cwd: string,
+	sessionPath: string,
+	message: string,
+	model: string | undefined,
+	systemPromptFile: string | undefined,
+	signal: AbortSignal | undefined,
+	onMessage?: (msg: Message) => void,
+): Promise<{ exitCode: number; messages: Message[]; stderr: string }> {
+	const args: string[] = ["--mode", "json", "-p", "--no-extensions", "--no-skills", "--no-prompt-templates"];
+	args.push("--session", sessionPath);
+	if (model) {
+		args.push("--model", model);
+	}
+	if (systemPromptFile) args.push("--append-system-prompt", systemPromptFile);
+	args.push(message);
+
+	const messages: Message[] = [];
+	let stderr = "";
+	let wasAborted = false;
+
+	const exitCode = await new Promise<number>((resolve) => {
+		const proc = spawn("pi", args, { cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+		let buffer = "";
+
+		const processLine = (line: string) => {
+			if (!line.trim()) return;
+			let event: any;
+			try {
+				event = JSON.parse(line);
+			} catch {
+				return;
+			}
+			if (event.type === "message_end" && event.message) {
+				messages.push(event.message as Message);
+				onMessage?.(event.message as Message);
+			}
+			if (event.type === "tool_result_end" && event.message) {
+				messages.push(event.message as Message);
+				onMessage?.(event.message as Message);
+			}
+		};
+
+		proc.stdout.on("data", (data: Buffer) => {
+			buffer += data.toString();
+			const lines = buffer.split("\n");
+			buffer = lines.pop() || "";
+			for (const line of lines) processLine(line);
+		});
+
+		proc.stderr.on("data", (data: Buffer) => {
+			stderr += data.toString();
+		});
+
+		proc.on("close", (code: number | null) => {
+			if (buffer.trim()) processLine(buffer);
+			resolve(code ?? 0);
+		});
+
+		proc.on("error", () => resolve(1));
+
+		if (signal) {
+			const killProc = () => {
+				wasAborted = true;
+				proc.kill("SIGTERM");
+				setTimeout(() => {
+					if (!proc.killed) proc.kill("SIGKILL");
+				}, 5000);
+			};
+			if (signal.aborted) killProc();
+			else signal.addEventListener("abort", killProc, { once: true });
+		}
+	});
+
+	if (wasAborted) throw new Error("Thread was aborted");
+	return { exitCode, messages, stderr };
+}
+
+async function runThreadAction(
+	cwd: string,
+	threadName: string,
+	action: string,
+	model: string | undefined,
+	signal: AbortSignal | undefined,
+	onUpdate: ((partial: AgentToolResult<DispatchDetails>) => void) | undefined,
+	episodeNumber: number,
+): Promise<ThreadActionResult> {
+	ensureThreadsDir(cwd);
+	const sessionPath = getThreadSessionPath(cwd, threadName);
+	const isNewThread = !fs.existsSync(sessionPath);
+
+	const result: ThreadActionResult = {
+		thread: threadName,
+		action,
+		exitCode: 0,
+		messages: [],
+		stderr: "",
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+		model,
+		sessionPath,
+		isNewThread,
+	};
+
+	const trackUsage = (msg: Message) => {
+		if (msg.role === "assistant") {
+			result.usage.turns++;
+			const usage = msg.usage;
+			if (usage) {
+				result.usage.input += usage.input || 0;
+				result.usage.output += usage.output || 0;
+				result.usage.cacheRead += usage.cacheRead || 0;
+				result.usage.cacheWrite += usage.cacheWrite || 0;
+				result.usage.cost += usage.cost?.total || 0;
+				result.usage.contextTokens = usage.totalTokens || 0;
+			}
+			if (!result.model && msg.model) result.model = msg.model;
+			if (msg.stopReason) result.stopReason = msg.stopReason;
+			if (msg.errorMessage) result.errorMessage = msg.errorMessage;
+		}
+	};
+
+	const emitUpdate = () => {
+		if (onUpdate) {
+			const lastText = getFinalOutput(result.messages);
+			onUpdate({
+				content: [{ type: "text", text: lastText || "(running...)" }],
+				details: {
+					mode: "single",
+					items: [{
+						thread: threadName,
+						action,
+						episode: "(running...)",
+						episodeNumber,
+						result,
+					}],
+				},
+			});
+		}
+	};
+
+	// Write thread worker prompt to temp file
+	const promptTmp = writeTempFile("worker", THREAD_WORKER_PROMPT);
+
+	try {
+		// Single process: thread executes the action AND produces the episode
+		// inline (delimited by ---EPISODE--- markers). No second process needed.
+		const actionResult = await runPiOnThread(
+			cwd,
+			sessionPath,
+			action,
+			model,
+			promptTmp.filePath,
+			signal,
+			(msg) => {
+				result.messages.push(msg);
+				trackUsage(msg);
+				emitUpdate();
+			},
+		);
+		result.exitCode = actionResult.exitCode;
+		result.stderr = actionResult.stderr;
+
+		return result;
+	} finally {
+		cleanupTemp(promptTmp.dir, promptTmp.filePath);
+	}
+}
+
+// ─── Episode Generation ───
+
+function getFinalOutput(messages: Message[]): string {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i];
+		if (msg.role === "assistant") {
+			for (const part of msg.content) {
+				if (part.type === "text") return part.text;
+			}
+		}
+	}
+	return "";
+}
+
+/**
+ * Build a transcript from thread messages for the episode generator.
+ * Includes tool calls AND their results so the episode has actual data.
+ */
+/**
+ * Build the episode directly from thread output — no extra model call.
+ * Returns: tool call history + last assistant message.
+ * The orchestrator sees exactly what the thread did and said.
+ */
+function buildEpisode(messages: Message[]): string {
+	const parts: string[] = [];
+
+	// Part 1: Tool call history — compact summary of what the thread did
+	const toolCalls: string[] = [];
+	for (const msg of messages) {
+		if (msg.role !== "assistant") continue;
+		for (const part of msg.content) {
+			if (part.type === "toolCall") {
+				const args = part.arguments as Record<string, unknown>;
+				switch (part.name) {
+					case "bash": {
+						const cmd = ((args.command as string) || "").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
+						const preview = cmd.length > 120 ? cmd.slice(0, 120) + "..." : cmd;
+						toolCalls.push(`$ ${preview}`);
+						break;
+					}
+					case "read": {
+						const p = (args.file_path || args.path || "") as string;
+						const offset = args.offset as number | undefined;
+						const limit = args.limit as number | undefined;
+						let entry = `read ${p}`;
+						if (offset || limit) entry += `:${offset || 1}${limit ? `-${(offset || 1) + limit - 1}` : ""}`;
+						toolCalls.push(entry);
+						break;
+					}
+					case "write": {
+						const p = (args.file_path || args.path || "") as string;
+						const content = (args.content || "") as string;
+						const lines = content.split("\n").length;
+						toolCalls.push(`write ${p} (${lines} lines)`);
+						break;
+					}
+					case "edit": {
+						const p = (args.file_path || args.path || "") as string;
+						toolCalls.push(`edit ${p}`);
+						break;
+					}
+					default: {
+						const s = JSON.stringify(args);
+						toolCalls.push(`${part.name} ${s.length > 80 ? s.slice(0, 80) + "..." : s}`);
+					}
+				}
+			}
+		}
+	}
+
+	if (toolCalls.length > 0) {
+		parts.push("TOOL CALLS:");
+		for (const tc of toolCalls) {
+			parts.push(`  ${tc}`);
+		}
+		parts.push("");
+	}
+
+	// Part 2: Last assistant message — the thread's final response
+	const lastMessage = getFinalOutput(messages);
+	if (lastMessage.trim()) {
+		parts.push("THREAD RESPONSE:");
+		parts.push(lastMessage);
+	}
+
+	return parts.join("\n") || "(no output)";
+}
+
+
 // ─── Rendering Helpers ───
 
-function wrapDispatchSummaryText(text: string, width: number): string[] {
-	const safeWidth = Math.max(1, width);
-	return wrapText(text, safeWidth, { minWidth: 1 }).map((line) => truncateToWidth(line, safeWidth));
-}
-
-function renderDispatchItemSummary(item: SingleDispatchResult, theme: any, width: number): string[] {
-	const { result } = item;
-	const isRunning = !item.episode || item.episode === "(running...)";
-	const isError = !isRunning && (result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted");
-	const icon = isRunning
-		? theme.fg("warning", "...")
-		: isError
-			? theme.fg("error", "x")
-			: theme.fg("success", "ok");
-	const headerParts = [
-		icon,
-		theme.fg("accent", `[${item.thread}]`),
-		theme.fg("muted", `ep${item.episodeNumber}`),
-		result.model ? theme.fg("dim", result.model) : "",
-		result.isNewThread ? theme.fg("warning", "new") : "",
-	].filter(Boolean);
-	const lines = [headerParts.join(" ")];
-	const summaryText = isRunning ? item.action : item.episode;
-	if (summaryText) {
-		lines.push(...wrapDispatchSummaryText(summaryText, width));
-	}
-	if (isError && result.errorMessage) {
-		lines.push(...wrapDispatchSummaryText(result.errorMessage, width).map((line) => theme.fg("error", line)));
-	}
-	const usage = formatUsage(result.usage);
-	if (usage) {
-		lines.push(theme.fg("dim", usage));
-	}
-	return lines;
-}
-
-class DispatchSummaryText extends Text {
-	constructor(
-		private readonly items: SingleDispatchResult[],
-		private readonly theme: any,
-	) {
-		super("", 0, 0);
-	}
-
-	render(width: number): string[] {
-		const lines: string[] = [];
-		for (const [index, item] of this.items.entries()) {
-			if (index > 0) lines.push("");
-			lines.push(...renderDispatchItemSummary(item, this.theme, width));
+function formatToolCall(
+	toolName: string,
+	args: Record<string, unknown>,
+	fg: (color: any, text: string) => string,
+): string {
+	const shorten = (p: string) => {
+		const home = os.homedir();
+		return p.startsWith(home) ? `~${p.slice(home.length)}` : p;
+	};
+	switch (toolName) {
+		case "bash": {
+			const cmd = ((args.command as string) || "...").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
+			const preview = cmd.length > 80 ? cmd.slice(0, 80) + "..." : cmd;
+			return fg("muted", "$ ") + fg("toolOutput", preview);
 		}
-		return lines.length > 0 ? lines : [""];
+		case "read": {
+			const filePath = shorten(((args.file_path || args.path || "...") as string));
+			return fg("muted", "read ") + fg("accent", filePath);
+		}
+		case "write": {
+			const filePath = shorten(((args.file_path || args.path || "...") as string));
+			return fg("muted", "write ") + fg("accent", filePath);
+		}
+		case "edit": {
+			const filePath = shorten(((args.file_path || args.path || "...") as string));
+			return fg("muted", "edit ") + fg("accent", filePath);
+		}
+		default: {
+			const s = JSON.stringify(args);
+			return fg("accent", toolName) + fg("dim", ` ${s.length > 60 ? s.slice(0, 60) + "..." : s}`);
+		}
 	}
+}
+
+type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; name: string; args: Record<string, any> };
+
+function getDisplayItems(messages: Message[]): DisplayItem[] {
+	const items: DisplayItem[] = [];
+	for (const msg of messages) {
+		if (msg.role === "assistant") {
+			for (const part of msg.content) {
+				if (part.type === "text") items.push({ type: "text", text: part.text });
+				else if (part.type === "toolCall") items.push({ type: "toolCall", name: part.name, args: part.arguments });
+			}
+		}
+	}
+	return items;
 }
 
 // ─── Extension ───
 
 export default function (pi: ExtensionAPI) {
-	// Track episode counts per canonical worker session path.
+	// Track episode counts per thread (reconstructed from session)
 	const episodeCounts = new Map<string, number>();
-	let defaultActiveTools: string[] | null = null;
-	let subagentModelOverride: ModelDescriptor | undefined;
-	const subagentRunStore = new SubagentRunStore();
+	let subagentModel = "anthropic/claude-sonnet-4-6";
 
-	const arraysEqual = (left: string[], right: string[]) =>
-		left.length === right.length && left.every((value, index) => value === right[index]);
+	pi.registerCommand("model-sub", {
+		description: "Set the subagent model for thread workers",
+		handler: async (args, ctx) => {
+			const input = args.trim();
 
-	const getParentSessionModel = (ctx: { model?: ModelLike }) => toModelDescriptor(ctx.model);
-
-	const getEffectiveSubagentModel = (ctx: { model?: ModelLike }): string | undefined =>
-		resolveEffectiveSubagentModel(getParentSessionModel(ctx), subagentModelOverride);
-
-	const updateSubagentModelStatus = (ctx: {
-		ui?: { theme?: { fg?: (color: string, text: string) => string }; setStatus?: (key: string, text: string | undefined) => void };
-		model?: ModelLike;
-	}) => {
-		const statusText = buildSubagentModelStatusText(getParentSessionModel(ctx), subagentModelOverride);
-		ctx.ui?.setStatus?.(
-			"subagent-model",
-			ctx.ui?.theme?.fg ? ctx.ui.theme.fg("dim", statusText) : statusText,
-		);
-	};
-
-	const setSubagentModelOverride = (nextModel: ModelDescriptor | undefined, ctx: {
-		ui?: {
-			notify?: (message: string, level?: string) => void;
-			theme?: { fg?: (color: string, text: string) => string };
-			setStatus?: (key: string, text: string | undefined) => void;
-		};
-		model?: ModelLike;
-	}) => {
-		subagentModelOverride = nextModel;
-		updateSubagentModelStatus(ctx);
-		if (nextModel) {
-			ctx.ui?.notify?.(`Subagent model override set to ${formatModelIdentifier(nextModel)}.`, "info");
-			return;
-		}
-		ctx.ui?.notify?.("Subagent model override cleared. Workers will inherit the current session model.", "info");
-	};
-
-	const getCanonicalThreadSessionPath = (cwd: string, thread: string, sessionPath?: string) =>
-		resolveDispatchSessionPath(cwd, thread, sessionPath);
-
-	const rebuildEpisodeCounts = (
-		cwd: string,
-		sessionManager: { getBranch(): Array<{ type: string; message: { role: string; toolName?: string; details?: unknown } }> },
-	) => {
-		rebuildDispatchEpisodeCounts(episodeCounts, collectCompletedDispatchItems(cwd, sessionManager.getBranch()));
-	};
-
-	const resolveSessionContext = (ctx: {
-		cwd: string;
-		sessionManager: { getSessionFile(): string | undefined };
-	}) => {
-		const state = loadThreadsState(ctx.cwd);
-		const sessionFile = normalizeSessionPath(ctx.sessionManager.getSessionFile());
-		const behavior = deriveSessionBehavior({
-			cwd: ctx.cwd,
-			sessionFile,
-			state,
-		});
-		return { behavior, sessionFile };
-	};
-
-	const syncSessionMode = (ctx: {
-		hasUI?: boolean;
-		cwd: string;
-		sessionManager: { getSessionFile(): string | undefined; getBranch(): Array<{ type: string; message: { role: string; toolName?: string; details?: unknown } }> };
-		ui: {
-			theme: any;
-			setStatus: (key: string, text: string | undefined) => void;
-			setWidget: (key: string, content: unknown, options?: unknown) => void;
-		};
-	}) => {
-		const { behavior } = resolveSessionContext(ctx);
-		const currentActiveTools = pi.getActiveTools().filter((tool) => tool !== "dispatch");
-		const allToolNames = pi.getAllTools().map((tool) => tool.name);
-
-		if (!defaultActiveTools) {
-			defaultActiveTools = currentActiveTools;
-		}
-
-		const strippedCachedTools = resolveActiveToolsForBehavior("orchestrator", defaultActiveTools, allToolNames)
-			.filter((tool) => tool !== "dispatch");
-		const isCurrentToolsetCached = arraysEqual(currentActiveTools, strippedCachedTools);
-		if (!isCurrentToolsetCached) {
-			defaultActiveTools = currentActiveTools;
-		}
-
-		const nextActiveTools = resolveActiveToolsForBehavior(
-			behavior.kind,
-			behavior.kind === "orchestrator" || isCurrentToolsetCached ? defaultActiveTools : currentActiveTools,
-			allToolNames,
-		);
-		pi.setActiveTools(nextActiveTools);
-
-		if (behavior.kind === "orchestrator") {
-			ctx.ui.setStatus("pi-threads", ctx.ui.theme.fg("accent", "threads:on"));
-		} else if (behavior.kind === "subagent") {
-			ctx.ui.setStatus("pi-threads", ctx.ui.theme.fg("warning", `subagent:${behavior.threadName ?? "thread"}`));
-		} else {
-			ctx.ui.setStatus("pi-threads", undefined);
-		}
-		updateSubagentModelStatus(ctx);
-
-		rebuildEpisodeCounts(ctx.cwd, ctx.sessionManager);
-		return behavior;
-	};
-
-	const reconcileCompletedSubagentHistory = (
-		parentSessionFile: string | undefined,
-		cwd: string,
-		parentBranchEntries: Array<{ type: string; message: { role: string; toolName?: string; details?: unknown } }>,
-	) => {
-		if (!parentSessionFile) return;
-		subagentRunStore.seedCompletedFromParent(parentSessionFile, collectCompletedDispatchItems(cwd, parentBranchEntries));
-	};
-
-	const openSubagentsBrowser = async (ctx: {
-		cwd: string;
-		hasUI: boolean;
-		sessionManager: {
-			getSessionFile(): string | undefined;
-			getBranch(): Array<{ type: string; message: { role: string; toolName?: string; details?: unknown } }>;
-		};
-		ui: {
-			notify: (message: string, level?: string) => void;
-			custom<T>(
-				factory: (tui: any, theme: any, keybindings: any, done: (result: T) => void) => unknown,
-				options?: unknown,
-			): Promise<T>;
-		};
-	}) => {
-		if (!ctx.hasUI) {
-			ctx.ui.notify("The /subagents browser requires the interactive UI.", "warning");
-			return;
-		}
-
-		const { sessionFile } = resolveSessionContext(ctx);
-		if (!sessionFile) {
-			ctx.ui.notify("Current session is not persisted, so /subagents has no session-scoped run store yet.", "warning");
-			return;
-		}
-		reconcileCompletedSubagentHistory(sessionFile, ctx.cwd, ctx.sessionManager.getBranch());
-
-		await ctx.ui.custom<void | undefined>(
-			(tui, theme, keybindings, done) =>
-				new SubagentBrowser(() => subagentRunStore.getCards(sessionFile), tui, theme, keybindings, done),
-			{
-				overlay: true,
-				overlayOptions: {
-					anchor: "top-left",
-					row: 0,
-					col: 0,
-					width: "100%",
-					maxHeight: "100%",
-					margin: 0,
-				},
-			},
-		);
-	};
-
-	const openSubagentModelPicker = async (ctx: {
-		hasUI: boolean;
-		model?: ModelLike;
-		modelRegistry?: { getAvailable: () => Promise<readonly ModelLike[]> | readonly ModelLike[] };
-		ui: {
-			notify: (message: string, level?: string) => void;
-			custom<T>(
-				factory: (tui: any, theme: any, keybindings: any, done: (result: T) => void) => unknown,
-				options?: unknown,
-			): Promise<T>;
-		};
-	}, initialQuery: string): Promise<ModelDescriptor | undefined | null> => {
-		const models = await getAvailableModels(ctx.modelRegistry);
-		if (models.length === 0) {
-			ctx.ui.notify("No subagent models with configured API keys are available.", "warning");
-			return null;
-		}
-		if (!ctx.hasUI) {
-			ctx.ui.notify("The /model-sub picker requires the interactive UI. Use /model-sub provider/model or /model-sub inherit.", "warning");
-			return null;
-		}
-
-		const BorderComponent = DynamicBorder;
-		const parentModel = getParentSessionModel(ctx);
-		const currentOverrideRef = subagentModelOverride ? formatModelIdentifier(subagentModelOverride) : undefined;
-		const sortedModels = [...models].sort((left, right) => {
-			const leftRef = formatModelIdentifier(left);
-			const rightRef = formatModelIdentifier(right);
-			const leftIsCurrent = currentOverrideRef !== undefined && leftRef === currentOverrideRef;
-			const rightIsCurrent = currentOverrideRef !== undefined && rightRef === currentOverrideRef;
-			if (leftIsCurrent && !rightIsCurrent) return -1;
-			if (!leftIsCurrent && rightIsCurrent) return 1;
-			return leftRef.localeCompare(rightRef);
-		});
-
-		const choice = await ctx.ui.custom<ModelDescriptor | undefined | null>((tui, theme, keybindings, done) => {
-			const maxVisible = 10;
-			let query = initialQuery.trim();
-			let filteredModels = query ? findFuzzyModelMatches(sortedModels, query) : sortedModels;
-			let selectedIndex = 0;
-			const searchInput = createSearchInput(theme, query);
-			const container = new Container();
-			const headerText = new Text(theme.fg("accent", theme.bold("Subagent model override")), 0, 0);
-			const hintText = new Text(
-				theme.fg("muted", "Workers inherit the current session model by default. Pick a model to force an override."),
-				0,
-				0,
-			);
-			const searchLabel = new Text(theme.fg("muted", "Search:"), 0, 0);
-			const listText = new Text("", 0, 0);
-			const detailText = new Text("", 0, 0);
-			const footerText = new Text(theme.fg("dim", "selection keys move • confirm selects • cancel closes"), 0, 0);
-
-			container.addChild(new BorderComponent((text: string) => theme.fg("accent", text)));
-			container.addChild(headerText);
-			container.addChild(hintText);
-			container.addChild(new Text("", 0, 0));
-			container.addChild(searchLabel);
-			container.addChild(searchInput);
-			container.addChild(new Text("", 0, 0));
-			container.addChild(listText);
-			container.addChild(new Text("", 0, 0));
-			container.addChild(detailText);
-			container.addChild(new Text("", 0, 0));
-			container.addChild(footerText);
-			container.addChild(new BorderComponent((text: string) => theme.fg("accent", text)));
-
-			const shouldShowInheritOption = (value: string) =>
-				value.length === 0
-				|| isModelOverrideResetQuery(value)
-				|| ["inherit", "current", "default", "parent"].some((token) => token.includes(value.toLowerCase()));
-
-			const getItems = () => {
-				const items: Array<{ kind: "inherit" } | { kind: "model"; model: ModelDescriptor }> = [];
-				if (shouldShowInheritOption(query)) {
-					items.push({ kind: "inherit" });
-				}
-				for (const model of filteredModels) {
-					items.push({ kind: "model", model });
-				}
-				return items;
-			};
-
-			const applyFilter = () => {
-				query = searchInput.getValue().trim();
-				filteredModels = query ? findFuzzyModelMatches(sortedModels, query) : sortedModels;
-				selectedIndex = Math.min(selectedIndex, Math.max(0, getItems().length - 1));
-			};
-
-			const renderList = () => {
-				const items = getItems();
-				if (items.length === 0) {
-					listText.setText(theme.fg("warning", "No matching models"));
-					detailText.setText(theme.fg("muted", "Try a broader search or use an exact provider/model identifier."));
-					return;
-				}
-
-				let startIndex = Math.max(0, selectedIndex - Math.floor(maxVisible / 2));
-				if (startIndex + maxVisible > items.length) {
-					startIndex = Math.max(0, items.length - maxVisible);
-				}
-				const endIndex = Math.min(startIndex + maxVisible, items.length);
-				const lines: string[] = [];
-
-				for (let index = startIndex; index < endIndex; index++) {
-					const item = items[index]!;
-					const isSelected = index === selectedIndex;
-					if (item.kind === "inherit") {
-						const active = subagentModelOverride === undefined ? theme.fg("success", " ✓") : "";
-						const label = parentModel
-							? `inherit current session model (${formatModelIdentifier(parentModel)})`
-							: "inherit current session model";
-						lines.push(
-							isSelected
-								? theme.fg("accent", `→ ${label}`) + active
-								: `  ${label}${active}`,
-						);
-						continue;
+			// Direct match via argument (like /model <term>)
+			if (input) {
+				const slashIndex = input.indexOf("/");
+				if (slashIndex > 0) {
+					const provider = input.substring(0, slashIndex);
+					const modelId = input.substring(slashIndex + 1);
+					const found = ctx.modelRegistry.find(provider, modelId);
+					if (found) {
+						subagentModel = `${provider}/${modelId}`;
+						ctx.ui.setStatus("subagent-model", `\x1b[${(process.stdout.columns ?? 120) - `sub: ${subagentModel}`.length + 1}G\x1b[2msub: ${subagentModel}\x1b[0m`);
+						ctx.ui.notify(`Subagent model set to: ${subagentModel}`, "info");
+						return;
 					}
-
-					const ref = formatModelIdentifier(item.model);
-					const active = currentOverrideRef === ref ? theme.fg("success", " ✓") : "";
-					const label = `${item.model.id} ${theme.fg("muted", `[${item.model.provider}]`)}`;
-					lines.push(
-						isSelected
-							? theme.fg("accent", `→ ${item.model.id}`) + ` ${theme.fg("muted", `[${item.model.provider}]`)}${active}`
-							: `  ${label}${active}`,
-					);
 				}
-
-				if (items.length > maxVisible) {
-					lines.push(theme.fg("muted", `(${selectedIndex + 1}/${items.length})`));
-				}
-				listText.setText(lines.join("\n"));
-
-				const selected = items[selectedIndex]!;
-				if (selected.kind === "inherit") {
-					detailText.setText(
-						theme.fg(
-							"muted",
-							parentModel
-								? `Clear the explicit override and inherit ${formatModelIdentifier(parentModel)} from this session.`
-								: "Clear the explicit override and inherit whatever model this session is currently using.",
-						),
-					);
-					return;
-				}
-
-				detailText.setText(
-					theme.fg(
-						"muted",
-						selected.model.name
-							? `${formatModelIdentifier(selected.model)} — ${selected.model.name}`
-							: formatModelIdentifier(selected.model),
-					),
+				// Fuzzy match
+				const allModels = ctx.modelRegistry.getAvailable();
+				const matches = allModels.filter((m: any) =>
+					`${m.id} ${m.provider} ${m.provider}/${m.id}`.toLowerCase().includes(input.toLowerCase())
 				);
-			};
-
-			applyFilter();
-			renderList();
-
-			let focused = true;
-			searchInput.focused = true;
-			const matchesCommand = (input: string, command: string, fallbacks: readonly string[]) => {
-				if (keybindings && typeof keybindings.matches === "function") {
-					return keybindings.matches(input, command);
+				if (matches.length === 1) {
+					subagentModel = `${matches[0].provider}/${matches[0].id}`;
+					ctx.ui.setStatus("subagent-model", `\x1b[${(process.stdout.columns ?? 120) - `sub: ${subagentModel}`.length + 1}G\x1b[2msub: ${subagentModel}\x1b[0m`);
+					ctx.ui.notify(`Subagent model set to: ${subagentModel}`, "info");
+					return;
 				}
-				return fallbacks.includes(input);
-			};
+				// Fall through to picker with search pre-filled
+			}
 
-			return {
-				get focused() {
-					return focused;
-				},
-				set focused(value: boolean) {
-					focused = value;
-					searchInput.focused = value;
-				},
-				render(width: number) {
-					return container.render(width);
-				},
-				invalidate() {
-					container.invalidate();
-				},
-				handleInput(data: string) {
-					const items = getItems();
-					if (matchesCommand(data, "tui.select.up", ["\x1b[A", "\x1bOA"]) && items.length > 0) {
-						selectedIndex = selectedIndex <= 0 ? items.length - 1 : selectedIndex - 1;
-						renderList();
-						tui.requestRender();
-						return;
-					}
-					if (matchesCommand(data, "tui.select.down", ["\x1b[B", "\x1bOB"]) && items.length > 0) {
-						selectedIndex = selectedIndex >= items.length - 1 ? 0 : selectedIndex + 1;
-						renderList();
-						tui.requestRender();
-						return;
-					}
-					if (matchesCommand(data, "tui.select.confirm", ["\r", "\n"]) && items.length > 0) {
-						const selected = items[selectedIndex]!;
-						done(selected.kind === "inherit" ? undefined : selected.model);
-						return;
-					}
-					if (matchesCommand(data, "tui.select.cancel", ["\x1b", "\x03"])) {
-						done(null);
-						return;
-					}
-					searchInput.handleInput(data);
+			// Show interactive picker (mirrors /model UI)
+			const available = ctx.modelRegistry.getAvailable();
+			if (available.length === 0) {
+				ctx.ui.notify("No models available", "error");
+				return;
+			}
+
+			// Sort: current model first, then alphabetical by provider
+			const items = available
+				.map((m: any) => ({
+					id: m.id,
+					name: m.name || m.id,
+					provider: m.provider,
+					isCurrent: `${m.provider}/${m.id}` === subagentModel,
+				}))
+				.sort((a: any, b: any) => {
+					if (a.isCurrent && !b.isCurrent) return -1;
+					if (!a.isCurrent && b.isCurrent) return 1;
+					return a.provider.localeCompare(b.provider);
+				});
+
+			const { DynamicBorder } = await import("@mariozechner/pi-coding-agent");
+			const { Container, Text, Input, matchesKey, Key } = await import("@mariozechner/pi-tui");
+
+			const choice = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+				const maxVisible = 10;
+				let selectedIndex = 0;
+				let filtered = [...items];
+				let searchText = input || "";
+
+				// Apply initial search if provided
+				if (searchText) {
 					applyFilter();
-					renderList();
-					tui.requestRender();
-				},
-			};
-			},
-			{
-				overlay: true,
-				overlayOptions: {
-					anchor: "top-center",
-					width: "70%",
-					minWidth: 60,
-					maxHeight: "80%",
-					margin: 1,
-				},
-			},
-		);
+				}
 
-		return choice;
-	};
+				function applyFilter() {
+					const q = searchText.toLowerCase();
+					if (!q) {
+						filtered = [...items];
+					} else {
+						filtered = items.filter((m: any) =>
+							`${m.id} ${m.provider} ${m.provider}/${m.id} ${m.name}`.toLowerCase().includes(q)
+						);
+					}
+					selectedIndex = Math.min(selectedIndex, Math.max(0, filtered.length - 1));
+				}
+
+				const container = new Container();
+
+				const topBorder = new DynamicBorder((s: string) => theme.fg("accent", s));
+				container.addChild(topBorder);
+
+				const headerText = new Text(theme.fg("muted", "  Only showing models with configured API keys. Configure keys in settings or environment."), 0, 1);
+				container.addChild(headerText);
+
+				const searchInput = new Input(
+					(s: string) => theme.fg("text", s),
+					(s: string) => theme.fg("accent", s),
+					80,
+					"Search models..."
+				);
+				if (searchText) {
+					// Pre-fill search
+					for (const ch of searchText) {
+						searchInput.handleInput(ch);
+					}
+				}
+				container.addChild(searchInput);
+
+				// Spacer
+				container.addChild(new Text("", 0, 1));
+
+				// Model list (rendered dynamically)
+				const listText = new Text("", 0, 0);
+				container.addChild(listText);
+
+				// Detail line
+				const detailText = new Text("", 0, 1);
+				container.addChild(detailText);
+
+				const bottomBorder = new DynamicBorder((s: string) => theme.fg("accent", s));
+				container.addChild(bottomBorder);
+
+				function renderList() {
+					if (filtered.length === 0) {
+						listText.text = theme.fg("warning", "  No matching models");
+						detailText.text = "";
+						return;
+					}
+
+					// Scroll window centred on selectedIndex
+					let startIndex = Math.max(0, selectedIndex - Math.floor(maxVisible / 2));
+					if (startIndex + maxVisible > filtered.length) {
+						startIndex = Math.max(0, filtered.length - maxVisible);
+					}
+					const endIndex = Math.min(startIndex + maxVisible, filtered.length);
+
+					const lines: string[] = [];
+					for (let i = startIndex; i < endIndex; i++) {
+						const m = filtered[i];
+						const isSelected = i === selectedIndex;
+						const checkmark = m.isCurrent ? theme.fg("success", " ✓") : "";
+						const providerBadge = theme.fg("muted", `[${m.provider}]`);
+
+						if (isSelected) {
+							lines.push(`${theme.fg("accent", "→ " + m.id)} ${providerBadge}${checkmark}`);
+						} else {
+							lines.push(`  ${m.id} ${providerBadge}${checkmark}`);
+						}
+					}
+
+					// Scroll indicator
+					if (filtered.length > maxVisible) {
+						lines.push(theme.fg("muted", `  (${selectedIndex + 1}/${filtered.length})`));
+					}
+
+					listText.text = lines.join("\n");
+
+					// Detail line: model name
+					const sel = filtered[selectedIndex];
+					if (sel) {
+						detailText.text = theme.fg("muted", `  Model Name: ${sel.name}`);
+					} else {
+						detailText.text = "";
+					}
+				}
+
+				renderList();
+
+				return {
+					render: (w: number) => container.render(w),
+					invalidate: () => container.invalidate(),
+					handleInput: (data: string) => {
+						if (matchesKey(data, Key.up)) {
+							selectedIndex = selectedIndex <= 0 ? filtered.length - 1 : selectedIndex - 1;
+							renderList();
+							tui.requestRender();
+						} else if (matchesKey(data, Key.down)) {
+							selectedIndex = selectedIndex >= filtered.length - 1 ? 0 : selectedIndex + 1;
+							renderList();
+							tui.requestRender();
+						} else if (matchesKey(data, Key.enter)) {
+							if (filtered.length > 0) {
+								const sel = filtered[selectedIndex];
+								done(`${sel.provider}/${sel.id}`);
+							}
+						} else if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+							done(null);
+						} else {
+							searchInput.handleInput(data);
+							searchText = searchInput.value;
+							applyFilter();
+							renderList();
+							tui.requestRender();
+						}
+					},
+				};
+			});
+
+			if (!choice) return;
+
+			subagentModel = choice;
+			ctx.ui.setStatus("subagent-model", `\x1b[${(process.stdout.columns ?? 120) - `sub: ${subagentModel}`.length + 1}G\x1b[2msub: ${subagentModel}\x1b[0m`);
+			ctx.ui.notify(`Subagent model set to: ${subagentModel}`, "info");
+		},
+	});
 
 	// Reconstruct state on session load
 	pi.on("session_start", async (_event, ctx) => {
-		syncSessionMode(ctx);
-	});
+		episodeCounts.clear();
 
-	pi.on("session_switch", async (_event, ctx) => {
-		syncSessionMode(ctx);
-	});
+		// Strip built-in tools — orchestrator only dispatches
+		const allTools = pi.getAllTools();
+		const keepTools = allTools.map((t) => t.name).filter((n) => !["read", "write", "edit", "bash", "grep", "find", "ls"].includes(n));
+		if (keepTools.length > 0) {
+			pi.setActiveTools(keepTools);
+		}
 
-	pi.on("model_select", async (_event, ctx) => {
-		updateSubagentModelStatus(ctx);
+		// Reconstruct episode counts from session history
+		for (const entry of ctx.sessionManager.getBranch()) {
+			if (entry.type === "message" && entry.message.role === "toolResult") {
+				if (entry.message.toolName === "dispatch") {
+					const details = entry.message.details as DispatchDetails | undefined;
+					if (details?.items) {
+						for (const item of details.items) {
+							episodeCounts.set(item.thread, Math.max(episodeCounts.get(item.thread) || 0, item.episodeNumber));
+						}
+					}
+				}
+			}
+		}
+
+		ctx.ui.notify("🧵 Thread orchestrator active", "info");
+		ctx.ui.setStatus("subagent-model", `\x1b[${(process.stdout.columns ?? 120) - `sub: ${subagentModel}`.length + 1}G\x1b[2msub: ${subagentModel}\x1b[0m`);
 	});
 
 	// Inject orchestrator system prompt
 	pi.on("before_agent_start", async (event, ctx) => {
-		const { behavior } = resolveSessionContext(ctx);
-		if (behavior.kind !== "orchestrator") return;
-
 		let extra = ORCHESTRATOR_PROMPT;
 
 		// Tell the orchestrator about existing threads
-		const threadSessions = listThreadSessionNames(ctx.cwd);
-		if (threadSessions.length > 0) {
-			const threadInfo = threadSessions.map((threadName) => {
-				const count = episodeCounts.get(getCanonicalThreadSessionPath(ctx.cwd, threadName)) || 0;
-				return `  - **${threadName}** (${count} episode${count !== 1 ? "s" : ""})`;
+		const threads = listThreads(ctx.cwd);
+		if (threads.length > 0) {
+			const threadInfo = threads.map((t) => {
+				const count = episodeCounts.get(t) || 0;
+				return `  - **${t}** (${count} episode${count !== 1 ? "s" : ""})`;
 			});
-			extra += [
-				"",
-				"## Known Worker Sessions on Disk",
-				"These are existing `.pi/threads/*.jsonl` session files. They are not necessarily running right now or scoped to the current parent session.",
-				threadInfo.join("\n"),
-				"",
-			].join("\n");
+			extra += `\n## Active Threads\n${threadInfo.join("\n")}\n`;
 		}
 
-		extra += `\n${buildSubagentModelPromptSection(getParentSessionModel(ctx), subagentModelOverride)}\n`;
+		extra += `\n## Current Subagent Model\n${subagentModel}\n`;
 
 		return { systemPrompt: event.systemPrompt + extra };
-	});
-
-	pi.registerCommand("threads", {
-		description: "Turn thread orchestrator mode on or off for this project",
-		getArgumentCompletions(prefix) {
-			const values = ["on", "off"].filter((value) => value.startsWith(prefix));
-			return values.length > 0 ? values.map((value) => ({ value, label: value })) : null;
-		},
-		handler: async (args, ctx) => {
-			const nextMode = args.trim().toLowerCase();
-			if (nextMode !== "on" && nextMode !== "off") {
-				const state = loadThreadsState(ctx.cwd);
-				ctx.ui.notify(`Thread mode is ${state.enabled ? "on" : "off"}. Use /threads on or /threads off.`, "info");
-				return;
-			}
-
-			const state = loadThreadsState(ctx.cwd);
-			saveThreadsState(ctx.cwd, { ...state, enabled: nextMode === "on" });
-			syncSessionMode(ctx);
-			ctx.ui.notify(`Thread mode ${nextMode}.`, "info");
-		},
-	});
-
-	pi.registerCommand("subagents", {
-		description: "Browse live subagent runs for the current session",
-		handler: async (_args, ctx) => {
-			await openSubagentsBrowser(ctx);
-		},
-	});
-
-	pi.registerCommand("model-sub", {
-		description: "Set or clear the worker model override used for dispatched subagents",
-		handler: async (args, ctx) => {
-			const input = args.trim();
-			if (isModelOverrideResetQuery(input)) {
-				setSubagentModelOverride(undefined, ctx);
-				return;
-			}
-
-			if (input.includes("/")) {
-				const slashIndex = input.indexOf("/");
-				const provider = input.slice(0, slashIndex).trim();
-				const id = input.slice(slashIndex + 1).trim();
-				if (provider && id) {
-					setSubagentModelOverride({ provider, id }, ctx);
-					return;
-				}
-			}
-
-			const availableModels = await getAvailableModels((ctx as {
-				modelRegistry?: { getAvailable: () => Promise<readonly ModelLike[]> | readonly ModelLike[] };
-			}).modelRegistry);
-			if (input) {
-				const matches = findFuzzyModelMatches(availableModels, input);
-				if (matches.length === 1) {
-					setSubagentModelOverride(matches[0], ctx);
-					return;
-				}
-				if (!ctx.hasUI) {
-					if (matches.length > 1) {
-						ctx.ui?.notify?.(
-							`Multiple subagent models match \"${input}\": ${matches.slice(0, 5).map((model) => formatModelIdentifier(model)).join(", ")}. Use an exact provider/model string.`,
-							"warning",
-						);
-						return;
-					}
-					ctx.ui?.notify?.(
-						"No matching configured subagent models were found. Use an exact provider/model string or run /model-sub in the interactive UI.",
-						"warning",
-					);
-					return;
-				}
-			}
-
-			const choice = await openSubagentModelPicker(ctx as {
-				hasUI: boolean;
-				model?: ModelLike;
-				modelRegistry?: { getAvailable: () => Promise<readonly ModelLike[]> | readonly ModelLike[] };
-				ui: {
-					notify: (message: string, level?: string) => void;
-					custom<T>(
-						factory: (tui: any, theme: any, keybindings: any, done: (result: T) => void) => unknown,
-						options?: unknown,
-					): Promise<T>;
-				};
-			}, input);
-			if (choice === null) return;
-			setSubagentModelOverride(choice, ctx);
-		},
 	});
 
 	// Register the dispatch tool
@@ -822,45 +860,48 @@ export default function (pi: ExtensionAPI) {
 			"Reuse thread names for related work so threads accumulate useful context.",
 			"If a thread reports failure, re-plan and dispatch a new action — don't ask the thread to figure it out.",
 		],
-		parameters: DISPATCH_TOOL_PARAMETERS,
+		parameters: Type.Object({
+			thread: Type.Optional(Type.String({ description: "Thread name — identifies the work stream. Reuse for related actions. (single mode)" })),
+			action: Type.Optional(Type.String({ description: "Direct, concrete instructions for the thread to execute. (single mode)" })),
+			tasks: Type.Optional(
+				Type.Array(
+					Type.Object({
+						thread: Type.String({ description: "Thread name" }),
+						action: Type.String({ description: "Action for this thread" }),
+					}),
+					{ description: "Batch mode: thread actions dispatched in parallel." },
+				),
+			),
+		}),
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const model = getEffectiveSubagentModel(ctx);
-			const sessionContext = resolveSessionContext(ctx);
-			const parentSessionFile = sessionContext.sessionFile;
-			const taskList: DispatchTask[] | null = params.tasks?.length
-				? params.tasks
-				: params.thread && params.action
-					? [{ thread: params.thread, action: params.action }]
-					: null;
+			const model = subagentModel;
 
-			if (!taskList) {
+			// Determine mode
+			const hasBatch = params.tasks && params.tasks.length > 0;
+			const hasSingle = params.thread && params.action;
+
+			if (!hasBatch && !hasSingle) {
 				return {
 					content: [{ type: "text", text: "Provide either thread+action (single) or tasks array (batch)." }],
 					details: { mode: "single" as const, items: [] },
 					isError: true,
 				};
 			}
+
+			const taskList = hasBatch
+				? params.tasks!
+				: [{ thread: params.thread!, action: params.action! }];
+
 			const mode = taskList.length > 1 ? "batch" : "single";
-			const threadsDir = getThreadsDir(ctx.cwd);
-			const duplicateThreads = mode === "batch" ? findDuplicateThreads(taskList, threadsDir) : [];
-			if (duplicateThreads.length > 0) {
-				return {
-					content: [{
-						type: "text",
-						text: `Duplicate worker session targets in one batch are not supported: ${duplicateThreads.join(", ")}. These thread names normalize to the same worker session. Split this into separate dispatches or use different thread names.`,
-					}],
-					details: { mode, items: [] },
-					isError: true,
-				};
-			}
-			const taskSessionPaths = new Map(taskList.map((task) => [task.thread, getThreadSessionPath(threadsDir, task.thread)]));
+
+			// Track all results for streaming updates in batch mode
 			const allItems: (SingleDispatchResult | null)[] = taskList.map(() => null);
-			reconcileCompletedSubagentHistory(parentSessionFile, ctx.cwd, ctx.sessionManager.getBranch());
 
 			const emitBatchUpdate = () => {
 				if (!onUpdate) return;
-				const currentItems = allItems.filter((i): i is SingleDispatchResult => i !== null);
+				const currentItems: SingleDispatchResult[] = allItems
+					.filter((i): i is SingleDispatchResult => i !== null);
 				if (currentItems.length === 0) return;
 				onUpdate({
 					content: [{ type: "text", text: currentItems.map((i) => `[${i.thread}] ${i.episode || "(running...)"}`).join("\n\n") }],
@@ -868,13 +909,17 @@ export default function (pi: ExtensionAPI) {
 				});
 			};
 
-			const runOne = async (task: DispatchTask, index: number): Promise<SingleDispatchResult> => {
-				const sessionPath = taskSessionPaths.get(task.thread) ?? getThreadSessionPath(threadsDir, task.thread);
-				const episodeNumber = (episodeCounts.get(sessionPath) || 0) + 1;
+			// Run all tasks (parallel for batch, single for single)
+			const runOne = async (task: { thread: string; action: string }, index: number): Promise<SingleDispatchResult> => {
+				const episodeNumber = (episodeCounts.get(task.thread) || 0) + 1;
+
+				// For single mode, pass onUpdate directly for live streaming
+				// For batch mode, create a per-task updater that updates this task's slot and emits
 				const taskOnUpdate = mode === "single"
 					? onUpdate
 					: onUpdate
 						? (partial: AgentToolResult<DispatchDetails>) => {
+								// Update this task's in-progress slot
 								const inProgress = partial.details?.items?.[0];
 								if (inProgress) {
 									allItems[index] = inProgress;
@@ -883,87 +928,33 @@ export default function (pi: ExtensionAPI) {
 							}
 						: undefined;
 
-				const runId = `${task.thread}:${episodeNumber}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
-
-				const pendingItem: SingleDispatchResult = {
-					thread: task.thread,
-					action: task.action,
-					episode: "(running...)",
+				const result = await runThreadAction(
+					ctx.cwd, task.thread, task.action, model, signal,
+					taskOnUpdate,
 					episodeNumber,
-					result: createEmptyThreadActionResult({
-						thread: task.thread,
-						action: task.action,
-						model,
-						sessionPath,
-						isNewThread: !fs.existsSync(sessionPath),
-					}),
-				};
-				allItems[index] = pendingItem;
-				if (parentSessionFile) {
-					subagentRunStore.startRun({
-						parentSessionFile,
-						runId,
-						thread: task.thread,
-						sessionPath,
-						action: task.action,
-					});
-				}
-				taskOnUpdate?.({
-					content: [{ type: "text", text: "(running...)" }],
-					details: { mode: "single", items: [pendingItem] },
-				});
-
-				const result = await runThreadAction({
-					runtime: piActorRuntime,
-					cwd: ctx.cwd,
-					threadName: task.thread,
-					action: task.action,
-					model,
-					signal,
-					onUpdate: taskOnUpdate,
-					episodeNumber,
-					runId,
-					onRuntimeMessage: (message, liveCost) => {
-						if (!parentSessionFile) return;
-						subagentRunStore.recordMessage({
-							parentSessionFile,
-							runId,
-							message,
-							sessionPath,
-							liveCost,
-						});
-					},
-				});
-
-				const episode = buildThreadEpisode(
-					result.messages as Parameters<typeof buildThreadEpisode>[0],
-					{ emptyFallback: getDispatchFailureSummary(result) },
 				);
-				episodeCounts.set(result.sessionPath, episodeNumber);
+
+				// Build episode directly — tool call history + last message, no extra model call
+				const episode = buildEpisode(result.messages);
+				episodeCounts.set(task.thread, episodeNumber);
 
 				const item: SingleDispatchResult = { thread: task.thread, action: task.action, episode, episodeNumber, result };
 				allItems[index] = item;
-				if (parentSessionFile) {
-					subagentRunStore.finishRun({
-						parentSessionFile,
-						runId,
-						thread: task.thread,
-						sessionPath: result.sessionPath,
-						action: task.action,
-						episodeNumber,
-						status: toSubagentStatus(result),
-						usageCost: result.usage.cost,
-						messages: result.messages,
-					});
-				}
 				if (mode === "batch") emitBatchUpdate();
 				return item;
 			};
 
-			const items = await Promise.all(taskList.map((task, index) => runOne(task, index)));
-			const anyError = items.some(({ result }) =>
-				result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted",
+			let items: SingleDispatchResult[];
+			if (taskList.length === 1) {
+				items = [await runOne(taskList[0], 0)];
+			} else {
+				items = await Promise.all(taskList.map((t, i) => runOne(t, i)));
+			}
+
+			const anyError = items.some(
+				(i) => i.result.exitCode !== 0 || i.result.stopReason === "error" || i.result.stopReason === "aborted",
 			);
+
 			const contentText = items.map((i) => `[${i.thread}] ${i.episode}`).join("\n\n");
 
 			return {
@@ -976,12 +967,11 @@ export default function (pi: ExtensionAPI) {
 		// ─── Rendering ───
 
 		renderCall(args, theme) {
-			const tasks = args.tasks;
-			if (tasks && tasks.length > 0) {
+			if (args.tasks && args.tasks.length > 0) {
 				return {
 					render(width: number): string[] {
 						return renderColumnsInRows(
-							tasks.map((t: { thread: string; action: string }) => (colWidth: number) => {
+							args.tasks.map((t: { thread: string; action: string }) => (colWidth: number) => {
 								const header = theme.fg("accent", theme.bold(`[${t.thread}]`));
 								const actionLines = wrapText(t.action, colWidth - 1);
 								return [header, ...actionLines.map((l: string) => theme.fg("dim", l))];
@@ -1008,7 +998,7 @@ export default function (pi: ExtensionAPI) {
 			};
 		},
 
-		renderResult(result, _controls, theme) {
+		renderResult(result, { expanded }, theme) {
 			const details = result.details as DispatchDetails | undefined;
 
 			if (!details || details.items.length === 0) {
@@ -1016,7 +1006,119 @@ export default function (pi: ExtensionAPI) {
 				return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
 			}
 
-			return new DispatchSummaryText(details.items, theme);
+			const renderSingleItem = (item: SingleDispatchResult, isExpanded: boolean) => {
+				const r = item.result;
+				const isRunning = !item.episode || item.episode === "(running...)";
+				const isError = !isRunning && (r.exitCode !== 0 || r.stopReason === "error" || r.stopReason === "aborted");
+				const threadLabel = theme.fg("accent", theme.bold(`[${item.thread}]`));
+				const epLabel = theme.fg("muted", `ep${item.episodeNumber}`);
+				const modelLabel = r.model ? theme.fg("dim", r.model) : "";
+
+				// ── Running state: action + live tool calls + stats ──
+				if (isRunning) {
+					return {
+						render(colWidth: number): string[] {
+							const lines: string[] = [];
+
+							// Status line: ⏳ turns · cost · context
+							const statParts: string[] = [];
+							if (r.usage.turns) statParts.push(`${r.usage.turns} turn${r.usage.turns > 1 ? "s" : ""}`);
+							if (r.usage.cost) statParts.push(`$${r.usage.cost.toFixed(2)}`);
+							if (r.usage.contextTokens > 0) statParts.push(`ctx:${formatTokens(r.usage.contextTokens)}`);
+							if (statParts.length > 0) {
+								lines.push(theme.fg("warning", "⏳") + " " + theme.fg("dim", statParts.join(" · ")));
+							}
+
+							// Live tool calls
+							const displayItems = getDisplayItems(r.messages);
+							const toolCalls = displayItems.filter((i) => i.type === "toolCall");
+							for (const tc of toolCalls) {
+								if (tc.type === "toolCall") {
+									lines.push(theme.fg("muted", "→ ") + formatToolCall(tc.name, tc.args, theme.fg.bind(theme)));
+								}
+							}
+
+							return lines.map((l) => truncateToWidth(l, colWidth));
+						},
+						invalidate(): void {},
+					};
+				}
+
+				// ── Done state: episode ──
+				const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+				const newBadge = r.isNewThread ? theme.fg("warning", " new") : "";
+
+				if (isExpanded) {
+					const mdTheme = getMarkdownTheme();
+					const container = new Container();
+					container.addChild(new Text(`${icon} ${threadLabel} ${epLabel} ${modelLabel}${newBadge}`, 0, 0));
+					container.addChild(new Spacer(1));
+					container.addChild(new Text(theme.fg("muted", "─── Action ───"), 0, 0));
+					container.addChild(new Text(theme.fg("dim", item.action), 0, 0));
+
+					const displayItems = getDisplayItems(r.messages);
+					const toolCalls = displayItems.filter((i) => i.type === "toolCall");
+					if (toolCalls.length > 0) {
+						container.addChild(new Spacer(1));
+						container.addChild(new Text(theme.fg("muted", "─── Activity ───"), 0, 0));
+						for (const tc of toolCalls) {
+							if (tc.type === "toolCall") {
+								container.addChild(
+									new Text(theme.fg("muted", "→ ") + formatToolCall(tc.name, tc.args, theme.fg.bind(theme)), 0, 0),
+								);
+							}
+						}
+					}
+					container.addChild(new Spacer(1));
+					container.addChild(new Text(theme.fg("muted", "─── Episode ───"), 0, 0));
+					container.addChild(new Markdown(item.episode.trim(), 0, 0, mdTheme));
+
+					const usageStr = formatUsage(r.usage, r.model);
+					if (usageStr) {
+						container.addChild(new Spacer(1));
+						container.addChild(new Text(theme.fg("dim", usageStr), 0, 0));
+					}
+					return container;
+				}
+
+				// Collapsed done
+				let text = `${icon} ${threadLabel} ${epLabel} ${modelLabel}${newBadge}`;
+				if (isError && r.errorMessage) text += `\n${theme.fg("error", r.errorMessage)}`;
+				text += `\n${item.episode}`;
+				const usageStr = formatUsage(r.usage, r.model);
+				if (usageStr) text += `\n${theme.fg("dim", usageStr)}`;
+				return new Text(text, 0, 0);
+			};
+
+			// Single mode: render as before
+			if (details.mode === "single" || details.items.length === 1) {
+				const component = renderSingleItem(details.items[0], expanded);
+				if (!expanded) {
+					const container = new Container();
+					container.addChild(component);
+					container.addChild(new Text(theme.fg("muted", "(Ctrl+O to expand)"), 0, 0));
+					return container;
+				}
+				return component;
+			}
+
+			// Batch mode: render in columns
+			// Batch mode: render in rows of 3 columns
+			return {
+				render(width: number): string[] {
+					const lines = renderColumnsInRows(
+						details.items.map((item) => (colWidth: number) => {
+							const component = renderSingleItem(item, expanded);
+							return component.render(colWidth);
+						}),
+						width,
+						theme,
+					);
+					if (!expanded) lines.push(theme.fg("muted", "(Ctrl+O to expand)"));
+					return lines;
+				},
+				invalidate(): void {},
+			};
 		},
 	});
 }
