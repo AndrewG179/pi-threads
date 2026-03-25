@@ -16,7 +16,7 @@
 import * as fs from "node:fs";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import { type ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Text, truncateToWidth, visibleWidth } from "./src/pi/runtime-deps";
+import { Text, createSearchInput, truncateToWidth, visibleWidth } from "./src/pi/runtime-deps";
 
 import {
 	collectCompletedDispatchItems,
@@ -468,7 +468,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const { DynamicBorder } = await import("@mariozechner/pi-coding-agent");
-		const { Container, Input } = await import("@mariozechner/pi-tui");
+		const { Container } = await import("@mariozechner/pi-tui");
 		const BorderComponent = typeof DynamicBorder === "function"
 			? DynamicBorder
 			: class {
@@ -476,30 +476,6 @@ export default function (pi: ExtensionAPI) {
 					render(_width: number) {
 						return [""];
 					}
-					invalidate() {}
-				};
-		const SearchInput = typeof Input === "function"
-			? Input
-			: class {
-					focused = false;
-					private value = "";
-
-					setValue(value: string) {
-						this.value = value;
-					}
-
-					getValue() {
-						return this.value;
-					}
-
-					handleInput(data: string) {
-						this.value += data;
-					}
-
-					render(_width: number) {
-						return [this.value];
-					}
-
 					invalidate() {}
 				};
 		const parentModel = getParentSessionModel(ctx);
@@ -519,8 +495,7 @@ export default function (pi: ExtensionAPI) {
 			let query = initialQuery.trim();
 			let filteredModels = query ? findFuzzyModelMatches(sortedModels, query) : sortedModels;
 			let selectedIndex = 0;
-			const searchInput = new SearchInput();
-			searchInput.setValue(query);
+			const searchInput = createSearchInput(theme, query);
 			const container = new Container();
 			const headerText = new Text(theme.fg("accent", theme.bold("Subagent model override")), 0, 0);
 			const hintText = new Text(
