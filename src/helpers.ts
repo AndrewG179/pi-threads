@@ -75,6 +75,7 @@ export async function mapWithConcurrencyLimit<TIn, TOut>(
 	if (items.length === 0) return [];
 	const limit = Math.max(1, Math.min(concurrency, items.length));
 	const results: TOut[] = new Array(items.length);
+	const errors: { index: number; error: unknown }[] = [];
 	let nextIndex = 0;
 	const workers = new Array(limit).fill(null).map(async () => {
 		while (true) {
@@ -83,25 +84,35 @@ export async function mapWithConcurrencyLimit<TIn, TOut>(
 			// and bounds check happen synchronously before the await.
 			const current = nextIndex++;
 			if (current >= items.length) return;
-			results[current] = await fn(items[current], current);
+			try {
+				results[current] = await fn(items[current], current);
+			} catch (error) {
+				errors.push({ index: current, error });
+			}
 		}
 	});
 	await Promise.all(workers);
+	if (errors.length > 0) {
+		throw errors[0].error;
+	}
 	return results;
 }
 
 // ─── Pi Invocation ───
 
 export function getPiInvocation(args: string[]): { command: string; args: string[] } {
+	// Branch 1: Running via `node /path/to/pi.js` — re-invoke with same script
 	const currentScript = process.argv[1];
 	if (currentScript && fs.existsSync(currentScript)) {
 		return { command: process.execPath, args: [currentScript, ...args] };
 	}
+	// Branch 2: Running as a compiled binary (e.g. `pi` installed as native executable)
 	const execName = path.basename(process.execPath).toLowerCase();
 	const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
 	if (!isGenericRuntime) {
 		return { command: process.execPath, args };
 	}
+	// Branch 3: Fallback — assume `pi` is available on PATH
 	return { command: "pi", args };
 }
 

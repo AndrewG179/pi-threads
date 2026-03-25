@@ -221,6 +221,10 @@ export function setupDashboard(pi: ExtensionAPI, registry: ThreadRegistry) {
 									const sessionPath = getThreadSessionPath(ctx.cwd, threadName);
 									fs.unlinkSync(sessionPath);
 								} catch { /* ignore */ }
+								// Recreate empty session file so listThreads still sees the thread
+								try {
+									fs.writeFileSync(getThreadSessionPath(ctx.cwd, threadName), '', 'utf-8');
+								} catch { /* ignore */ }
 								registry.resetThread(threadName);
 								refreshThreads();
 							}

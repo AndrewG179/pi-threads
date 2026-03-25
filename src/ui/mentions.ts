@@ -59,6 +59,8 @@ export function setupMentions(pi: ExtensionAPI, registry: ThreadRegistry): void 
 		if (spaceIdx === -1) return { action: "continue" };
 
 		const threadName = text.slice(1, spaceIdx);
+		// Validate thread name is a safe identifier (letters, numbers, hyphens, dots, underscores)
+		if (!/^[\w.-]+$/.test(threadName)) return { action: "continue" };
 		const message = text.slice(spaceIdx + 1).trim();
 
 		if (!threadName || !message) return { action: "continue" };

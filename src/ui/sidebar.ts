@@ -8,6 +8,7 @@
 import * as fs from "node:fs";
 
 import { DynamicBorder } from "@mariozechner/pi-coding-agent";
+import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Container, Text, Spacer, matchesKey, Key, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 
 import { getThreadSessionPath, wrapText } from "../helpers.ts";
@@ -57,10 +58,7 @@ function parseSessionFile(filePath: string): ParsedMessage[] {
 				});
 			}
 		} catch {
-			// Skip unparseable lines (may be in-progress write on last line)
-			if (i < lines.length - 1) {
-				// Only silently skip the last line; earlier failures are unexpected but non-fatal
-			}
+			// Skip unparseable lines (last line may be partial from in-progress write)
 		}
 	}
 
@@ -187,7 +185,7 @@ function truncate(text: string, maxLen: number): string {
 	return truncateToWidth(oneLine, maxLen - 1) + "…";
 }
 
-export function openEpisodeSidebar(ctx: { ui: { custom: (...args: unknown[]) => void } }, threadName: string, cwd: string): void {
+export function openEpisodeSidebar(ctx: ExtensionContext, threadName: string, cwd: string): void {
 	const sessionPath = getThreadSessionPath(cwd, threadName);
 	const messages = parseSessionFile(sessionPath);
 	const episodes = buildEpisodes(messages);

@@ -137,9 +137,7 @@ export function renderResult(result: { details?: DispatchDetails; content: Array
 					const displayItems = getDisplayItems(r.messages);
 					const toolCalls = displayItems.filter((i) => i.type === "toolCall");
 					for (const tc of toolCalls) {
-						if (tc.type === "toolCall") {
-							lines.push(theme.fg("muted", "→ ") + formatToolCall(tc.name, tc.args, theme.fg.bind(theme)));
-						}
+						lines.push(theme.fg("muted", "→ ") + formatToolCall(tc.name, tc.args, theme.fg.bind(theme)));
 					}
 
 					return lines.map((l) => truncateToWidth(l, colWidth));
@@ -166,11 +164,9 @@ export function renderResult(result: { details?: DispatchDetails; content: Array
 				container.addChild(new Spacer(1));
 				container.addChild(new Text(theme.fg("muted", "─── Activity ───"), 0, 0));
 				for (const tc of toolCalls) {
-					if (tc.type === "toolCall") {
-						container.addChild(
-							new Text(theme.fg("muted", "→ ") + formatToolCall(tc.name, tc.args, theme.fg.bind(theme)), 0, 0),
-						);
-					}
+					container.addChild(
+						new Text(theme.fg("muted", "→ ") + formatToolCall(tc.name, tc.args, theme.fg.bind(theme)), 0, 0),
+					);
 				}
 			}
 			container.addChild(new Spacer(1));
