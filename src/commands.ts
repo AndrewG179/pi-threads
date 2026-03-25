@@ -5,7 +5,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import type { ThreadRegistry } from "./state.ts";
 import { getThreadSessionPath, listThreads, formatTokens } from "./helpers.ts";
 
-export function updateStatusBar(ctx: any, registry: ThreadRegistry): void {
+export function updateStatusBar(ctx: { ui: { setStatus: (key: string, text: string) => void } }, registry: ThreadRegistry): void {
 	const thinkingLabel = registry.subagentThinking || "default";
 	const statusText = `sub: ${registry.subagentModel} | thinking: ${thinkingLabel}`;
 	ctx.ui.setStatus("subagent-model", `\x1b[${(process.stdout.columns ?? 120) - statusText.length + 1}G\x1b[2m${statusText}\x1b[0m`);
@@ -53,7 +53,7 @@ export function registerCommands(pi: ExtensionAPI, registry: ThreadRegistry): vo
 				}
 				// Fuzzy match
 				const allModels = ctx.modelRegistry.getAvailable();
-				const matches = allModels.filter((m: any) =>
+				const matches = allModels.filter((m: { id: string; name?: string; provider: string }) =>
 					`${m.id} ${m.provider} ${m.provider}/${m.id}`.toLowerCase().includes(modelInput.toLowerCase())
 				);
 				if (matches.length === 1) {
@@ -77,13 +77,13 @@ export function registerCommands(pi: ExtensionAPI, registry: ThreadRegistry): vo
 
 			// Sort: current model first, then alphabetical by provider
 			const items = available
-				.map((m: any) => ({
+				.map((m: { id: string; name?: string; provider: string }) => ({
 					id: m.id,
 					name: m.name || m.id,
 					provider: m.provider,
 					isCurrent: `${m.provider}/${m.id}` === registry.subagentModel,
 				}))
-				.sort((a: any, b: any) => {
+				.sort((a: { isCurrent: boolean; provider: string }, b: { isCurrent: boolean; provider: string }) => {
 					if (a.isCurrent && !b.isCurrent) return -1;
 					if (!a.isCurrent && b.isCurrent) return 1;
 					return a.provider.localeCompare(b.provider);
@@ -108,7 +108,7 @@ export function registerCommands(pi: ExtensionAPI, registry: ThreadRegistry): vo
 					if (!q) {
 						filtered = [...items];
 					} else {
-						filtered = items.filter((m: any) =>
+						filtered = items.filter((m: { id: string; name?: string; provider: string }) =>
 							`${m.id} ${m.provider} ${m.provider}/${m.id} ${m.name}`.toLowerCase().includes(q)
 						);
 					}

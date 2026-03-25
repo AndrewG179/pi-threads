@@ -18,7 +18,7 @@ interface ParsedMessage {
 	id?: string;
 	parentId?: string;
 	role: string;
-	content: any;
+	content: unknown;
 	timestamp?: number;
 }
 
@@ -106,12 +106,12 @@ function followActiveBranch(messages: ParsedMessage[]): ParsedMessage[] {
 	return branch;
 }
 
-function extractText(content: any): string {
+function extractText(content: unknown): string {
 	if (typeof content === "string") return content;
 	if (Array.isArray(content)) {
 		return content
-			.filter((c: any) => c.type === "text" && c.text)
-			.map((c: any) => c.text)
+			.filter((c: { type: string; text?: string; name?: string }) => c.type === "text" && c.text)
+			.map((c: { type: string; text?: string; name?: string }) => c.text)
 			.join(" ");
 	}
 	return "";
@@ -120,8 +120,8 @@ function extractText(content: any): string {
 function extractToolCalls(msg: ParsedMessage): string[] {
 	if (!Array.isArray(msg.content)) return [];
 	return msg.content
-		.filter((c: any) => c.type === "toolCall")
-		.map((c: any) => c.name || "unknown");
+		.filter((c: { type: string; text?: string; name?: string }) => c.type === "toolCall")
+		.map((c: { type: string; text?: string; name?: string }) => c.name || "unknown");
 }
 
 function buildEpisodes(messages: ParsedMessage[]): Episode[] {
@@ -187,7 +187,7 @@ function truncate(text: string, maxLen: number): string {
 	return truncateToWidth(oneLine, maxLen - 1) + "…";
 }
 
-export function openEpisodeSidebar(ctx: any, threadName: string, cwd: string): void {
+export function openEpisodeSidebar(ctx: { ui: { custom: (...args: unknown[]) => void } }, threadName: string, cwd: string): void {
 	const sessionPath = getThreadSessionPath(cwd, threadName);
 	const messages = parseSessionFile(sessionPath);
 	const episodes = buildEpisodes(messages);
@@ -196,7 +196,7 @@ export function openEpisodeSidebar(ctx: any, threadName: string, cwd: string): v
 	const reversed = [...episodes].reverse();
 
 	ctx.ui.custom(
-		(tui: any, theme: any, _kb: any, done: (val: undefined) => void) => {
+		(tui: { requestRender: () => void }, theme: { fg: (color: string, text: string) => string; bold: (text: string) => string }, _kb: unknown, done: (val: undefined) => void) => {
 			let selectedIndex = 0;
 			const expanded = new Set<number>(); // indices of expanded episodes
 

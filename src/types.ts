@@ -44,4 +44,4 @@ export interface DispatchDetails {
 	items: SingleDispatchResult[];
 }
 
-export type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; name: string; args: Record<string, any> };
+export type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; name: string; args: Record<string, unknown> };

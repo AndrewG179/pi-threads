@@ -78,6 +78,9 @@ export async function mapWithConcurrencyLimit<TIn, TOut>(
 	let nextIndex = 0;
 	const workers = new Array(limit).fill(null).map(async () => {
 		while (true) {
+			// Safe: JS is single-threaded, so nextIndex++ is atomic.
+			// Each worker awaits fn() which may yield, but the increment
+			// and bounds check happen synchronously before the await.
 			const current = nextIndex++;
 			if (current >= items.length) return;
 			results[current] = await fn(items[current], current);
@@ -118,7 +121,7 @@ export function formatTokens(count: number): string {
 export function renderColumnsInRows(
 	items: ((colWidth: number) => string[])[],
 	width: number,
-	theme: any,
+	theme: { fg: (style: string, text: string) => string },
 ): string[] {
 	const sep = theme.fg("muted", "│");
 	const sepWidth = 3; // " │ "

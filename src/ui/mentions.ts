@@ -79,6 +79,7 @@ export function setupMentions(pi: ExtensionAPI, registry: ThreadRegistry): void 
 		// Fire and forget the actual work
 		doThreadWork(pi, registry, ctx.cwd, threadName, message).catch((e) => {
 			console.error(`@${threadName} mention failed:`, e);
+			ctx.ui.notify(`@${threadName} failed: ${e instanceof Error ? e.message : String(e)}`, "error");
 		});
 
 		return { action: "handled" };
@@ -114,7 +115,7 @@ async function doThreadWork(
 			.filter((m) => m.role === "assistant")
 			.pop();
 		const text = lastMsg?.content
-			?.find((p: any) => p.type === "text")
+			?.find((p: { type: string; text?: string }) => p.type === "text")
 			?.text || "(no response)";
 
 		pi.sendMessage<ThreadResponseDetails>({
@@ -127,10 +128,10 @@ async function doThreadWork(
 				turns: result.messages.length,
 			},
 		}, { triggerTurn: false });
-	} catch (e: any) {
+	} catch (e: unknown) {
 		pi.sendMessage<ThreadResponseDetails>({
 			customType: "thread-response",
-			content: `Error talking to thread "${threadName}": ${e?.message || String(e)}`,
+			content: `Error talking to thread "${threadName}": ${e instanceof Error ? e.message : String(e)}`,
 			display: true,
 			details: {
 				threadName,

@@ -13,10 +13,15 @@ import {
 	wrapText,
 } from "./helpers.ts";
 
+interface ThemeArg {
+	fg: (color: string, text: string) => string;
+	bold: (text: string) => string;
+}
+
 export function formatToolCall(
 	toolName: string,
 	args: Record<string, unknown>,
-	fg: (color: any, text: string) => string,
+	fg: (color: string, text: string) => string,
 ): string {
 	const shorten = (p: string) => {
 		const home = os.homedir();
@@ -62,12 +67,13 @@ export function getDisplayItems(messages: Message[]): DisplayItem[] {
 
 // ─── renderCall ───
 
-export function renderCall(args: any, theme: any) {
-	if (args.tasks && args.tasks.length > 0) {
+export function renderCall(args: Record<string, unknown>, theme: ThemeArg) {
+	const tasks = Array.isArray(args.tasks) ? args.tasks as Array<{ thread: string; action: string }> : [];
+	if (tasks.length > 0) {
 		return {
 			render(width: number): string[] {
 				return renderColumnsInRows(
-					args.tasks.map((t: { thread: string; action: string }) => (colWidth: number) => {
+					tasks.map((t: { thread: string; action: string }) => (colWidth: number) => {
 						const header = theme.fg("accent", theme.bold(`[${t.thread}]`));
 						const actionLines = wrapText(t.action, colWidth - 1);
 						return [header, ...actionLines.map((l: string) => theme.fg("dim", l))];
@@ -81,8 +87,8 @@ export function renderCall(args: any, theme: any) {
 	}
 
 	// Single dispatch
-	const threadName = args.thread || "...";
-	const actionText = args.action || "...";
+	const threadName = (args.thread as string) || "...";
+	const actionText = (args.action as string) || "...";
 
 	return {
 		render(width: number): string[] {
@@ -96,12 +102,12 @@ export function renderCall(args: any, theme: any) {
 
 // ─── renderResult ───
 
-export function renderResult(result: any, { expanded }: { expanded: boolean }, theme: any) {
+export function renderResult(result: { details?: DispatchDetails; content: Array<{ type: string; text?: string }> }, { expanded }: { expanded: boolean }, theme: ThemeArg) {
 	const details = result.details as DispatchDetails | undefined;
 
 	if (!details || details.items.length === 0) {
 		const text = result.content[0];
-		return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
+		return new Text(text?.type === "text" && text.text ? text.text : "(no output)", 0, 0);
 	}
 
 	const renderSingleItem = (item: SingleDispatchResult, isExpanded: boolean) => {

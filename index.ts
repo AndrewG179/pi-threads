@@ -72,7 +72,7 @@ export default function (pi: ExtensionAPI) {
 					const details = entry.message.details as DispatchDetails | undefined;
 					if (details?.items) {
 						for (const item of details.items) {
-							registry.episodeCounts.set(item.thread, Math.max(registry.episodeCounts.get(item.thread) || 0, item.episodeNumber));
+							registry.updateEpisodeCount(item.thread, item.episodeNumber);
 						}
 					}
 				}
@@ -218,17 +218,20 @@ export default function (pi: ExtensionAPI) {
 
 				// Build episode directly — tool call history + last message, no extra model call
 				const episode = buildEpisode(result.messages, result.compaction);
-				registry.episodeCounts.set(task.thread, episodeNumber);
+				registry.setEpisodeCount(task.thread, episodeNumber);
 
 				// Update thread context stats
-				const existingStats = registry.threadStats.get(task.thread) || { contextTokens: 0, lastCompactedAt: 0, compactionCount: 0 };
-				existingStats.contextTokens = result.usage.contextTokens;
+				const existingStats = registry.threadStats.get(task.thread);
+				const updatedStats = {
+					contextTokens: result.usage.contextTokens,
+					lastCompactedAt: existingStats?.lastCompactedAt || 0,
+					compactionCount: existingStats?.compactionCount || 0,
+				};
 				if (result.compaction) {
-					existingStats.lastCompactedAt = Date.now();
-					existingStats.compactionCount++;
+					updatedStats.lastCompactedAt = Date.now();
+					updatedStats.compactionCount++;
 				}
-				registry.threadStats.set(task.thread, existingStats);
-				registry.emit();
+				registry.updateThreadStats(task.thread, updatedStats);
 
 				const item: SingleDispatchResult = { thread: task.thread, action: task.action, episode, episodeNumber, result };
 				allItems[index] = item;

@@ -52,12 +52,20 @@ export async function runPiOnThread(
 		const proc = spawn(invocation.command, invocation.args, { cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] });
 		let buffer = "";
 
+		interface PiStreamEvent {
+			type?: string;
+			message?: Message;
+			result?: { tokensBefore?: number; tokensAfter?: number };
+		}
+
 		const processLine = (line: string) => {
 			if (!line.trim()) return;
-			let event: any;
+			let event: PiStreamEvent;
 			try {
-				event = JSON.parse(line);
+				event = JSON.parse(line) as PiStreamEvent;
 			} catch {
+				// Malformed JSON line from subprocess — skip silently
+				// (partial lines are buffered and retried, only truly broken lines land here)
 				return;
 			}
 			if (event.type === "message_end" && event.message) {
@@ -92,7 +100,10 @@ export async function runPiOnThread(
 			resolve(code ?? 0);
 		});
 
-		proc.on("error", () => resolve(1));
+		proc.on("error", (err) => {
+			stderr += `Spawn error: ${err.message}\n`;
+			resolve(1);
+		});
 
 		if (signal) {
 			const killProc = () => {

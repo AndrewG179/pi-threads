@@ -4,15 +4,39 @@ import type { ThreadStats } from "./types.ts";
 import { listThreads as listThreadsFromDir } from "./helpers.ts";
 
 export class ThreadRegistry {
-	episodeCounts = new Map<string, number>();
-	threadStats = new Map<string, ThreadStats>();
+	private _episodeCounts = new Map<string, number>();
+	private _threadStats = new Map<string, ThreadStats>();
+	private _runningThreads = new Set<string>();
+	private _lastActivity = new Map<string, number>();
+	private _threadErrors = new Map<string, boolean>();
+	private emitter = new EventEmitter();
+
 	subagentModel = "anthropic/claude-sonnet-4-6";
 	subagentThinking: string | undefined = undefined;
-	runningThreads = new Set<string>();
-	lastActivity = new Map<string, number>();
-	threadErrors = new Map<string, boolean>();
 
-	private emitter = new EventEmitter();
+	// ─── Read-only accessors ───
+
+	get episodeCounts(): ReadonlyMap<string, number> {
+		return this._episodeCounts;
+	}
+
+	get threadStats(): ReadonlyMap<string, ThreadStats> {
+		return this._threadStats;
+	}
+
+	get runningThreads(): ReadonlySet<string> {
+		return this._runningThreads;
+	}
+
+	get lastActivity(): ReadonlyMap<string, number> {
+		return this._lastActivity;
+	}
+
+	get threadErrors(): ReadonlyMap<string, boolean> {
+		return this._threadErrors;
+	}
+
+	// ─── Queries ───
 
 	listThreads(cwd: string): string[] {
 		return listThreadsFromDir(cwd);
@@ -20,53 +44,86 @@ export class ThreadRegistry {
 
 	getThreadState(name: string): { episodes: number; stats: ThreadStats | undefined } {
 		return {
-			episodes: this.episodeCounts.get(name) || 0,
-			stats: this.threadStats.get(name),
+			episodes: this._episodeCounts.get(name) || 0,
+			stats: this._threadStats.get(name),
 		};
 	}
 
+	// ─── Mutations (all emit automatically) ───
+
+	setEpisodeCount(name: string, count: number): void {
+		this._episodeCounts.set(name, count);
+		this.emit();
+	}
+
+	updateEpisodeCount(name: string, count: number): void {
+		this._episodeCounts.set(name, Math.max(this._episodeCounts.get(name) || 0, count));
+		this.emit();
+	}
+
+	updateThreadStats(name: string, stats: ThreadStats): void {
+		this._threadStats.set(name, stats);
+		this.emit();
+	}
+
 	markRunning(name: string): void {
-		this.runningThreads.add(name);
+		this._runningThreads.add(name);
 		this.emit();
 	}
 
 	markDone(name: string): void {
-		this.runningThreads.delete(name);
-		this.lastActivity.set(name, Date.now());
+		this._runningThreads.delete(name);
+		this._lastActivity.set(name, Date.now());
 		this.emit();
 	}
 
 	markError(name: string): void {
-		this.threadErrors.set(name, true);
+		this._threadErrors.set(name, true);
 		this.emit();
 	}
 
 	clearError(name: string): void {
-		this.threadErrors.delete(name);
+		this._threadErrors.delete(name);
 		this.emit();
 	}
 
-	onChange(cb: () => void): void {
+	// ─── Listener management ───
+
+	onChange(cb: () => void): () => void {
 		this.emitter.on("change", cb);
+		return () => { this.emitter.off("change", cb); };
 	}
 
-	emit(): void {
-		this.emitter.emit("change");
-	}
+	// ─── Bulk operations ───
 
 	clear(): void {
-		this.episodeCounts.clear();
-		this.threadStats.clear();
-		this.lastActivity.clear();
-		this.threadErrors.clear();
+		this._episodeCounts.clear();
+		this._threadStats.clear();
+		this._lastActivity.clear();
+		this._threadErrors.clear();
+		this._runningThreads.clear();
 		this.emit();
 	}
 
 	clearThread(name: string): void {
-		this.episodeCounts.delete(name);
-		this.threadStats.delete(name);
-		this.lastActivity.delete(name);
-		this.threadErrors.delete(name);
+		this._episodeCounts.delete(name);
+		this._threadStats.delete(name);
+		this._lastActivity.delete(name);
+		this._threadErrors.delete(name);
+		this._runningThreads.delete(name);
 		this.emit();
+	}
+
+	resetThread(name: string): void {
+		this._threadStats.delete(name);
+		this._lastActivity.set(name, Date.now());
+		this._threadErrors.delete(name);
+		this._runningThreads.delete(name);
+		// Preserve episodeCounts — thread identity is kept
+		this.emit();
+	}
+
+	private emit(): void {
+		this.emitter.emit("change");
 	}
 }

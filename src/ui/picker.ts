@@ -12,16 +12,8 @@ import { DynamicBorder } from "@mariozechner/pi-coding-agent";
 import { Container, type SelectItem, SelectList, Text } from "@mariozechner/pi-tui";
 
 import type { ThreadRegistry } from "../state.ts";
-import { listThreads, getThreadSessionPath, formatTokens } from "../helpers.ts";
+import { listThreads, getThreadSessionPath, formatTokens, relativeTime } from "../helpers.ts";
 import { openEpisodeSidebar } from "./sidebar.ts";
-
-function formatTimeAgo(ms: number): string {
-	const ago = Date.now() - ms;
-	if (ago < 60_000) return "just now";
-	if (ago < 3_600_000) return `${Math.round(ago / 60_000)}m ago`;
-	if (ago < 86_400_000) return `${Math.round(ago / 3_600_000)}h ago`;
-	return `${Math.round(ago / 86_400_000)}d ago`;
-}
 
 export function setupPicker(pi: ExtensionAPI, registry: ThreadRegistry): void {
 	pi.registerShortcut("ctrl+alt+t", {
@@ -42,7 +34,7 @@ export function setupPicker(pi: ExtensionAPI, registry: ThreadRegistry): void {
 				let mtimeStr = "";
 				try {
 					const stat = fs.statSync(sessionPath);
-					mtimeStr = formatTimeAgo(stat.mtimeMs);
+					mtimeStr = relativeTime(stat.mtimeMs);
 				} catch { /* ignore */ }
 
 				const contextInfo = stats?.contextTokens ? `${formatTokens(stats.contextTokens)} ctx` : "0 ctx";
