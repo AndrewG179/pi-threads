@@ -6,12 +6,14 @@
  */
 
 import * as fs from "node:fs";
+import { randomUUID } from "node:crypto";
 
 import { matchesKey, Key, visibleWidth, truncateToWidth } from "@mariozechner/pi-tui";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 
 import type { ThreadRegistry } from "../state.ts";
 import { listThreads, formatTokens, getThreadSessionPath, relativeTime } from "../helpers.ts";
+import { getStatusIcon } from "./shared.ts";
 import { openEpisodeSidebar } from "./sidebar.ts";
 
 // ─── Helpers ───
@@ -62,14 +64,7 @@ export function setupDashboard(pi: ExtensionAPI, registry: ThreadRegistry) {
 
 			/** Get status icon for a thread. */
 			function statusIcon(name: string): string {
-				const hasError = registry.threadErrors.get(name) === true;
-				const isRunning = registry.runningThreads.has(name);
-				const episodes = registry.episodeCounts.get(name) || 0;
-
-				if (hasError) return theme.fg("error", "✗");
-				if (isRunning) return theme.fg("warning", "◉");
-				if (episodes > 0) return theme.fg("success", "●");
-				return theme.fg("dim", "○");
+				return getStatusIcon(registry, name, theme);
 			}
 
 			/** Get mtime-based relative time for a thread. */
@@ -221,9 +216,10 @@ export function setupDashboard(pi: ExtensionAPI, registry: ThreadRegistry) {
 									const sessionPath = getThreadSessionPath(ctx.cwd, threadName);
 									fs.unlinkSync(sessionPath);
 								} catch { /* ignore */ }
-								// Recreate empty session file so listThreads still sees the thread
+								// Recreate session file with valid JSONL header so listThreads still sees the thread
 								try {
-									fs.writeFileSync(getThreadSessionPath(ctx.cwd, threadName), '', 'utf-8');
+									const header = JSON.stringify({ type: "session", id: randomUUID(), cwd: ctx.cwd });
+									fs.writeFileSync(getThreadSessionPath(ctx.cwd, threadName), header + "\n", 'utf-8');
 								} catch { /* ignore */ }
 								registry.resetThread(threadName);
 								refreshThreads();

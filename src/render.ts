@@ -4,7 +4,7 @@ import type { Message } from "@mariozechner/pi-ai";
 import { getMarkdownTheme } from "@mariozechner/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
 
-import type { DispatchDetails, DisplayItem, SingleDispatchResult } from "./types.ts";
+import type { DispatchDetails, DispatchToolResult, DisplayItem, SingleDispatchResult } from "./types.ts";
 import {
 	formatTokens,
 	formatUsage,
@@ -102,7 +102,7 @@ export function renderCall(args: Record<string, unknown>, theme: ThemeArg) {
 
 // ─── renderResult ───
 
-export function renderResult(result: { details?: DispatchDetails; content: Array<{ type: string; text?: string }> }, { expanded }: { expanded: boolean }, theme: ThemeArg) {
+export function renderResult(result: DispatchToolResult, { expanded }: { expanded: boolean }, theme: ThemeArg) {
 	const details = result.details as DispatchDetails | undefined;
 
 	if (!details || details.items.length === 0) {

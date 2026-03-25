@@ -46,7 +46,7 @@ export function registerCommands(pi: ExtensionAPI, registry: ThreadRegistry): vo
 					const found = ctx.modelRegistry.find(provider, modelId);
 					if (found) {
 						registry.subagentModel = `${provider}/${modelId}`;
-						if (thinkingSuffix) registry.subagentThinking = thinkingSuffix;
+						if (thinkingSuffix) registry.setThinking(thinkingSuffix);
 						updateStatusBar(ctx, registry);
 						const thinkingMsg = thinkingSuffix ? ` | thinking: ${thinkingSuffix}` : "";
 						ctx.ui.notify(`Subagent model set to: ${registry.subagentModel}${thinkingMsg}`, "info");
@@ -61,7 +61,7 @@ export function registerCommands(pi: ExtensionAPI, registry: ThreadRegistry): vo
 				);
 				if (matches.length === 1) {
 					registry.subagentModel = `${matches[0].provider}/${matches[0].id}`;
-					if (thinkingSuffix) registry.subagentThinking = thinkingSuffix;
+					if (thinkingSuffix) registry.setThinking(thinkingSuffix);
 					updateStatusBar(ctx, registry);
 					const thinkingMsg = thinkingSuffix ? ` | thinking: ${thinkingSuffix}` : "";
 					ctx.ui.notify(`Subagent model set to: ${registry.subagentModel}${thinkingMsg}`, "info");
@@ -305,7 +305,7 @@ export function registerCommands(pi: ExtensionAPI, registry: ThreadRegistry): vo
 			});
 
 			if (chosenThinking !== null) {
-				registry.subagentThinking = chosenThinking === "__default__" ? undefined : chosenThinking;
+				registry.setThinking(chosenThinking === "__default__" ? undefined : chosenThinking);
 			}
 
 			updateStatusBar(ctx, registry);

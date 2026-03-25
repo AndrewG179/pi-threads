@@ -55,7 +55,7 @@ export default function (pi: ExtensionAPI) {
 		for (const entry of ctx.sessionManager.getEntries()) {
 			if (entry.type === "custom" && entry.customType === "thread-config" && entry.data) {
 				if (entry.data.model) registry.subagentModel = entry.data.model;
-				registry.subagentThinking = entry.data.thinking;
+				registry.setThinking(entry.data.thinking);
 			}
 		}
 

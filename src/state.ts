@@ -3,6 +3,9 @@ import { EventEmitter } from "node:events";
 import type { ThreadStats } from "./types.ts";
 import { listThreads as listThreadsFromDir } from "./helpers.ts";
 
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+
 export class ThreadRegistry {
 	private _episodeCounts = new Map<string, number>();
 	private _threadStats = new Map<string, ThreadStats>();
@@ -12,7 +15,16 @@ export class ThreadRegistry {
 	private emitter = new EventEmitter();
 
 	subagentModel = "anthropic/claude-sonnet-4-6";
-	subagentThinking: string | undefined = undefined;
+	subagentThinking: ThinkingLevel | undefined = undefined;
+
+	/** Set thinking level with validation. Invalid values are silently ignored. */
+	setThinking(value: string | undefined): void {
+		if (value === undefined) {
+			this.subagentThinking = undefined;
+		} else if ((THINKING_LEVELS as readonly string[]).includes(value)) {
+			this.subagentThinking = value as ThinkingLevel;
+		}
+	}
 
 	// ─── Read-only accessors ───
 

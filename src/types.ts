@@ -45,3 +45,8 @@ export interface DispatchDetails {
 }
 
 export type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; name: string; args: Record<string, unknown> };
+
+export interface DispatchToolResult {
+	details?: DispatchDetails;
+	content: Array<{ type: string; text?: string }>;
+}

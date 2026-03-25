@@ -1,5 +1,6 @@
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { ThreadRegistry } from "../state.ts";
+import { getStatusIcon } from "./shared.ts";
 import { listThreads, formatTokens, relativeTime, truncateToWidth } from "../helpers.ts";
 
 // ─── Widget Setup ───
@@ -21,23 +22,12 @@ export function setupWidget(registry: ThreadRegistry, ctx: ExtensionContext): ()
 			lines.push(theme.fg("accent", "🧵 Threads"));
 
 			for (const name of threads) {
-				const isRunning = registry.runningThreads.has(name);
-				const hasError = registry.threadErrors.get(name) === true;
 				const episodes = registry.episodeCounts.get(name) || 0;
 				const stats = registry.threadStats.get(name);
 				const lastActive = registry.lastActivity.get(name);
 
 				// Status icon
-				let icon: string;
-				if (hasError) {
-					icon = theme.fg("error", "✗");
-				} else if (isRunning) {
-					icon = theme.fg("warning", "◉");
-				} else if (episodes > 0) {
-					icon = theme.fg("success", "●");
-				} else {
-					icon = theme.fg("dim", "○");
-				}
+				const icon = getStatusIcon(registry, name, theme);
 
 				// Thread name
 				const nameStr = theme.fg("accent", name);
@@ -73,9 +63,20 @@ export function setupWidget(registry: ThreadRegistry, ctx: ExtensionContext): ()
 	// Initial render
 	rebuildWidget();
 
-	// Re-render on registry changes (triggers filesystem I/O + themed line rebuild)
+	// Debounce re-renders on registry changes to avoid excessive synchronous I/O.
+	// During batch dispatch, registry emits 8-10 changes per thread; this collapses
+	// them into a single rebuild after activity settles.
+	let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 	const unsubscribe = registry.onChange(() => {
-		rebuildWidget();
+		if (debounceTimer) clearTimeout(debounceTimer);
+		debounceTimer = setTimeout(() => {
+			rebuildWidget();
+			debounceTimer = null;
+		}, 100);
 	});
-	return unsubscribe;
+
+	return () => {
+		unsubscribe();
+		if (debounceTimer) clearTimeout(debounceTimer);
+	};
 }

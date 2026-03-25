@@ -93,7 +93,13 @@ export async function mapWithConcurrencyLimit<TIn, TOut>(
 	});
 	await Promise.all(workers);
 	if (errors.length > 0) {
-		throw errors[0].error;
+		if (errors.length === 1) {
+			throw errors[0].error;
+		}
+		throw new AggregateError(
+			errors.map((e) => e.error),
+			`${errors.length} of ${items.length} tasks failed`,
+		);
 	}
 	return results;
 }
