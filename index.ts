@@ -16,7 +16,7 @@
 import * as fs from "node:fs";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import { type ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Text, createSearchInput, truncateToWidth, visibleWidth } from "./src/pi/runtime-deps";
+import { Container, DynamicBorder, Text, createSearchInput, truncateToWidth, visibleWidth } from "./src/pi/runtime-deps";
 
 import {
 	collectCompletedDispatchItems,
@@ -467,17 +467,7 @@ export default function (pi: ExtensionAPI) {
 			return null;
 		}
 
-		const { DynamicBorder } = await import("@mariozechner/pi-coding-agent");
-		const { Container } = await import("@mariozechner/pi-tui");
-		const BorderComponent = typeof DynamicBorder === "function"
-			? DynamicBorder
-			: class {
-					constructor(_render: (text: string) => string) {}
-					render(_width: number) {
-						return [""];
-					}
-					invalidate() {}
-				};
+		const BorderComponent = DynamicBorder;
 		const parentModel = getParentSessionModel(ctx);
 		const currentOverrideRef = subagentModelOverride ? formatModelIdentifier(subagentModelOverride) : undefined;
 		const sortedModels = [...models].sort((left, right) => {

@@ -4,10 +4,8 @@ import { createRequire } from "node:module";
 import * as path from "node:path";
 import test from "node:test";
 
-import { Container, Text } from "@mariozechner/pi-tui";
-
 import { default as registerExtension } from "../../index";
-import { visibleWidth } from "../../src/pi/runtime-deps";
+import { Container, Text, visibleWidth } from "../../src/pi/runtime-deps";
 import { PiActorRuntime } from "../../src/runtime/pi-actor";
 import { SubagentBrowser } from "../../src/subagents/view";
 import {

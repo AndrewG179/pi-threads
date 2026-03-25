@@ -1,4 +1,4 @@
-import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { truncateToWidth, visibleWidth } from "../pi/runtime-deps";
 
 import type { SubagentCard } from "./metadata";
 import { wrapText } from "../text/wrap";

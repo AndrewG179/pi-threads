@@ -1,8 +1,21 @@
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import test from "node:test";
 
 import { createSearchInput } from "../../src/pi/runtime-deps";
 import { makeTheme } from "../helpers/subagent-test-helpers";
+
+test("extension code should route host UI imports through runtime-deps", () => {
+	for (const relativePath of ["index.ts", "src/subagents/view.ts", ".tests/subagents/view-model-contract.test.ts"]) {
+		const source = fs.readFileSync(path.join(process.cwd(), relativePath), "utf8");
+		assert.doesNotMatch(
+			source,
+			/@mariozechner\/pi-tui|await import\("@mariozechner\/pi-coding-agent"\)/,
+			`${relativePath} should use src/pi/runtime-deps instead of importing host UI modules directly`,
+		);
+	}
+});
 
 test("createSearchInput should adapt value-backed pi-tui inputs for /model-sub search filtering", () => {
 	class ValueBackedInput {

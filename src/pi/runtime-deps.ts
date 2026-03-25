@@ -49,11 +49,36 @@ type InputLike = {
 	): InputInstance;
 };
 
+type ContainerInstance = {
+	children: any[];
+	addChild(child: any): void;
+	render(width: number): string[];
+	invalidate(): void;
+};
+
+type ContainerLike = {
+	new (): ContainerInstance;
+};
+
+type DynamicBorderInstance = {
+	render(width: number): string[];
+	invalidate(): void;
+};
+
+type DynamicBorderLike = {
+	new (render: (text: string) => string): DynamicBorderInstance;
+};
+
 type PiTuiModule = {
 	Text: TextLike;
 	Input?: InputLike;
+	Container?: ContainerLike;
 	truncateToWidth: (input: string, width: number, ellipsis?: string) => string;
 	visibleWidth: (input: string) => number;
+};
+
+type PiCodingAgentModule = {
+	DynamicBorder?: DynamicBorderLike;
 };
 
 type TypeboxModule = {
@@ -66,9 +91,12 @@ type TypeboxModule = {
 };
 
 const piTui = loadOptionalModule<PiTuiModule>("@mariozechner/pi-tui");
+const piCodingAgent = loadOptionalModule<PiCodingAgentModule>("@mariozechner/pi-coding-agent");
 const typebox = loadOptionalModule<TypeboxModule>("@sinclair/typebox");
 const BaseText = piTui?.Text as TextLike | undefined;
 const BaseInput = piTui?.Input as InputLike | undefined;
+const BaseContainer = piTui?.Container as ContainerLike | undefined;
+const BaseDynamicBorder = piCodingAgent?.DynamicBorder as DynamicBorderLike | undefined;
 
 class FallbackText {
 	protected text: string;
@@ -129,6 +157,38 @@ class CompatibleText extends TextBase implements MutableTextInstance {
 }
 
 export const Text = CompatibleText as MutableTextLike;
+
+class FallbackContainer implements ContainerInstance {
+	children: any[] = [];
+
+	addChild(child: any): void {
+		this.children.push(child);
+	}
+
+	render(_width: number): string[] {
+		return [];
+	}
+
+	invalidate(): void {
+		// no-op fallback
+	}
+}
+
+export const Container = (BaseContainer ?? FallbackContainer) as ContainerLike;
+
+class FallbackDynamicBorder implements DynamicBorderInstance {
+	constructor(_render: (text: string) => string) {}
+
+	render(_width: number): string[] {
+		return [""];
+	}
+
+	invalidate(): void {
+		// no-op fallback
+	}
+}
+
+export const DynamicBorder = (BaseDynamicBorder ?? FallbackDynamicBorder) as DynamicBorderLike;
 
 export type SearchInputLike = {
 	focused: boolean;
