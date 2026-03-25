@@ -254,8 +254,8 @@ export function setupDashboard(pi: ExtensionAPI, registry: ThreadRegistry) {
 
 					if (matchesKey(data, Key.up) || data === "k") {
 						if (row > 0) {
-							const newIdx = (row - 1) * cols + col;
-							if (newIdx < numThreads) selectedIndex = newIdx;
+							const newIdx = Math.min((row - 1) * cols + col, numThreads - 1);
+							selectedIndex = newIdx;
 						}
 						tui.requestRender();
 						return;
@@ -263,8 +263,8 @@ export function setupDashboard(pi: ExtensionAPI, registry: ThreadRegistry) {
 
 					if (matchesKey(data, Key.down) || data === "j") {
 						if (row < totalRows - 1) {
-							const newIdx = (row + 1) * cols + col;
-							if (newIdx < numThreads) selectedIndex = newIdx;
+							const newIdx = Math.min((row + 1) * cols + col, numThreads - 1);
+							selectedIndex = newIdx;
 						}
 						tui.requestRender();
 						return;
@@ -293,12 +293,20 @@ export function setupDashboard(pi: ExtensionAPI, registry: ThreadRegistry) {
 					}
 
 					if (data === "d") {
+						if (registry.runningThreads.has(threads[selectedIndex])) {
+							ctx.ui.notify(`Thread "${threads[selectedIndex]}" is currently busy`, "warning");
+							return;
+						}
 						confirmMode = "delete";
 						tui.requestRender();
 						return;
 					}
 
 					if (data === "r") {
+						if (registry.runningThreads.has(threads[selectedIndex])) {
+							ctx.ui.notify(`Thread "${threads[selectedIndex]}" is currently busy`, "warning");
+							return;
+						}
 						confirmMode = "reset";
 						tui.requestRender();
 						return;

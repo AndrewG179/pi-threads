@@ -135,7 +135,9 @@ export function renderResult(result: { details?: DispatchDetails; content: Array
 
 					// Live tool calls
 					const displayItems = getDisplayItems(r.messages);
-					const toolCalls = displayItems.filter((i) => i.type === "toolCall");
+					const toolCalls = displayItems.filter(
+						(i): i is Extract<DisplayItem, { type: "toolCall" }> => i.type === "toolCall",
+					);
 					for (const tc of toolCalls) {
 						lines.push(theme.fg("muted", "→ ") + formatToolCall(tc.name, tc.args, theme.fg.bind(theme)));
 					}
@@ -159,7 +161,9 @@ export function renderResult(result: { details?: DispatchDetails; content: Array
 			container.addChild(new Text(theme.fg("dim", item.action), 0, 0));
 
 			const displayItems = getDisplayItems(r.messages);
-			const toolCalls = displayItems.filter((i) => i.type === "toolCall");
+			const toolCalls = displayItems.filter(
+				(i): i is Extract<DisplayItem, { type: "toolCall" }> => i.type === "toolCall",
+			);
 			if (toolCalls.length > 0) {
 				container.addChild(new Spacer(1));
 				container.addChild(new Text(theme.fg("muted", "─── Activity ───"), 0, 0));

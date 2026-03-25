@@ -12,6 +12,9 @@ export function updateStatusBar(ctx: { ui: { setStatus: (key: string, text: stri
 }
 
 export function persistConfig(pi: ExtensionAPI, registry: ThreadRegistry): void {
+	// Appends a new config entry to the session. On reload, only the last
+	// thread-config entry is used (see session_start handler in index.ts).
+	// Repeated appends are harmless but create minor session file bloat.
 	pi.appendEntry("thread-config", { model: registry.subagentModel, thinking: registry.subagentThinking });
 }
 
