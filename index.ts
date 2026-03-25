@@ -431,17 +431,6 @@ export default function (pi: ExtensionAPI) {
 		await ctx.ui.custom<void | undefined>(
 			(tui, theme, keybindings, done) =>
 				new SubagentBrowser(() => subagentRunStore.getCards(sessionFile), tui, theme, keybindings, done),
-			{
-				overlay: true,
-				overlayOptions: {
-					anchor: "top-left",
-					row: 0,
-					col: 0,
-					width: "100%",
-					maxHeight: "100%",
-					margin: 0,
-				},
-			},
 		);
 	};
 

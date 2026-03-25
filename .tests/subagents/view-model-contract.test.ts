@@ -65,7 +65,7 @@ function flattenRenderedLines(component: unknown, width = 120): string[] {
 	return [];
 }
 
-test("/subagents should open an independent custom view instead of a modal overlay", async () => {
+test("/subagents should open an independent custom view instead of composing over the live transcript as a modal overlay", async () => {
 	const projectDir = makeTempProject();
 	const parentSession = path.join(projectDir, ".pi", "sessions", "parent.jsonl");
 	const alphaSession = path.join(projectDir, ".pi", "threads", "alpha.jsonl");
@@ -163,11 +163,16 @@ test("/subagents should open an independent custom view instead of a modal overl
 		}) as any);
 
 		assert.ok(customRenderer, "/subagents should invoke ctx.ui.custom()");
-		assert.equal(customOptions?.overlay, true, "/subagents should mount as a fullscreen overlay to cover prior transcript content");
-		assert.equal(customOptions?.overlayOptions?.anchor, "top-left");
-		assert.equal(customOptions?.overlayOptions?.width, "100%");
-		assert.equal(customOptions?.overlayOptions?.maxHeight, "100%");
-		assert.equal(customOptions?.overlayOptions?.margin, 0);
+		assert.notEqual(
+			customOptions?.overlay,
+			true,
+			"/subagents should use the replacement custom-view path; overlay mode composites over the live transcript instead of clearing it",
+		);
+		assert.equal(
+			customOptions?.overlayOptions,
+			undefined,
+			"/subagents should not pass fullscreen overlay options when it is meant to replace the editor region",
+		);
 
 		const rendered = flattenRenderedLines(customRenderer!(undefined, makeTheme(), undefined, () => {}), 80).join("\n");
 		assert.match(rendered, /\[alpha\]/, "the subagent view should still render subagent card summaries from collected card data");
