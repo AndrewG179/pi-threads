@@ -10,7 +10,7 @@ import * as fs from "node:fs";
 import { DynamicBorder } from "@mariozechner/pi-coding-agent";
 import { Container, Text, Spacer, matchesKey, Key, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 
-import { getThreadSessionPath } from "../helpers.ts";
+import { getThreadSessionPath, wrapText } from "../helpers.ts";
 
 // ─── Types ───
 
@@ -246,7 +246,7 @@ export function openEpisodeSidebar(ctx: { ui: { custom: (...args: unknown[]) => 
 
 						// User action
 						lines.push("    " + theme.fg("accent", "Action:"));
-						const userLines = wrapForSidebar(ep.userText, innerWidth - 6);
+						const userLines = wrapText(ep.userText, innerWidth - 6);
 						for (const ul of userLines) {
 							lines.push("      " + ul);
 						}
@@ -264,7 +264,7 @@ export function openEpisodeSidebar(ctx: { ui: { custom: (...args: unknown[]) => 
 						if (ep.assistantText) {
 							lines.push("");
 							lines.push("    " + theme.fg("accent", "Response:"));
-							const respLines = wrapForSidebar(ep.assistantText, innerWidth - 6);
+							const respLines = wrapText(ep.assistantText, innerWidth - 6);
 							for (const rl of respLines.slice(0, 20)) {
 								lines.push("      " + rl);
 							}
@@ -279,29 +279,6 @@ export function openEpisodeSidebar(ctx: { ui: { custom: (...args: unknown[]) => 
 				}
 
 				return lines;
-			}
-
-			function wrapForSidebar(text: string, maxWidth: number): string[] {
-				if (!text) return [""];
-				const result: string[] = [];
-				for (const paragraph of text.split("\n")) {
-					if (!paragraph.trim()) {
-						result.push("");
-						continue;
-					}
-					const words = paragraph.split(/\s+/);
-					let current = "";
-					for (const word of words) {
-						if (current.length + word.length + 1 > maxWidth && current.length > 0) {
-							result.push(current);
-							current = word;
-						} else {
-							current = current ? current + " " + word : word;
-						}
-					}
-					if (current) result.push(current);
-				}
-				return result.length > 0 ? result : [""];
 			}
 
 			const container = new Container();

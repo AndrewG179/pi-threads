@@ -213,7 +213,7 @@ export function setupDashboard(pi: ExtensionAPI, registry: ThreadRegistry) {
 									const sessionPath = getThreadSessionPath(ctx.cwd, threadName);
 									fs.unlinkSync(sessionPath);
 								} catch { /* ignore */ }
-								registry.clearThread(threadName);
+								registry.deleteThread(threadName);
 								refreshThreads();
 							} else if (confirmMode === "reset") {
 								// Delete session file but preserve thread identity (episode count stays)

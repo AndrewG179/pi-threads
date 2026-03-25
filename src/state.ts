@@ -105,7 +105,7 @@ export class ThreadRegistry {
 		this.emit();
 	}
 
-	clearThread(name: string): void {
+	deleteThread(name: string): void {
 		this._episodeCounts.delete(name);
 		this._threadStats.delete(name);
 		this._lastActivity.delete(name);

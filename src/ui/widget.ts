@@ -4,7 +4,7 @@ import { listThreads, formatTokens, relativeTime, truncateToWidth } from "../hel
 
 // ─── Widget Setup ───
 
-export function setupWidget(registry: ThreadRegistry, ctx: ExtensionContext): void {
+export function setupWidget(registry: ThreadRegistry, ctx: ExtensionContext): () => void {
 	const cwd = ctx.cwd;
 
 	function rebuildWidget(): void {
@@ -74,7 +74,8 @@ export function setupWidget(registry: ThreadRegistry, ctx: ExtensionContext): vo
 	rebuildWidget();
 
 	// Re-render on registry changes (triggers filesystem I/O + themed line rebuild)
-	registry.onChange(() => {
+	const unsubscribe = registry.onChange(() => {
 		rebuildWidget();
 	});
+	return unsubscribe;
 }

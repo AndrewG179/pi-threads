@@ -15,7 +15,7 @@
 
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type, type TLiteral, type TUnion } from "@sinclair/typebox";
 
 import type { DispatchDetails, SingleDispatchResult } from "./src/types.ts";
 import { listThreads, formatTokens, mapWithConcurrencyLimit, MAX_CONCURRENCY } from "./src/helpers.ts";
@@ -33,6 +33,7 @@ import { setupDashboard } from "./src/ui/dashboard.ts";
 
 export default function (pi: ExtensionAPI) {
 	const registry = new ThreadRegistry();
+	let unsubWidget: (() => void) | undefined;
 
 	// Register all slash commands
 	registerCommands(pi, registry);
@@ -81,7 +82,8 @@ export default function (pi: ExtensionAPI) {
 
 		ctx.ui.notify("🧵 Thread orchestrator active", "info");
 		updateStatusBar(ctx, registry);
-		setupWidget(registry, ctx);
+		unsubWidget?.();
+		unsubWidget = setupWidget(registry, ctx);
 	});
 
 	// Inject orchestrator system prompt
@@ -128,13 +130,19 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			thread: Type.Optional(Type.String({ description: "Thread name — identifies the work stream. Reuse for related actions. (single mode)" })),
 			action: Type.Optional(Type.String({ description: "Direct, concrete instructions for the thread to execute. (single mode)" })),
-			thinking: Type.Optional(Type.String({ description: "Thinking level for this dispatch: off, minimal, low, medium, high, xhigh. Defaults to global subagent thinking level." })),
+			thinking: Type.Optional(Type.Union(
+				[Type.Literal("off"), Type.Literal("minimal"), Type.Literal("low"), Type.Literal("medium"), Type.Literal("high"), Type.Literal("xhigh")],
+				{ description: "Thinking level: off, minimal, low, medium, high, xhigh" }
+			)),
 			tasks: Type.Optional(
 				Type.Array(
 					Type.Object({
 						thread: Type.String({ description: "Thread name" }),
 						action: Type.String({ description: "Action for this thread" }),
-						thinking: Type.Optional(Type.String({ description: "Thinking level for this task: off, minimal, low, medium, high, xhigh" })),
+						thinking: Type.Optional(Type.Union(
+							[Type.Literal("off"), Type.Literal("minimal"), Type.Literal("low"), Type.Literal("medium"), Type.Literal("high"), Type.Literal("xhigh")],
+							{ description: "Thinking level: off, minimal, low, medium, high, xhigh" }
+						)),
 					}),
 					{ description: "Batch mode: thread actions dispatched in parallel." },
 				),

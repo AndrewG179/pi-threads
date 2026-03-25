@@ -76,10 +76,14 @@ export function setupMentions(pi: ExtensionAPI, registry: ThreadRegistry): void 
 			return { action: "handled" };
 		}
 
+		// Mark running *before* the fire-and-forget so check-and-mark is atomic
+		registry.markRunning(threadName);
+
 		// Fire and forget the actual work
 		doThreadWork(pi, registry, ctx.cwd, threadName, message).catch((e) => {
 			console.error(`@${threadName} mention failed:`, e);
 			ctx.ui.notify(`@${threadName} failed: ${e instanceof Error ? e.message : String(e)}`, "error");
+			registry.markDone(threadName);
 		});
 
 		return { action: "handled" };
@@ -99,7 +103,6 @@ async function doThreadWork(
 	// Write thread worker prompt to temp file
 	const promptTmp = writeTempFile("worker", THREAD_WORKER_PROMPT);
 
-	registry.markRunning(threadName);
 	try {
 		const result = await runPiOnThread(
 			cwd,

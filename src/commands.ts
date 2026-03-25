@@ -350,12 +350,12 @@ export function registerCommands(pi: ExtensionAPI, registry: ThreadRegistry): vo
 		},
 	});
 
-	pi.registerCommand("thread-reset", {
-		description: "Reset a thread (clear its session history)",
+	pi.registerCommand("thread-delete", {
+		description: "Delete a thread (destroy its session and all state)",
 		handler: async (args, ctx) => {
 			const name = args.trim();
 			if (!name) {
-				ctx.ui.notify("Usage: /thread-reset <thread-name>", "warning");
+				ctx.ui.notify("Usage: /thread-delete <thread-name>", "warning");
 				return;
 			}
 
@@ -369,8 +369,8 @@ export function registerCommands(pi: ExtensionAPI, registry: ThreadRegistry): vo
 			try {
 				fs.unlinkSync(sessionPath);
 			} catch { /* ignore */ }
-			registry.clearThread(name);
-			ctx.ui.notify(`🗑️ Thread '${name}' reset`, "info");
+			registry.deleteThread(name);
+			ctx.ui.notify(`🗑️ Thread '${name}' deleted`, "info");
 		},
 	});
 
