@@ -14,7 +14,7 @@
  */
 
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type, type TLiteral, type TUnion } from "@sinclair/typebox";
 
 import type { DispatchDetails, SingleDispatchResult } from "./src/types.ts";
@@ -48,7 +48,7 @@ export default function (pi: ExtensionAPI) {
 	setupDashboard(pi, registry);
 
 	// Shared init logic for session_start and session_switch
-	async function initSessionState(ctx: any) {
+	async function initSessionState(ctx: ExtensionContext) {
 		registry.clear();
 		registry.sessionId = ctx.sessionManager.getSessionId();
 

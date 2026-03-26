@@ -186,7 +186,10 @@ function truncate(text: string, maxLen: number): string {
 }
 
 export function openEpisodeSidebar(ctx: ExtensionContext, threadName: string, cwd: string, sessionId: string): void {
-	if (!sessionId) return;
+	if (!sessionId) {
+		ctx.ui.notify("Thread sidebar unavailable — session not initialized yet", "warn");
+		return;
+	}
 	const sessionPath = getThreadSessionPath(cwd, sessionId, threadName);
 	const messages = parseSessionFile(sessionPath);
 	const episodes = buildEpisodes(messages);

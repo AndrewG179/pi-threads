@@ -1,6 +1,5 @@
 import * as fs from "node:fs";
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
@@ -18,9 +17,9 @@ const GLOBAL_CONFIG_PATH = join(homedir(), ".pi", "threads", "config.json");
 
 export function persistGlobalConfig(registry: ThreadRegistry): void {
 	try {
-		const dir = join(homedir(), ".pi", "threads");
-		mkdirSync(dir, { recursive: true });
-		writeFileSync(GLOBAL_CONFIG_PATH, JSON.stringify({
+		const dir = dirname(GLOBAL_CONFIG_PATH);
+		fs.mkdirSync(dir, { recursive: true });
+		fs.writeFileSync(GLOBAL_CONFIG_PATH, JSON.stringify({
 			model: registry.subagentModel,
 			thinking: registry.subagentThinking,
 		}, null, 2) + "\n");
@@ -29,17 +28,23 @@ export function persistGlobalConfig(registry: ThreadRegistry): void {
 
 export function loadGlobalConfig(): { model?: string; thinking?: string } | null {
 	try {
-		const raw = readFileSync(GLOBAL_CONFIG_PATH, "utf-8");
-		return JSON.parse(raw);
+		const raw = fs.readFileSync(GLOBAL_CONFIG_PATH, "utf-8");
+		const parsed = JSON.parse(raw);
+		if (typeof parsed !== "object" || parsed === null) return null;
+		return {
+			model: typeof parsed.model === "string" ? parsed.model : undefined,
+			thinking: typeof parsed.thinking === "string" ? parsed.thinking : undefined,
+		};
 	} catch {
 		return null;
 	}
 }
 
 export function persistConfig(pi: ExtensionAPI, registry: ThreadRegistry): void {
-	// Appends a new config entry to the session. On reload, only the last
-	// thread-config entry is used (see session_start handler in index.ts).
-	// Repeated appends are harmless but create minor session file bloat.
+	// Appends a new config entry to the session. On reload, all thread-config
+	// entries are applied in order and the last one wins by overwrite
+	// (see initSessionState in index.ts). Repeated appends are harmless
+	// but create minor session file bloat.
 	pi.appendEntry("thread-config", { model: registry.subagentModel, thinking: registry.subagentThinking });
 	persistGlobalConfig(registry);
 }
