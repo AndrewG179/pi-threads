@@ -152,7 +152,7 @@ export function renderColumnsInRows(
 		if (colWidth < 20) {
 			// Too narrow — stack vertically
 			for (const item of rowItems) {
-				output.push(...item(width));
+				output.push(...item(width).map((l) => truncateToWidth(l, width)));
 				output.push("");
 			}
 			continue;
@@ -205,6 +205,11 @@ export function wrapText(text: string | undefined, width: number): string[] {
 				current = word;
 			} else {
 				current = current ? current + " " + word : word;
+			}
+			// Hard-break words that exceed the width
+			while (current.length > width) {
+				lines.push(current.slice(0, width));
+				current = current.slice(width);
 			}
 		}
 		if (current) lines.push(current);

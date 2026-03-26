@@ -23,7 +23,7 @@ import { ORCHESTRATOR_PROMPT } from "./src/orchestrator.ts";
 import { ThreadRegistry } from "./src/state.ts";
 import { runThreadAction, buildEpisode } from "./src/dispatch.ts";
 import { renderCall, renderResult } from "./src/render.ts";
-import { registerCommands, updateStatusBar } from "./src/commands.ts";
+import { registerCommands, updateStatusBar, loadGlobalConfig } from "./src/commands.ts";
 import { setupPicker } from "./src/ui/picker.ts";
 import { setupWidget } from "./src/ui/widget.ts";
 import { setupMentions } from "./src/ui/mentions.ts";
@@ -52,10 +52,19 @@ export default function (pi: ExtensionAPI) {
 		registry.clear();
 
 		// Restore model/thinking config from session
+		let hasSessionConfig = false;
 		for (const entry of ctx.sessionManager.getEntries()) {
 			if (entry.type === "custom" && entry.customType === "thread-config" && entry.data) {
 				if (entry.data.model) registry.subagentModel = entry.data.model;
 				registry.setThinking(entry.data.thinking);
+				hasSessionConfig = true;
+			}
+		}
+		if (!hasSessionConfig) {
+			const globalConfig = loadGlobalConfig();
+			if (globalConfig) {
+				if (globalConfig.model) registry.subagentModel = globalConfig.model;
+				if (globalConfig.thinking) registry.setThinking(globalConfig.thinking);
 			}
 		}
 

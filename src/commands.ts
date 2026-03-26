@@ -1,4 +1,7 @@
 import * as fs from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
@@ -11,11 +14,34 @@ export function updateStatusBar(ctx: { ui: { setStatus: (key: string, text: stri
 	ctx.ui.setStatus("subagent-model", `\x1b[${(process.stdout.columns ?? 120) - statusText.length + 1}G\x1b[2m${statusText}\x1b[0m`);
 }
 
+const GLOBAL_CONFIG_PATH = join(homedir(), ".pi", "threads", "config.json");
+
+export function persistGlobalConfig(registry: ThreadRegistry): void {
+	try {
+		const dir = join(homedir(), ".pi", "threads");
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(GLOBAL_CONFIG_PATH, JSON.stringify({
+			model: registry.subagentModel,
+			thinking: registry.subagentThinking,
+		}, null, 2) + "\n");
+	} catch { /* best-effort */ }
+}
+
+export function loadGlobalConfig(): { model?: string; thinking?: string } | null {
+	try {
+		const raw = readFileSync(GLOBAL_CONFIG_PATH, "utf-8");
+		return JSON.parse(raw);
+	} catch {
+		return null;
+	}
+}
+
 export function persistConfig(pi: ExtensionAPI, registry: ThreadRegistry): void {
 	// Appends a new config entry to the session. On reload, only the last
 	// thread-config entry is used (see session_start handler in index.ts).
 	// Repeated appends are harmless but create minor session file bloat.
 	pi.appendEntry("thread-config", { model: registry.subagentModel, thinking: registry.subagentThinking });
+	persistGlobalConfig(registry);
 }
 
 export function registerCommands(pi: ExtensionAPI, registry: ThreadRegistry): void {
