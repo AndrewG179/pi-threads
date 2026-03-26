@@ -50,6 +50,7 @@ export default function (pi: ExtensionAPI) {
 	// Reconstruct state on session load
 	pi.on("session_start", async (_event, ctx) => {
 		registry.clear();
+		registry.sessionId = ctx.sessionManager.getSessionId();
 
 		// Restore model/thinking config from session
 		let hasSessionConfig = false;
@@ -100,7 +101,7 @@ export default function (pi: ExtensionAPI) {
 		let extra = ORCHESTRATOR_PROMPT;
 
 		// Tell the orchestrator about existing threads
-		const threads = listThreads(ctx.cwd);
+		const threads = listThreads(ctx.cwd, registry.sessionId);
 		if (threads.length > 0) {
 			const threadInfo = threads.map((t) => {
 				const count = registry.episodeCounts.get(t) || 0;
@@ -221,6 +222,7 @@ export default function (pi: ExtensionAPI) {
 						ctx.cwd, task.thread, task.action, model, thinking, signal,
 						taskOnUpdate,
 						episodeNumber,
+						registry.sessionId,
 					);
 				} finally {
 					registry.markDone(task.thread);

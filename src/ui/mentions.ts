@@ -66,7 +66,7 @@ export function setupMentions(pi: ExtensionAPI, registry: ThreadRegistry): void 
 		if (!threadName || !message) return { action: "continue" };
 
 		// Check if the thread exists
-		const threads = listThreads(ctx.cwd);
+		const threads = listThreads(ctx.cwd, registry.sessionId);
 		if (!threads.includes(threadName)) {
 			// Not a known thread — let it pass through
 			return { action: "continue" };
@@ -99,8 +99,8 @@ async function doThreadWork(
 	threadName: string,
 	message: string,
 ): Promise<void> {
-	ensureThreadsDir(cwd);
-	const sessionPath = getThreadSessionPath(cwd, threadName);
+	ensureThreadsDir(cwd, registry.sessionId);
+	const sessionPath = getThreadSessionPath(cwd, registry.sessionId, threadName);
 
 	// Write thread worker prompt to temp file
 	const promptTmp = writeTempFile("worker", THREAD_WORKER_PROMPT);

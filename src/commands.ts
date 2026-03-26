@@ -344,7 +344,7 @@ export function registerCommands(pi: ExtensionAPI, registry: ThreadRegistry): vo
 	pi.registerCommand("threads", {
 		description: "List all threads with stats",
 		handler: async (_args, ctx) => {
-			const threads = listThreads(ctx.cwd);
+			const threads = listThreads(ctx.cwd, registry.sessionId);
 			if (threads.length === 0) {
 				ctx.ui.notify("No threads yet", "info");
 				return;
@@ -353,7 +353,7 @@ export function registerCommands(pi: ExtensionAPI, registry: ThreadRegistry): vo
 			const lines = threads.map((t) => {
 				const count = registry.episodeCounts.get(t) || 0;
 				const stats = registry.threadStats.get(t);
-				const sessionPath = getThreadSessionPath(ctx.cwd, t);
+				const sessionPath = getThreadSessionPath(ctx.cwd, registry.sessionId, t);
 
 				// File size and last modified
 				let sizeStr = "";
@@ -388,13 +388,13 @@ export function registerCommands(pi: ExtensionAPI, registry: ThreadRegistry): vo
 				return;
 			}
 
-			const threads = listThreads(ctx.cwd);
+			const threads = listThreads(ctx.cwd, registry.sessionId);
 			if (!threads.includes(name)) {
 				ctx.ui.notify(`Thread '${name}' not found. Available: ${threads.join(", ") || "(none)"}`, "warning");
 				return;
 			}
 
-			const sessionPath = getThreadSessionPath(ctx.cwd, name);
+			const sessionPath = getThreadSessionPath(ctx.cwd, registry.sessionId, name);
 			try {
 				fs.unlinkSync(sessionPath);
 			} catch { /* ignore */ }
@@ -406,7 +406,7 @@ export function registerCommands(pi: ExtensionAPI, registry: ThreadRegistry): vo
 	pi.registerCommand("threads-clear", {
 		description: "Clear all threads (delete all session files)",
 		handler: async (_args, ctx) => {
-			const threads = listThreads(ctx.cwd);
+			const threads = listThreads(ctx.cwd, registry.sessionId);
 			if (threads.length === 0) {
 				ctx.ui.notify("No threads to clear", "info");
 				return;
@@ -414,14 +414,14 @@ export function registerCommands(pi: ExtensionAPI, registry: ThreadRegistry): vo
 
 			const confirmed = await ctx.ui.confirm(
 				"Clear all threads?",
-				`This will delete ${threads.length} thread session${threads.length !== 1 ? "s" : ""} in .pi/threads/. This cannot be undone.`,
+				`This will delete ${threads.length} thread session${threads.length !== 1 ? "s" : ""} in .pi/threads/<session>/. This cannot be undone.`,
 			);
 			if (!confirmed) return;
 
 			let deleted = 0;
 			for (const t of threads) {
 				try {
-					fs.unlinkSync(getThreadSessionPath(ctx.cwd, t));
+					fs.unlinkSync(getThreadSessionPath(ctx.cwd, registry.sessionId, t));
 					deleted++;
 				} catch { /* ignore */ }
 			}

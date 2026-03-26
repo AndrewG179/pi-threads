@@ -131,9 +131,10 @@ export async function runThreadAction(
 	signal: AbortSignal | undefined,
 	onUpdate: ((partial: AgentToolResult<DispatchDetails>) => void) | undefined,
 	episodeNumber: number,
+	sessionId: string,
 ): Promise<ThreadActionResult> {
-	ensureThreadsDir(cwd);
-	const sessionPath = getThreadSessionPath(cwd, threadName);
+	ensureThreadsDir(cwd, sessionId);
+	const sessionPath = getThreadSessionPath(cwd, sessionId, threadName);
 	const isNewThread = !fs.existsSync(sessionPath);
 
 	const result: ThreadActionResult = {

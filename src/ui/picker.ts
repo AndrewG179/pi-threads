@@ -19,7 +19,7 @@ export function setupPicker(pi: ExtensionAPI, registry: ThreadRegistry): void {
 	pi.registerShortcut("ctrl+alt+t", {
 		description: "Open thread picker",
 		handler: async (ctx) => {
-			const threads = listThreads(ctx.cwd);
+			const threads = listThreads(ctx.cwd, registry.sessionId);
 			if (threads.length === 0) {
 				ctx.ui.notify("No threads yet", "info");
 				return;
@@ -29,7 +29,7 @@ export function setupPicker(pi: ExtensionAPI, registry: ThreadRegistry): void {
 			const items: SelectItem[] = threads.map((t) => {
 				const count = registry.episodeCounts.get(t) || 0;
 				const stats = registry.threadStats.get(t);
-				const sessionPath = getThreadSessionPath(ctx.cwd, t);
+				const sessionPath = getThreadSessionPath(ctx.cwd, registry.sessionId, t);
 
 				let mtimeStr = "";
 				try {
@@ -103,7 +103,7 @@ export function setupPicker(pi: ExtensionAPI, registry: ThreadRegistry): void {
 			);
 
 			if (result) {
-				openEpisodeSidebar(ctx, result, ctx.cwd);
+				openEpisodeSidebar(ctx, result, ctx.cwd, registry.sessionId);
 			}
 		},
 	});

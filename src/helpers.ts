@@ -12,17 +12,17 @@ export const MAX_COLUMNS = 3;
 
 // ─── Path Helpers ───
 
-export function getThreadsDir(cwd: string): string {
-	return path.join(cwd, THREADS_DIR);
+export function getThreadsDir(cwd: string, sessionId: string): string {
+	return path.join(cwd, THREADS_DIR, sessionId);
 }
 
-export function getThreadSessionPath(cwd: string, threadName: string): string {
+export function getThreadSessionPath(cwd: string, sessionId: string, threadName: string): string {
 	const safe = threadName.replace(/[^\w.-]+/g, "_");
-	return path.join(getThreadsDir(cwd), `${safe}.jsonl`);
+	return path.join(getThreadsDir(cwd, sessionId), `${safe}.jsonl`);
 }
 
-export function listThreads(cwd: string): string[] {
-	const dir = getThreadsDir(cwd);
+export function listThreads(cwd: string, sessionId: string): string[] {
+	const dir = getThreadsDir(cwd, sessionId);
 	if (!fs.existsSync(dir)) return [];
 	try {
 		return fs
@@ -34,8 +34,8 @@ export function listThreads(cwd: string): string[] {
 	}
 }
 
-export function ensureThreadsDir(cwd: string): void {
-	const dir = getThreadsDir(cwd);
+export function ensureThreadsDir(cwd: string, sessionId: string): void {
+	const dir = getThreadsDir(cwd, sessionId);
 	if (!fs.existsSync(dir)) {
 		fs.mkdirSync(dir, { recursive: true });
 	}
