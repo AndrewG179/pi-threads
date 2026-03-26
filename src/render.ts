@@ -9,6 +9,7 @@ import {
 	formatTokens,
 	formatUsage,
 	renderColumnsInRows,
+	truncatePreserveBg,
 	truncateToWidth,
 	wrapText,
 } from "./helpers.ts";
@@ -30,7 +31,7 @@ export function formatToolCall(
 	switch (toolName) {
 		case "bash": {
 			const cmd = ((args.command as string) || "...").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
-			const preview = cmd.length > 80 ? cmd.slice(0, 80) + "..." : cmd;
+			const preview = cmd;
 			return fg("muted", "$ ") + fg("toolOutput", preview);
 		}
 		case "read": {
@@ -47,7 +48,7 @@ export function formatToolCall(
 		}
 		default: {
 			const s = JSON.stringify(args);
-			return fg("accent", toolName) + fg("dim", ` ${s.length > 60 ? s.slice(0, 60) + "..." : s}`);
+			return fg("accent", toolName) + fg("dim", ` ${s}`);
 		}
 	}
 }
@@ -142,7 +143,7 @@ export function renderResult(result: DispatchToolResult, { expanded }: { expande
 						lines.push(theme.fg("muted", "→ ") + formatToolCall(tc.name, tc.args, theme.fg.bind(theme)));
 					}
 
-					return lines.map((l) => truncateToWidth(l, colWidth));
+					return lines.map((l) => truncatePreserveBg(l, colWidth));
 				},
 				invalidate(): void {},
 			};

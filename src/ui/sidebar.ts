@@ -182,7 +182,7 @@ function formatTimestamp(ts: number): string {
 function truncate(text: string, maxLen: number): string {
 	const oneLine = text.replace(/\n/g, " ").trim();
 	if (visibleWidth(oneLine) <= maxLen) return oneLine;
-	return truncateToWidth(oneLine, maxLen - 1) + "…";
+	return truncateToWidth(oneLine, maxLen, "\u2026");
 }
 
 export function openEpisodeSidebar(ctx: ExtensionContext, threadName: string, cwd: string): void {

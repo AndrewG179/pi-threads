@@ -172,7 +172,7 @@ export function renderColumnsInRows(
 			const parts: string[] = [];
 			for (let c = 0; c < numCols; c++) {
 				const line = columns[c][row];
-				const padded = truncateToWidth(line, colWidth);
+				const padded = truncatePreserveBg(line, colWidth);
 				const pad = colWidth - visibleWidth(padded);
 				parts.push(padded + " ".repeat(Math.max(0, pad)));
 			}
@@ -238,3 +238,18 @@ export function relativeTime(ts: number): string {
 // Re-export TUI utilities used by renderColumnsInRows
 import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 export { truncateToWidth, visibleWidth };
+
+/**
+ * Wrap truncateToWidth so that the full ANSI reset (\x1b[0m) it injects is
+ * replaced with a selective reset that preserves background colour.
+ *
+ * truncateToWidth's finalizeTruncatedResult always emits \x1b[0m around the
+ * ellipsis. That kills any background set by a parent Box/container, leaving
+ * a visible "hole" to the right of the "...".  We swap in SGR codes that
+ * reset intensity, italic, underline, strike-through and fg colour — but NOT
+ * background (49) — so the Box bg survives.
+ */
+export function truncatePreserveBg(text: string, maxWidth: number, ellipsis = "..."): string {
+	const result = truncateToWidth(text, maxWidth, ellipsis);
+	return result.replaceAll('\x1b[0m', '\x1b[22;23;24;29;39m');
+}
