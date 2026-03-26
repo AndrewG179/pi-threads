@@ -84,6 +84,14 @@ export default function (pi: ExtensionAPI) {
 					if (details?.items) {
 						for (const item of details.items) {
 							registry.updateEpisodeCount(item.thread, item.episodeNumber);
+							if (item.result?.usage) {
+								const existing = registry.threadStats.get(item.thread);
+								registry.updateThreadStats(item.thread, {
+									contextTokens: item.result.usage.contextTokens || 0,
+									lastCompactedAt: item.result.compaction ? Date.now() : (existing?.lastCompactedAt || 0),
+									compactionCount: (existing?.compactionCount || 0) + (item.result.compaction ? 1 : 0),
+								});
+							}
 						}
 					}
 				}
