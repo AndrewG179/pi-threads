@@ -47,8 +47,8 @@ export default function (pi: ExtensionAPI) {
 	// Register Ctrl+Shift+T dashboard and /dashboard command
 	setupDashboard(pi, registry);
 
-	// Reconstruct state on session load
-	pi.on("session_start", async (_event, ctx) => {
+	// Shared init logic for session_start and session_switch
+	async function initSessionState(ctx: any) {
 		registry.clear();
 		registry.sessionId = ctx.sessionManager.getSessionId();
 
@@ -94,6 +94,16 @@ export default function (pi: ExtensionAPI) {
 		updateStatusBar(ctx, registry);
 		unsubWidget?.();
 		unsubWidget = setupWidget(registry, ctx);
+	}
+
+	// Reconstruct state on session load
+	pi.on("session_start", async (_event, ctx) => {
+		await initSessionState(ctx);
+	});
+
+	// Re-init state when switching to an existing session (e.g. /resume)
+	pi.on("session_switch", async (_event, ctx) => {
+		await initSessionState(ctx);
 	});
 
 	// Inject orchestrator system prompt
