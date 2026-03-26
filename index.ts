@@ -13,790 +13,51 @@
  * fails outside their scope, they stop and report back.
  */
 
-import { spawn } from "node:child_process";
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
-import type { Message } from "@mariozechner/pi-ai";
-import { type ExtensionAPI, getMarkdownTheme } from "@mariozechner/pi-coding-agent";
-import { Container, Markdown, Spacer, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
-
-// ─── Constants ───
-
-const THREADS_DIR = ".pi/threads";
-
-const THREAD_WORKER_PROMPT = `You are a thread — an execution worker controlled by an orchestrator.
-
-## Your Role
-Execute the instructions given to you. You are the hands, not the brain.
-
-## Rules
-1. **Follow instructions precisely.** Do exactly what you're told.
-2. **Handle tactical details.** Missing imports, typos, small fixups needed to complete your task — just handle them.
-3. **Never make strategic decisions.** If something is ambiguous, if you face a fork where different approaches are possible, or if you encounter something unexpected — STOP and report back. Do not guess.
-4. **If you fail, report clearly.** Don't try alternative approaches. Describe what went wrong and what state things are in now.
-5. **Be thorough within scope.** Complete all parts of your instructions.`;
-
-
-
-const ORCHESTRATOR_PROMPT = `
-# Thread-Based Execution Model
-
-You are a **strategic orchestrator**. You think, plan, and decide. You never execute.
-
-## How You Work
-- You have one tool: \`dispatch\`. It sends an action to a thread and returns an episode (compressed result).
-- A **thread** is a persistent worker with its own context. It accumulates knowledge across actions.
-- Use **named threads** to organize work streams (e.g., "auth-refactor", "test-suite", "deploy").
-
-## Rules
-1. **Never use file or shell tools.** You only dispatch.
-2. **Give concrete, direct instructions.** Not "figure out the auth system" but "Read src/auth/middleware.ts and list all exported functions with their signatures."
-3. **One logical action per dispatch.** A dispatch can involve multiple steps ("SSH in, check the config, update it") but they should serve one coherent goal.
-4. **React to episodes.** Episodes are adaptive — investigation tasks return findings, edit tasks return what changed, test tasks return results. Use the information to plan your next move.
-5. **Reuse threads for related work.** Thread "auth-refactor" should handle all auth-related actions — it builds up context about that area.
-6. **Create new threads for independent work streams.** Don't mix unrelated work in one thread.
-7. **If a thread fails, you adapt.** Re-plan, give different instructions, or try a different approach. The thread just reports — you decide.
-8. **Shape the episode with your action.** The more specific your instructions, the more useful the episode. If you need specific information back, say so in the action (e.g., "...and list each endpoint with its HTTP method and handler function name").
-9. **Never ask for raw dumps.** The thread's response comes back into YOUR context. Never ask a thread to "show me the complete contents" of a file or "paste the full output." Instead, ask for what you actually need: "Read X and summarize its structure", "Read X and list the key sections", "Run Y and tell me if it passed or what the error was." Your context is precious — don't fill it with raw file contents or unfiltered command output.
-
-## Dispatch Examples
-
-Good — asks for specific information:
-- \`dispatch(thread: "backend", action: "Read src/api/routes.ts and list every route with its HTTP method, path, and handler function name")\`
-- \`dispatch(thread: "debug", action: "Run pytest -x and tell me if it passes. If it fails, show the first failure's test name, assertion, and traceback")\`
-- \`dispatch(thread: "infra", action: "Check if nginx is running on 10.0.1.50, and show the upstream config block for the API service")\`
-
-Bad — dumps raw content into your context:
-- ~~\`dispatch(thread: "x", action: "Show me the complete contents of README.md")\`~~
-- ~~\`dispatch(thread: "x", action: "Run find . -type f and paste the output")\`~~
-
-Batch (parallel, shown side by side in groups of 3):
-- \`dispatch(tasks: [{thread: "auth", action: "Read auth middleware and list exported functions with signatures"}, {thread: "tests", action: "Run the test suite and report pass/fail counts"}, {thread: "docs", action: "Check if API docs exist and list what endpoints are documented"}])\`
-`;
-
-// ─── Types ───
-
-interface UsageStats {
-	input: number;
-	output: number;
-	cacheRead: number;
-	cacheWrite: number;
-	cost: number;
-	contextTokens: number;
-	turns: number;
-}
-
-interface ThreadActionResult {
-	thread: string;
-	action: string;
-	exitCode: number;
-	messages: Message[];
-	stderr: string;
-	usage: UsageStats;
-	model?: string;
-	stopReason?: string;
-	errorMessage?: string;
-	sessionPath: string;
-	isNewThread: boolean;
-}
-
-interface SingleDispatchResult {
-	thread: string;
-	action: string;
-	episode: string;
-	episodeNumber: number;
-	result: ThreadActionResult;
-}
-
-interface DispatchDetails {
-	mode: "single" | "batch";
-	items: SingleDispatchResult[];
-}
-
-// ─── Helpers ───
-
-function getThreadsDir(cwd: string): string {
-	return path.join(cwd, THREADS_DIR);
-}
-
-function getThreadSessionPath(cwd: string, threadName: string): string {
-	const safe = threadName.replace(/[^\w.-]+/g, "_");
-	return path.join(getThreadsDir(cwd), `${safe}.jsonl`);
-}
-
-function listThreads(cwd: string): string[] {
-	const dir = getThreadsDir(cwd);
-	if (!fs.existsSync(dir)) return [];
-	try {
-		return fs
-			.readdirSync(dir)
-			.filter((f) => f.endsWith(".jsonl"))
-			.map((f) => f.replace(/\.jsonl$/, ""));
-	} catch {
-		return [];
-	}
-}
-
-function ensureThreadsDir(cwd: string): void {
-	const dir = getThreadsDir(cwd);
-	if (!fs.existsSync(dir)) {
-		fs.mkdirSync(dir, { recursive: true });
-	}
-}
-
-function writeTempFile(prefix: string, content: string): { dir: string; filePath: string } {
-	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-thread-${prefix}-`));
-	const filePath = path.join(tmpDir, `${prefix}.md`);
-	fs.writeFileSync(filePath, content, { encoding: "utf-8", mode: 0o600 });
-	return { dir: tmpDir, filePath };
-}
-
-function cleanupTemp(dir: string | null, file: string | null): void {
-	if (file)
-		try {
-			fs.unlinkSync(file);
-		} catch {
-			/* ignore */
-		}
-	if (dir)
-		try {
-			fs.rmdirSync(dir);
-		} catch {
-			/* ignore */
-		}
-}
-
-
-function formatTokens(count: number): string {
-	if (count < 1000) return count.toString();
-	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
-	if (count < 1000000) return `${Math.round(count / 1000)}k`;
-	return `${(count / 1000000).toFixed(1)}M`;
-}
-
-const MAX_COLUMNS = 3;
-
-/**
- * Render items in rows of up to MAX_COLUMNS columns.
- * Each item is a function that takes column width and returns rendered lines.
- */
-function renderColumnsInRows(
-	items: ((colWidth: number) => string[])[],
-	width: number,
-	theme: any,
-): string[] {
-	const sep = theme.fg("muted", "│");
-	const sepWidth = 3; // " │ "
-	const output: string[] = [];
-
-	for (let rowStart = 0; rowStart < items.length; rowStart += MAX_COLUMNS) {
-		const rowItems = items.slice(rowStart, rowStart + MAX_COLUMNS);
-		const numCols = rowItems.length;
-		const colWidth = Math.floor((width - sepWidth * (numCols - 1)) / numCols);
-
-		if (colWidth < 20) {
-			// Too narrow — stack vertically
-			for (const item of rowItems) {
-				output.push(...item(width));
-				output.push("");
-			}
-			continue;
-		}
-
-		// Render each column
-		const columns: string[][] = rowItems.map((item) => item(colWidth));
-
-		// Pad to same height with full-width spaces (so background fills)
-		const maxHeight = Math.max(...columns.map((c) => c.length));
-		for (const col of columns) {
-			while (col.length < maxHeight) col.push(" ".repeat(colWidth));
-		}
-
-		// Zip lines
-		for (let row = 0; row < maxHeight; row++) {
-			const parts: string[] = [];
-			for (let c = 0; c < numCols; c++) {
-				const line = columns[c][row];
-				const padded = truncateToWidth(line, colWidth);
-				const pad = colWidth - visibleWidth(padded);
-				parts.push(padded + " ".repeat(Math.max(0, pad)));
-			}
-			output.push(parts.join(` ${sep} `));
-		}
-
-		// Add spacing between rows of columns
-		if (rowStart + MAX_COLUMNS < items.length) {
-			output.push(" ".repeat(width));
-		}
-	}
-
-	return output;
-}
-
-function wrapText(text: string | undefined, width: number): string[] {
-	if (!text) return [""];
-	if (width < 10) return [text];
-	const lines: string[] = [];
-	for (const paragraph of text.split("\n")) {
-		if (!paragraph.trim()) {
-			lines.push("");
-			continue;
-		}
-		const words = paragraph.split(/\s+/);
-		let current = "";
-		for (const word of words) {
-			if (current.length + word.length + 1 > width && current.length > 0) {
-				lines.push(current);
-				current = word;
-			} else {
-				current = current ? current + " " + word : word;
-			}
-		}
-		if (current) lines.push(current);
-	}
-	return lines.length > 0 ? lines : [""];
-}
-
-function formatUsage(usage: UsageStats, model?: string): string {
-	const parts: string[] = [];
-	if (usage.turns) parts.push(`${usage.turns} turn${usage.turns > 1 ? "s" : ""}`);
-	if (usage.input) parts.push(`↑${formatTokens(usage.input)}`);
-	if (usage.output) parts.push(`↓${formatTokens(usage.output)}`);
-	if (usage.cacheRead) parts.push(`R${formatTokens(usage.cacheRead)}`);
-	if (usage.cacheWrite) parts.push(`W${formatTokens(usage.cacheWrite)}`);
-	if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
-	if (usage.contextTokens > 0) parts.push(`ctx:${formatTokens(usage.contextTokens)}`);
-	if (model) parts.push(model);
-	return parts.join(" ");
-}
-
-// ─── Thread Execution ───
-
-/**
- * Run a pi process against a thread session. Used for both the action
- * and the episode extraction (same session = cached context).
- */
-async function runPiOnThread(
-	cwd: string,
-	sessionPath: string,
-	message: string,
-	model: string | undefined,
-	systemPromptFile: string | undefined,
-	signal: AbortSignal | undefined,
-	onMessage?: (msg: Message) => void,
-): Promise<{ exitCode: number; messages: Message[]; stderr: string }> {
-	const args: string[] = ["--mode", "json", "-p", "--no-extensions", "--no-skills", "--no-prompt-templates"];
-	args.push("--session", sessionPath);
-	if (model) {
-		args.push("--model", model);
-	}
-	if (systemPromptFile) args.push("--append-system-prompt", systemPromptFile);
-	args.push(message);
-
-	const messages: Message[] = [];
-	let stderr = "";
-	let wasAborted = false;
-
-	const exitCode = await new Promise<number>((resolve) => {
-		const proc = spawn("pi", args, { cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] });
-		let buffer = "";
-
-		const processLine = (line: string) => {
-			if (!line.trim()) return;
-			let event: any;
-			try {
-				event = JSON.parse(line);
-			} catch {
-				return;
-			}
-			if (event.type === "message_end" && event.message) {
-				messages.push(event.message as Message);
-				onMessage?.(event.message as Message);
-			}
-			if (event.type === "tool_result_end" && event.message) {
-				messages.push(event.message as Message);
-				onMessage?.(event.message as Message);
-			}
-		};
-
-		proc.stdout.on("data", (data: Buffer) => {
-			buffer += data.toString();
-			const lines = buffer.split("\n");
-			buffer = lines.pop() || "";
-			for (const line of lines) processLine(line);
-		});
-
-		proc.stderr.on("data", (data: Buffer) => {
-			stderr += data.toString();
-		});
-
-		proc.on("close", (code: number | null) => {
-			if (buffer.trim()) processLine(buffer);
-			resolve(code ?? 0);
-		});
-
-		proc.on("error", () => resolve(1));
-
-		if (signal) {
-			const killProc = () => {
-				wasAborted = true;
-				proc.kill("SIGTERM");
-				setTimeout(() => {
-					if (!proc.killed) proc.kill("SIGKILL");
-				}, 5000);
-			};
-			if (signal.aborted) killProc();
-			else signal.addEventListener("abort", killProc, { once: true });
-		}
-	});
-
-	if (wasAborted) throw new Error("Thread was aborted");
-	return { exitCode, messages, stderr };
-}
-
-async function runThreadAction(
-	cwd: string,
-	threadName: string,
-	action: string,
-	model: string | undefined,
-	signal: AbortSignal | undefined,
-	onUpdate: ((partial: AgentToolResult<DispatchDetails>) => void) | undefined,
-	episodeNumber: number,
-): Promise<ThreadActionResult> {
-	ensureThreadsDir(cwd);
-	const sessionPath = getThreadSessionPath(cwd, threadName);
-	const isNewThread = !fs.existsSync(sessionPath);
-
-	const result: ThreadActionResult = {
-		thread: threadName,
-		action,
-		exitCode: 0,
-		messages: [],
-		stderr: "",
-		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-		model,
-		sessionPath,
-		isNewThread,
-	};
-
-	const trackUsage = (msg: Message) => {
-		if (msg.role === "assistant") {
-			result.usage.turns++;
-			const usage = msg.usage;
-			if (usage) {
-				result.usage.input += usage.input || 0;
-				result.usage.output += usage.output || 0;
-				result.usage.cacheRead += usage.cacheRead || 0;
-				result.usage.cacheWrite += usage.cacheWrite || 0;
-				result.usage.cost += usage.cost?.total || 0;
-				result.usage.contextTokens = usage.totalTokens || 0;
-			}
-			if (!result.model && msg.model) result.model = msg.model;
-			if (msg.stopReason) result.stopReason = msg.stopReason;
-			if (msg.errorMessage) result.errorMessage = msg.errorMessage;
-		}
-	};
-
-	const emitUpdate = () => {
-		if (onUpdate) {
-			const lastText = getFinalOutput(result.messages);
-			onUpdate({
-				content: [{ type: "text", text: lastText || "(running...)" }],
-				details: {
-					mode: "single",
-					items: [{
-						thread: threadName,
-						action,
-						episode: "(running...)",
-						episodeNumber,
-						result,
-					}],
-				},
-			});
-		}
-	};
-
-	// Write thread worker prompt to temp file
-	const promptTmp = writeTempFile("worker", THREAD_WORKER_PROMPT);
-
-	try {
-		// Single process: thread executes the action AND produces the episode
-		// inline (delimited by ---EPISODE--- markers). No second process needed.
-		const actionResult = await runPiOnThread(
-			cwd,
-			sessionPath,
-			action,
-			model,
-			promptTmp.filePath,
-			signal,
-			(msg) => {
-				result.messages.push(msg);
-				trackUsage(msg);
-				emitUpdate();
-			},
-		);
-		result.exitCode = actionResult.exitCode;
-		result.stderr = actionResult.stderr;
-
-		return result;
-	} finally {
-		cleanupTemp(promptTmp.dir, promptTmp.filePath);
-	}
-}
-
-// ─── Episode Generation ───
-
-function getFinalOutput(messages: Message[]): string {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (msg.role === "assistant") {
-			for (const part of msg.content) {
-				if (part.type === "text") return part.text;
-			}
-		}
-	}
-	return "";
-}
-
-/**
- * Build a transcript from thread messages for the episode generator.
- * Includes tool calls AND their results so the episode has actual data.
- */
-/**
- * Build the episode directly from thread output — no extra model call.
- * Returns: tool call history + last assistant message.
- * The orchestrator sees exactly what the thread did and said.
- */
-function buildEpisode(messages: Message[]): string {
-	const parts: string[] = [];
-
-	// Part 1: Tool call history — compact summary of what the thread did
-	const toolCalls: string[] = [];
-	for (const msg of messages) {
-		if (msg.role !== "assistant") continue;
-		for (const part of msg.content) {
-			if (part.type === "toolCall") {
-				const args = part.arguments as Record<string, unknown>;
-				switch (part.name) {
-					case "bash": {
-						const cmd = ((args.command as string) || "").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
-						const preview = cmd.length > 120 ? cmd.slice(0, 120) + "..." : cmd;
-						toolCalls.push(`$ ${preview}`);
-						break;
-					}
-					case "read": {
-						const p = (args.file_path || args.path || "") as string;
-						const offset = args.offset as number | undefined;
-						const limit = args.limit as number | undefined;
-						let entry = `read ${p}`;
-						if (offset || limit) entry += `:${offset || 1}${limit ? `-${(offset || 1) + limit - 1}` : ""}`;
-						toolCalls.push(entry);
-						break;
-					}
-					case "write": {
-						const p = (args.file_path || args.path || "") as string;
-						const content = (args.content || "") as string;
-						const lines = content.split("\n").length;
-						toolCalls.push(`write ${p} (${lines} lines)`);
-						break;
-					}
-					case "edit": {
-						const p = (args.file_path || args.path || "") as string;
-						toolCalls.push(`edit ${p}`);
-						break;
-					}
-					default: {
-						const s = JSON.stringify(args);
-						toolCalls.push(`${part.name} ${s.length > 80 ? s.slice(0, 80) + "..." : s}`);
-					}
-				}
-			}
-		}
-	}
-
-	if (toolCalls.length > 0) {
-		parts.push("TOOL CALLS:");
-		for (const tc of toolCalls) {
-			parts.push(`  ${tc}`);
-		}
-		parts.push("");
-	}
-
-	// Part 2: Last assistant message — the thread's final response
-	const lastMessage = getFinalOutput(messages);
-	if (lastMessage.trim()) {
-		parts.push("THREAD RESPONSE:");
-		parts.push(lastMessage);
-	}
-
-	return parts.join("\n") || "(no output)";
-}
-
-
-// ─── Rendering Helpers ───
-
-function formatToolCall(
-	toolName: string,
-	args: Record<string, unknown>,
-	fg: (color: any, text: string) => string,
-): string {
-	const shorten = (p: string) => {
-		const home = os.homedir();
-		return p.startsWith(home) ? `~${p.slice(home.length)}` : p;
-	};
-	switch (toolName) {
-		case "bash": {
-			const cmd = ((args.command as string) || "...").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
-			const preview = cmd.length > 80 ? cmd.slice(0, 80) + "..." : cmd;
-			return fg("muted", "$ ") + fg("toolOutput", preview);
-		}
-		case "read": {
-			const filePath = shorten(((args.file_path || args.path || "...") as string));
-			return fg("muted", "read ") + fg("accent", filePath);
-		}
-		case "write": {
-			const filePath = shorten(((args.file_path || args.path || "...") as string));
-			return fg("muted", "write ") + fg("accent", filePath);
-		}
-		case "edit": {
-			const filePath = shorten(((args.file_path || args.path || "...") as string));
-			return fg("muted", "edit ") + fg("accent", filePath);
-		}
-		default: {
-			const s = JSON.stringify(args);
-			return fg("accent", toolName) + fg("dim", ` ${s.length > 60 ? s.slice(0, 60) + "..." : s}`);
-		}
-	}
-}
-
-type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; name: string; args: Record<string, any> };
-
-function getDisplayItems(messages: Message[]): DisplayItem[] {
-	const items: DisplayItem[] = [];
-	for (const msg of messages) {
-		if (msg.role === "assistant") {
-			for (const part of msg.content) {
-				if (part.type === "text") items.push({ type: "text", text: part.text });
-				else if (part.type === "toolCall") items.push({ type: "toolCall", name: part.name, args: part.arguments });
-			}
-		}
-	}
-	return items;
-}
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Type, type TLiteral, type TUnion } from "@sinclair/typebox";
+
+import type { DispatchDetails, SingleDispatchResult } from "./src/types.ts";
+import { listThreads, formatTokens, mapWithConcurrencyLimit, MAX_CONCURRENCY } from "./src/helpers.ts";
+import { ORCHESTRATOR_PROMPT } from "./src/orchestrator.ts";
+import { ThreadRegistry } from "./src/state.ts";
+import { runThreadAction, buildEpisode } from "./src/dispatch.ts";
+import { renderCall, renderResult } from "./src/render.ts";
+import { registerCommands, updateStatusBar } from "./src/commands.ts";
+import { setupPicker } from "./src/ui/picker.ts";
+import { setupWidget } from "./src/ui/widget.ts";
+import { setupMentions } from "./src/ui/mentions.ts";
+import { setupDashboard } from "./src/ui/dashboard.ts";
 
 // ─── Extension ───
 
 export default function (pi: ExtensionAPI) {
-	// Track episode counts per thread (reconstructed from session)
-	const episodeCounts = new Map<string, number>();
-	let subagentModel = "anthropic/claude-sonnet-4-6";
+	const registry = new ThreadRegistry();
+	let unsubWidget: (() => void) | undefined;
 
-	pi.registerCommand("model-sub", {
-		description: "Set the subagent model for thread workers",
-		handler: async (args, ctx) => {
-			const input = args.trim();
+	// Register all slash commands
+	registerCommands(pi, registry);
 
-			// Direct match via argument (like /model <term>)
-			if (input) {
-				const slashIndex = input.indexOf("/");
-				if (slashIndex > 0) {
-					const provider = input.substring(0, slashIndex);
-					const modelId = input.substring(slashIndex + 1);
-					const found = ctx.modelRegistry.find(provider, modelId);
-					if (found) {
-						subagentModel = `${provider}/${modelId}`;
-						ctx.ui.setStatus("subagent-model", `\x1b[${(process.stdout.columns ?? 120) - `sub: ${subagentModel}`.length + 1}G\x1b[2msub: ${subagentModel}\x1b[0m`);
-						ctx.ui.notify(`Subagent model set to: ${subagentModel}`, "info");
-						return;
-					}
-				}
-				// Fuzzy match
-				const allModels = ctx.modelRegistry.getAvailable();
-				const matches = allModels.filter((m: any) =>
-					`${m.id} ${m.provider} ${m.provider}/${m.id}`.toLowerCase().includes(input.toLowerCase())
-				);
-				if (matches.length === 1) {
-					subagentModel = `${matches[0].provider}/${matches[0].id}`;
-					ctx.ui.setStatus("subagent-model", `\x1b[${(process.stdout.columns ?? 120) - `sub: ${subagentModel}`.length + 1}G\x1b[2msub: ${subagentModel}\x1b[0m`);
-					ctx.ui.notify(`Subagent model set to: ${subagentModel}`, "info");
-					return;
-				}
-				// Fall through to picker with search pre-filled
-			}
+	// Register Ctrl+Alt+T thread picker shortcut
+	setupPicker(pi, registry);
 
-			// Show interactive picker (mirrors /model UI)
-			const available = ctx.modelRegistry.getAvailable();
-			if (available.length === 0) {
-				ctx.ui.notify("No models available", "error");
-				return;
-			}
+	// Register @mention talk-to-thread
+	setupMentions(pi, registry);
 
-			// Sort: current model first, then alphabetical by provider
-			const items = available
-				.map((m: any) => ({
-					id: m.id,
-					name: m.name || m.id,
-					provider: m.provider,
-					isCurrent: `${m.provider}/${m.id}` === subagentModel,
-				}))
-				.sort((a: any, b: any) => {
-					if (a.isCurrent && !b.isCurrent) return -1;
-					if (!a.isCurrent && b.isCurrent) return 1;
-					return a.provider.localeCompare(b.provider);
-				});
-
-			const { DynamicBorder } = await import("@mariozechner/pi-coding-agent");
-			const { Container, Text, Input, matchesKey, Key } = await import("@mariozechner/pi-tui");
-
-			const choice = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
-				const maxVisible = 10;
-				let selectedIndex = 0;
-				let filtered = [...items];
-				let searchText = input || "";
-
-				// Apply initial search if provided
-				if (searchText) {
-					applyFilter();
-				}
-
-				function applyFilter() {
-					const q = searchText.toLowerCase();
-					if (!q) {
-						filtered = [...items];
-					} else {
-						filtered = items.filter((m: any) =>
-							`${m.id} ${m.provider} ${m.provider}/${m.id} ${m.name}`.toLowerCase().includes(q)
-						);
-					}
-					selectedIndex = Math.min(selectedIndex, Math.max(0, filtered.length - 1));
-				}
-
-				const container = new Container();
-
-				const topBorder = new DynamicBorder((s: string) => theme.fg("accent", s));
-				container.addChild(topBorder);
-
-				const headerText = new Text(theme.fg("muted", "  Only showing models with configured API keys. Configure keys in settings or environment."), 0, 1);
-				container.addChild(headerText);
-
-				const searchInput = new Input(
-					(s: string) => theme.fg("text", s),
-					(s: string) => theme.fg("accent", s),
-					80,
-					"Search models..."
-				);
-				if (searchText) {
-					// Pre-fill search
-					for (const ch of searchText) {
-						searchInput.handleInput(ch);
-					}
-				}
-				container.addChild(searchInput);
-
-				// Spacer
-				container.addChild(new Text("", 0, 1));
-
-				// Model list (rendered dynamically)
-				const listText = new Text("", 0, 0);
-				container.addChild(listText);
-
-				// Detail line
-				const detailText = new Text("", 0, 1);
-				container.addChild(detailText);
-
-				const bottomBorder = new DynamicBorder((s: string) => theme.fg("accent", s));
-				container.addChild(bottomBorder);
-
-				function renderList() {
-					if (filtered.length === 0) {
-						listText.text = theme.fg("warning", "  No matching models");
-						detailText.text = "";
-						return;
-					}
-
-					// Scroll window centred on selectedIndex
-					let startIndex = Math.max(0, selectedIndex - Math.floor(maxVisible / 2));
-					if (startIndex + maxVisible > filtered.length) {
-						startIndex = Math.max(0, filtered.length - maxVisible);
-					}
-					const endIndex = Math.min(startIndex + maxVisible, filtered.length);
-
-					const lines: string[] = [];
-					for (let i = startIndex; i < endIndex; i++) {
-						const m = filtered[i];
-						const isSelected = i === selectedIndex;
-						const checkmark = m.isCurrent ? theme.fg("success", " ✓") : "";
-						const providerBadge = theme.fg("muted", `[${m.provider}]`);
-
-						if (isSelected) {
-							lines.push(`${theme.fg("accent", "→ " + m.id)} ${providerBadge}${checkmark}`);
-						} else {
-							lines.push(`  ${m.id} ${providerBadge}${checkmark}`);
-						}
-					}
-
-					// Scroll indicator
-					if (filtered.length > maxVisible) {
-						lines.push(theme.fg("muted", `  (${selectedIndex + 1}/${filtered.length})`));
-					}
-
-					listText.text = lines.join("\n");
-
-					// Detail line: model name
-					const sel = filtered[selectedIndex];
-					if (sel) {
-						detailText.text = theme.fg("muted", `  Model Name: ${sel.name}`);
-					} else {
-						detailText.text = "";
-					}
-				}
-
-				renderList();
-
-				return {
-					render: (w: number) => container.render(w),
-					invalidate: () => container.invalidate(),
-					handleInput: (data: string) => {
-						if (matchesKey(data, Key.up)) {
-							selectedIndex = selectedIndex <= 0 ? filtered.length - 1 : selectedIndex - 1;
-							renderList();
-							tui.requestRender();
-						} else if (matchesKey(data, Key.down)) {
-							selectedIndex = selectedIndex >= filtered.length - 1 ? 0 : selectedIndex + 1;
-							renderList();
-							tui.requestRender();
-						} else if (matchesKey(data, Key.enter)) {
-							if (filtered.length > 0) {
-								const sel = filtered[selectedIndex];
-								done(`${sel.provider}/${sel.id}`);
-							}
-						} else if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
-							done(null);
-						} else {
-							searchInput.handleInput(data);
-							searchText = searchInput.value;
-							applyFilter();
-							renderList();
-							tui.requestRender();
-						}
-					},
-				};
-			});
-
-			if (!choice) return;
-
-			subagentModel = choice;
-			ctx.ui.setStatus("subagent-model", `\x1b[${(process.stdout.columns ?? 120) - `sub: ${subagentModel}`.length + 1}G\x1b[2msub: ${subagentModel}\x1b[0m`);
-			ctx.ui.notify(`Subagent model set to: ${subagentModel}`, "info");
-		},
-	});
+	// Register Ctrl+Shift+T dashboard and /dashboard command
+	setupDashboard(pi, registry);
 
 	// Reconstruct state on session load
 	pi.on("session_start", async (_event, ctx) => {
-		episodeCounts.clear();
+		registry.clear();
+
+		// Restore model/thinking config from session
+		for (const entry of ctx.sessionManager.getEntries()) {
+			if (entry.type === "custom" && entry.customType === "thread-config" && entry.data) {
+				if (entry.data.model) registry.subagentModel = entry.data.model;
+				registry.setThinking(entry.data.thinking);
+			}
+		}
 
 		// Strip built-in tools — orchestrator only dispatches
 		const allTools = pi.getAllTools();
@@ -812,7 +73,7 @@ export default function (pi: ExtensionAPI) {
 					const details = entry.message.details as DispatchDetails | undefined;
 					if (details?.items) {
 						for (const item of details.items) {
-							episodeCounts.set(item.thread, Math.max(episodeCounts.get(item.thread) || 0, item.episodeNumber));
+							registry.updateEpisodeCount(item.thread, item.episodeNumber);
 						}
 					}
 				}
@@ -820,7 +81,9 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		ctx.ui.notify("🧵 Thread orchestrator active", "info");
-		ctx.ui.setStatus("subagent-model", `\x1b[${(process.stdout.columns ?? 120) - `sub: ${subagentModel}`.length + 1}G\x1b[2msub: ${subagentModel}\x1b[0m`);
+		updateStatusBar(ctx, registry);
+		unsubWidget?.();
+		unsubWidget = setupWidget(registry, ctx);
 	});
 
 	// Inject orchestrator system prompt
@@ -831,13 +94,17 @@ export default function (pi: ExtensionAPI) {
 		const threads = listThreads(ctx.cwd);
 		if (threads.length > 0) {
 			const threadInfo = threads.map((t) => {
-				const count = episodeCounts.get(t) || 0;
-				return `  - **${t}** (${count} episode${count !== 1 ? "s" : ""})`;
+				const count = registry.episodeCounts.get(t) || 0;
+				const stats = registry.threadStats.get(t);
+				const contextInfo = stats?.contextTokens ? `, ${formatTokens(stats.contextTokens)} context` : "";
+				const compactInfo = stats?.compactionCount ? `, compacted ${stats.compactionCount}×` : "";
+				return `  - **${t}** (${count} episode${count !== 1 ? "s" : ""}${contextInfo}${compactInfo})`;
 			});
 			extra += `\n## Active Threads\n${threadInfo.join("\n")}\n`;
 		}
 
-		extra += `\n## Current Subagent Model\n${subagentModel}\n`;
+		extra += `\n## Current Subagent Model\n${registry.subagentModel}\n`;
+		extra += `\n## Current Subagent Thinking\n${registry.subagentThinking || "(pi default from settings)"}\n`;
 
 		return { systemPrompt: event.systemPrompt + extra };
 	});
@@ -863,11 +130,19 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			thread: Type.Optional(Type.String({ description: "Thread name — identifies the work stream. Reuse for related actions. (single mode)" })),
 			action: Type.Optional(Type.String({ description: "Direct, concrete instructions for the thread to execute. (single mode)" })),
+			thinking: Type.Optional(Type.Union(
+				[Type.Literal("off"), Type.Literal("minimal"), Type.Literal("low"), Type.Literal("medium"), Type.Literal("high"), Type.Literal("xhigh")],
+				{ description: "Thinking level: off, minimal, low, medium, high, xhigh" }
+			)),
 			tasks: Type.Optional(
 				Type.Array(
 					Type.Object({
 						thread: Type.String({ description: "Thread name" }),
 						action: Type.String({ description: "Action for this thread" }),
+						thinking: Type.Optional(Type.Union(
+							[Type.Literal("off"), Type.Literal("minimal"), Type.Literal("low"), Type.Literal("medium"), Type.Literal("high"), Type.Literal("xhigh")],
+							{ description: "Thinking level: off, minimal, low, medium, high, xhigh" }
+						)),
 					}),
 					{ description: "Batch mode: thread actions dispatched in parallel." },
 				),
@@ -875,7 +150,8 @@ export default function (pi: ExtensionAPI) {
 		}),
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const model = subagentModel;
+			const model = registry.subagentModel;
+			const defaultThinking = registry.subagentThinking;
 
 			// Determine mode
 			const hasBatch = params.tasks && params.tasks.length > 0;
@@ -891,7 +167,7 @@ export default function (pi: ExtensionAPI) {
 
 			const taskList = hasBatch
 				? params.tasks!
-				: [{ thread: params.thread!, action: params.action! }];
+				: [{ thread: params.thread!, action: params.action!, thinking: params.thinking }];
 
 			const mode = taskList.length > 1 ? "batch" : "single";
 
@@ -910,8 +186,8 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			// Run all tasks (parallel for batch, single for single)
-			const runOne = async (task: { thread: string; action: string }, index: number): Promise<SingleDispatchResult> => {
-				const episodeNumber = (episodeCounts.get(task.thread) || 0) + 1;
+			const runOne = async (task: { thread: string; action: string; thinking?: string }, index: number): Promise<SingleDispatchResult> => {
+				const episodeNumber = (registry.episodeCounts.get(task.thread) || 0) + 1;
 
 				// For single mode, pass onUpdate directly for live streaming
 				// For batch mode, create a per-task updater that updates this task's slot and emits
@@ -928,15 +204,42 @@ export default function (pi: ExtensionAPI) {
 							}
 						: undefined;
 
-				const result = await runThreadAction(
-					ctx.cwd, task.thread, task.action, model, signal,
-					taskOnUpdate,
-					episodeNumber,
-				);
+				const thinking = task.thinking || defaultThinking;
+				registry.markRunning(task.thread);
+				let result;
+				try {
+					result = await runThreadAction(
+						ctx.cwd, task.thread, task.action, model, thinking, signal,
+						taskOnUpdate,
+						episodeNumber,
+					);
+				} finally {
+					registry.markDone(task.thread);
+				}
+
+				// Track error state
+				if (result.errorMessage || result.exitCode !== 0) {
+					registry.markError(task.thread);
+				} else {
+					registry.clearError(task.thread);
+				}
 
 				// Build episode directly — tool call history + last message, no extra model call
-				const episode = buildEpisode(result.messages);
-				episodeCounts.set(task.thread, episodeNumber);
+				const episode = buildEpisode(result.messages, result.compaction);
+				registry.setEpisodeCount(task.thread, episodeNumber);
+
+				// Update thread context stats
+				const existingStats = registry.threadStats.get(task.thread);
+				const updatedStats = {
+					contextTokens: result.usage.contextTokens,
+					lastCompactedAt: existingStats?.lastCompactedAt || 0,
+					compactionCount: existingStats?.compactionCount || 0,
+				};
+				if (result.compaction) {
+					updatedStats.lastCompactedAt = Date.now();
+					updatedStats.compactionCount++;
+				}
+				registry.updateThreadStats(task.thread, updatedStats);
 
 				const item: SingleDispatchResult = { thread: task.thread, action: task.action, episode, episodeNumber, result };
 				allItems[index] = item;
@@ -948,7 +251,7 @@ export default function (pi: ExtensionAPI) {
 			if (taskList.length === 1) {
 				items = [await runOne(taskList[0], 0)];
 			} else {
-				items = await Promise.all(taskList.map((t, i) => runOne(t, i)));
+				items = await mapWithConcurrencyLimit(taskList, MAX_CONCURRENCY, (t, i) => runOne(t, i));
 			}
 
 			const anyError = items.some(
@@ -957,6 +260,10 @@ export default function (pi: ExtensionAPI) {
 
 			const contentText = items.map((i) => `[${i.thread}] ${i.episode}`).join("\n\n");
 
+			// NOTE: `isError` is returned but pi's tool execution pipeline may silently
+			// ignore it. To reliably signal errors to the model, the episode text itself
+			// should contain clear error descriptions. Throwing would alter control flow
+			// (abort remaining batch items), so we keep the current return-based approach.
 			return {
 				content: [{ type: "text", text: contentText }],
 				details: { mode, items },
@@ -966,159 +273,12 @@ export default function (pi: ExtensionAPI) {
 
 		// ─── Rendering ───
 
-		renderCall(args, theme) {
-			if (args.tasks && args.tasks.length > 0) {
-				return {
-					render(width: number): string[] {
-						return renderColumnsInRows(
-							args.tasks.map((t: { thread: string; action: string }) => (colWidth: number) => {
-								const header = theme.fg("accent", theme.bold(`[${t.thread}]`));
-								const actionLines = wrapText(t.action, colWidth - 1);
-								return [header, ...actionLines.map((l: string) => theme.fg("dim", l))];
-							}),
-							width,
-							theme,
-						);
-					},
-					invalidate(): void {},
-				};
-			}
-
-			// Single dispatch
-			const threadName = args.thread || "...";
-			const actionText = args.action || "...";
-
-			return {
-				render(width: number): string[] {
-					const header = theme.fg("toolTitle", theme.bold("dispatch ")) + theme.fg("accent", theme.bold(`[${threadName}]`));
-					const actionLines = wrapText(actionText, width - 2);
-					return [header, ...actionLines.map((l: string) => "  " + theme.fg("dim", l))];
-				},
-				invalidate(): void {},
-			};
+		renderCall(args, theme, context) {
+			return renderCall(args, theme);
 		},
 
-		renderResult(result, { expanded }, theme) {
-			const details = result.details as DispatchDetails | undefined;
-
-			if (!details || details.items.length === 0) {
-				const text = result.content[0];
-				return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
-			}
-
-			const renderSingleItem = (item: SingleDispatchResult, isExpanded: boolean) => {
-				const r = item.result;
-				const isRunning = !item.episode || item.episode === "(running...)";
-				const isError = !isRunning && (r.exitCode !== 0 || r.stopReason === "error" || r.stopReason === "aborted");
-				const threadLabel = theme.fg("accent", theme.bold(`[${item.thread}]`));
-				const epLabel = theme.fg("muted", `ep${item.episodeNumber}`);
-				const modelLabel = r.model ? theme.fg("dim", r.model) : "";
-
-				// ── Running state: action + live tool calls + stats ──
-				if (isRunning) {
-					return {
-						render(colWidth: number): string[] {
-							const lines: string[] = [];
-
-							// Status line: ⏳ turns · cost · context
-							const statParts: string[] = [];
-							if (r.usage.turns) statParts.push(`${r.usage.turns} turn${r.usage.turns > 1 ? "s" : ""}`);
-							if (r.usage.cost) statParts.push(`$${r.usage.cost.toFixed(2)}`);
-							if (r.usage.contextTokens > 0) statParts.push(`ctx:${formatTokens(r.usage.contextTokens)}`);
-							if (statParts.length > 0) {
-								lines.push(theme.fg("warning", "⏳") + " " + theme.fg("dim", statParts.join(" · ")));
-							}
-
-							// Live tool calls
-							const displayItems = getDisplayItems(r.messages);
-							const toolCalls = displayItems.filter((i) => i.type === "toolCall");
-							for (const tc of toolCalls) {
-								if (tc.type === "toolCall") {
-									lines.push(theme.fg("muted", "→ ") + formatToolCall(tc.name, tc.args, theme.fg.bind(theme)));
-								}
-							}
-
-							return lines.map((l) => truncateToWidth(l, colWidth));
-						},
-						invalidate(): void {},
-					};
-				}
-
-				// ── Done state: episode ──
-				const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
-				const newBadge = r.isNewThread ? theme.fg("warning", " new") : "";
-
-				if (isExpanded) {
-					const mdTheme = getMarkdownTheme();
-					const container = new Container();
-					container.addChild(new Text(`${icon} ${threadLabel} ${epLabel} ${modelLabel}${newBadge}`, 0, 0));
-					container.addChild(new Spacer(1));
-					container.addChild(new Text(theme.fg("muted", "─── Action ───"), 0, 0));
-					container.addChild(new Text(theme.fg("dim", item.action), 0, 0));
-
-					const displayItems = getDisplayItems(r.messages);
-					const toolCalls = displayItems.filter((i) => i.type === "toolCall");
-					if (toolCalls.length > 0) {
-						container.addChild(new Spacer(1));
-						container.addChild(new Text(theme.fg("muted", "─── Activity ───"), 0, 0));
-						for (const tc of toolCalls) {
-							if (tc.type === "toolCall") {
-								container.addChild(
-									new Text(theme.fg("muted", "→ ") + formatToolCall(tc.name, tc.args, theme.fg.bind(theme)), 0, 0),
-								);
-							}
-						}
-					}
-					container.addChild(new Spacer(1));
-					container.addChild(new Text(theme.fg("muted", "─── Episode ───"), 0, 0));
-					container.addChild(new Markdown(item.episode.trim(), 0, 0, mdTheme));
-
-					const usageStr = formatUsage(r.usage, r.model);
-					if (usageStr) {
-						container.addChild(new Spacer(1));
-						container.addChild(new Text(theme.fg("dim", usageStr), 0, 0));
-					}
-					return container;
-				}
-
-				// Collapsed done
-				let text = `${icon} ${threadLabel} ${epLabel} ${modelLabel}${newBadge}`;
-				if (isError && r.errorMessage) text += `\n${theme.fg("error", r.errorMessage)}`;
-				text += `\n${item.episode}`;
-				const usageStr = formatUsage(r.usage, r.model);
-				if (usageStr) text += `\n${theme.fg("dim", usageStr)}`;
-				return new Text(text, 0, 0);
-			};
-
-			// Single mode: render as before
-			if (details.mode === "single" || details.items.length === 1) {
-				const component = renderSingleItem(details.items[0], expanded);
-				if (!expanded) {
-					const container = new Container();
-					container.addChild(component);
-					container.addChild(new Text(theme.fg("muted", "(Ctrl+O to expand)"), 0, 0));
-					return container;
-				}
-				return component;
-			}
-
-			// Batch mode: render in columns
-			// Batch mode: render in rows of 3 columns
-			return {
-				render(width: number): string[] {
-					const lines = renderColumnsInRows(
-						details.items.map((item) => (colWidth: number) => {
-							const component = renderSingleItem(item, expanded);
-							return component.render(colWidth);
-						}),
-						width,
-						theme,
-					);
-					if (!expanded) lines.push(theme.fg("muted", "(Ctrl+O to expand)"));
-					return lines;
-				},
-				invalidate(): void {},
-			};
+		renderResult(result, opts, theme, context) {
+			return renderResult(result, opts, theme);
 		},
 	});
 }
