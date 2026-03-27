@@ -22,7 +22,7 @@ import type { DispatchDetails, SingleDispatchResult } from "./src/types.ts";
 import { listThreads, formatTokens, mapWithConcurrencyLimit, MAX_CONCURRENCY, readThreadNameIndex, writeThreadNameIndex, getThreadSessionPath } from "./src/helpers.ts";
 import { ORCHESTRATOR_PROMPT } from "./src/orchestrator.ts";
 import { ThreadRegistry } from "./src/state.ts";
-import { runThreadAction, buildEpisode } from "./src/dispatch.ts";
+import { runThreadAction, buildEpisode, isRetryableFailure } from "./src/dispatch.ts";
 import { renderCall, renderResult } from "./src/render.ts";
 import { registerCommands, updateStatusBar, loadGlobalConfig } from "./src/commands.ts";
 import { setupPicker } from "./src/ui/picker.ts";
@@ -264,6 +264,8 @@ export default function (pi: ExtensionAPI) {
 				const thinking = task.thinking || defaultThinking;
 				registry.markRunning(task.thread);
 				let result;
+				let retried = false;
+				let firstAttemptError: string | undefined;
 				try {
 					result = await runThreadAction(
 						ctx.cwd, task.thread, task.action, model, thinking, signal,
@@ -271,6 +273,44 @@ export default function (pi: ExtensionAPI) {
 						episodeNumber,
 						registry.sessionId,
 					);
+
+					// Retry once on retryable transient failures
+					if (isRetryableFailure(result, signal) && !signal.aborted) {
+						// Capture first attempt failure info
+						firstAttemptError = [
+							result.errorMessage ? `Error: ${result.errorMessage}` : "",
+							result.stderr ? `Stderr: ${result.stderr.trim().slice(-300)}` : "",
+							`Exit code: ${result.exitCode}`,
+						].filter(Boolean).join("; ");
+
+						onUpdate?.({
+							content: [{ type: "text", text: `Transient failure detected, retrying thread [${task.thread}] in 2s...\n${firstAttemptError}` }],
+							details: { mode: "single", items: [] },
+						});
+
+						await new Promise<void>(r => {
+							const timer = setTimeout(r, 2000);
+							// Allow abort to cancel the wait
+							if (signal) {
+								const onAbort = () => {
+									clearTimeout(timer);
+									r();
+								};
+								signal.addEventListener("abort", onAbort, { once: true });
+							}
+						});
+
+						if (!signal.aborted) {
+							retried = true;
+							registry.markRunning(task.thread);
+							result = await runThreadAction(
+								ctx.cwd, task.thread, task.action, model, thinking, signal,
+								taskOnUpdate,
+								episodeNumber,
+								registry.sessionId,
+							);
+						}
+					}
 				} finally {
 					registry.markDone(task.thread);
 				}
@@ -282,8 +322,15 @@ export default function (pi: ExtensionAPI) {
 					registry.clearError(task.thread);
 				}
 
-				// Build episode directly — tool call history + last message, no extra model call
-				const episode = buildEpisode(result.messages, result.compaction);
+				// Build episode directly — tool call history + last message + error context, no extra model call
+				const episode = buildEpisode(
+					result.messages,
+					result.compaction,
+					result.stderr,
+					result.exitCode,
+					result.errorMessage,
+					retried ? firstAttemptError : undefined,
+				);
 				registry.setEpisodeCount(task.thread, episodeNumber);
 
 				// Update thread context stats
