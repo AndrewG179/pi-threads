@@ -8,8 +8,8 @@ import { listThreads, formatTokens, relativeTime, truncateToWidth } from "../hel
 export function setupWidget(registry: ThreadRegistry, ctx: ExtensionContext): () => void {
 	const cwd = ctx.cwd;
 
-	function rebuildWidget(): void {
-		const threads = listThreads(cwd, registry.sessionId);
+	async function rebuildWidget(): Promise<void> {
+		const threads = await listThreads(cwd, registry.sessionId);
 
 		if (threads.length === 0) {
 			ctx.ui.setWidget("pi-threads", undefined);
@@ -61,7 +61,7 @@ export function setupWidget(registry: ThreadRegistry, ctx: ExtensionContext): ()
 	}
 
 	// Initial render
-	rebuildWidget();
+	rebuildWidget().catch(() => {});
 
 	// Debounce re-renders on registry changes to avoid excessive synchronous I/O.
 	// During batch dispatch, registry emits 8-10 changes per thread; this collapses
@@ -70,7 +70,7 @@ export function setupWidget(registry: ThreadRegistry, ctx: ExtensionContext): ()
 	const unsubscribe = registry.onChange(() => {
 		if (debounceTimer) clearTimeout(debounceTimer);
 		debounceTimer = setTimeout(() => {
-			rebuildWidget();
+			rebuildWidget().catch(() => {});
 			debounceTimer = null;
 		}, 100);
 	});
