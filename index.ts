@@ -147,38 +147,29 @@ export default function (pi: ExtensionAPI) {
 		name: "dispatch",
 		label: "Dispatch",
 		description: [
-			"Dispatch actions to named threads.",
-			"Single mode: thread + action. Batch mode: tasks array (any number of threads in parallel).",
-			"Threads are persistent workers with accumulated context.",
-			"Give concrete, direct instructions. The thread executes and returns an episode (compressed result).",
-			"Reuse thread names for related work. Create new threads for independent work streams.",
+			"Dispatch actions to threads in parallel.",
+			"Each task targets a named thread with an action.",
+			"Threads are persistent subagents with accumulated context — reuse thread names to build on previous work.",
+			"Spawn many threads to parallelize.",
 		].join(" "),
-		promptSnippet: "Dispatch actions to thread workers (single or batch parallel) and receive compressed episodes back",
+		promptSnippet: "Dispatch actions to threads in parallel. Threads are persistent subagents. Spawn swarms for parallelism.",
 		promptGuidelines: [
 			"Always use dispatch for ALL work — never use file or shell tools directly.",
-			"Give threads concrete, direct instructions like 'Go to file X and change Y to Z' or 'Run command X and show me the output'.",
+			"Think in swarms — fan out work across many threads in parallel.",
 			"Reuse thread names for related work so threads accumulate useful context.",
 			"If a thread reports failure, re-plan and dispatch a new action — don't ask the thread to figure it out.",
 		],
 		parameters: Type.Object({
-			thread: Type.Optional(Type.String({ description: "Thread name — identifies the work stream. Reuse for related actions. (single mode)" })),
-			action: Type.Optional(Type.String({ description: "Direct, concrete instructions for the thread to execute. (single mode)" })),
-			thinking: Type.Optional(Type.Union(
-				[Type.Literal("off"), Type.Literal("minimal"), Type.Literal("low"), Type.Literal("medium"), Type.Literal("high"), Type.Literal("xhigh")],
-				{ description: "Thinking level: off, minimal, low, medium, high, xhigh" }
-			)),
-			tasks: Type.Optional(
-				Type.Array(
-					Type.Object({
-						thread: Type.String({ description: "Thread name" }),
-						action: Type.String({ description: "Action for this thread" }),
-						thinking: Type.Optional(Type.Union(
-							[Type.Literal("off"), Type.Literal("minimal"), Type.Literal("low"), Type.Literal("medium"), Type.Literal("high"), Type.Literal("xhigh")],
-							{ description: "Thinking level: off, minimal, low, medium, high, xhigh" }
-						)),
-					}),
-					{ description: "Batch mode: thread actions dispatched in parallel." },
-				),
+			tasks: Type.Array(
+				Type.Object({
+					thread: Type.String({ description: "Thread name — identifies the work stream. Reuse for related actions." }),
+					action: Type.String({ description: "Direct, concrete instructions for the thread to execute." }),
+					thinking: Type.Optional(Type.Union(
+						[Type.Literal("off"), Type.Literal("minimal"), Type.Literal("low"), Type.Literal("medium"), Type.Literal("high"), Type.Literal("xhigh")],
+						{ description: "Thinking level: off, minimal, low, medium, high, xhigh" }
+					)),
+				}),
+				{ description: "Thread actions dispatched in parallel." },
 			),
 		}),
 
@@ -186,21 +177,14 @@ export default function (pi: ExtensionAPI) {
 			const model = registry.subagentModel;
 			const defaultThinking = registry.subagentThinking;
 
-			// Determine mode
-			const hasBatch = params.tasks && params.tasks.length > 0;
-			const hasSingle = params.thread && params.action;
-
-			if (!hasBatch && !hasSingle) {
+			const taskList = params.tasks;
+			if (!taskList || taskList.length === 0) {
 				return {
-					content: [{ type: "text", text: "Provide either thread+action (single) or tasks array (batch)." }],
+					content: [{ type: "text", text: "Provide a tasks array with at least one thread action." }],
 					details: { mode: "single" as const, items: [] },
 					isError: true,
 				};
 			}
-
-			const taskList = hasBatch
-				? params.tasks!
-				: [{ thread: params.thread!, action: params.action!, thinking: params.thinking }];
 
 			const mode = taskList.length > 1 ? "batch" : "single";
 
