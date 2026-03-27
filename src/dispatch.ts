@@ -16,6 +16,39 @@ import {
 	formatTokens,
 } from "./helpers.ts";
 
+// ─── Retry Helper ───
+
+/** Transient error patterns that are safe to retry */
+const TRANSIENT_PATTERNS = [
+	/ECONNREFUSED/i,
+	/ECONNRESET/i,
+	/ETIMEDOUT/i,
+	/ENETUNREACH/i,
+	/socket hang up/i,
+	/rate limit/i,
+	/429/,
+	/503/,
+	/too many requests/i,
+	/network\s*(error|timeout|unreachable|failure)/i,
+];
+
+/**
+ * Determine if a thread action result represents a retryable transient failure.
+ * Only retries on network/transient errors. Never retries user cancellation
+ * or deterministic failures that could have side effects.
+ */
+export function isRetryableFailure(result: ThreadActionResult, signal?: AbortSignal): boolean {
+	if (signal?.aborted) return false;
+	if (result.exitCode === 0) return false;
+	// Never retry if the thread produced output — it may have performed side effects
+	if (result.messages && result.messages.length > 0) return false;
+	// Only retry if we can identify a transient error pattern in stderr/error output
+	const errorText = [result.stderr ?? "", result.errorMessage ?? ""].join(" ");
+	if (errorText.trim() && TRANSIENT_PATTERNS.some(p => p.test(errorText))) return true;
+	// No recognized transient pattern — do not retry
+	return false;
+}
+
 // ─── Thread Execution ───
 
 /**
@@ -235,10 +268,17 @@ export function getFinalOutput(messages: Message[]): string {
 
 /**
  * Build the episode directly from thread output — no extra model call.
- * Returns: tool call history + last assistant message.
+ * Returns: tool call history + last assistant message + error context if any.
  * The orchestrator sees exactly what the thread did and said.
  */
-export function buildEpisode(messages: Message[], compaction?: { tokensBefore: number; tokensAfter: number }): string {
+export function buildEpisode(
+	messages: Message[],
+	compaction?: { tokensBefore: number; tokensAfter: number },
+	stderr?: string,
+	exitCode?: number,
+	errorMessage?: string,
+	firstAttemptError?: string,
+): string {
 	const parts: string[] = [];
 	if (compaction) {
 		parts.push(`⚠️ Context was compacted during this action (${formatTokens(compaction.tokensBefore)} → ${formatTokens(compaction.tokensAfter)} tokens kept)\n`);
@@ -301,6 +341,17 @@ export function buildEpisode(messages: Message[], compaction?: { tokensBefore: n
 	if (lastMessage.trim()) {
 		parts.push("THREAD RESPONSE:");
 		parts.push(lastMessage);
+	}
+
+	// Part 3: Error context — surface failures to the orchestrator
+	if (exitCode !== undefined && exitCode !== 0 && stderr && stderr.trim()) {
+		parts.push(`\nERROR (exit ${exitCode}): ${stderr.trim().slice(-500)}`);
+	}
+	if (errorMessage) {
+		parts.push(`\nERROR: ${errorMessage}`);
+	}
+	if (firstAttemptError) {
+		parts.push(`\nRETRY CONTEXT: ${firstAttemptError}`);
 	}
 
 	return parts.join("\n") || "(no output)";
