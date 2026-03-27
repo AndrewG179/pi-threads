@@ -185,12 +185,12 @@ function truncate(text: string, maxLen: number): string {
 	return truncateToWidth(oneLine, maxLen, "\u2026");
 }
 
-export async function openEpisodeSidebar(ctx: ExtensionContext, threadName: string, cwd: string, sessionId: string): Promise<void> {
-	if (!sessionId) {
+export async function openEpisodeSidebar(ctx: ExtensionContext, threadName: string, cwd: string, sessionId: string, sessionPathOverride?: string): Promise<void> {
+	if (!sessionId && !sessionPathOverride) {
 		ctx.ui.notify("Thread sidebar unavailable — session not initialized yet", "warn");
 		return;
 	}
-	const sessionPath = getThreadSessionPath(cwd, sessionId, threadName);
+	const sessionPath = sessionPathOverride ?? getThreadSessionPath(cwd, sessionId, threadName);
 	const messages = await parseSessionFile(sessionPath);
 	const episodes = buildEpisodes(messages);
 

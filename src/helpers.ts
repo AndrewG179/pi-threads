@@ -28,15 +28,75 @@ export function getThreadSessionPath(cwd: string, sessionId: string, threadName:
 }
 
 export async function listThreads(cwd: string, sessionId: string): Promise<string[]> {
+	const sessions = await listThreadSessions(cwd, sessionId);
+	return sessions.map((session) => session.threadName);
+}
+
+export interface ThreadSessionInfo {
+	threadName: string;
+	sessionPath: string;
+}
+
+export function getThreadNameIndexPath(cwd: string, sessionId: string): string {
+	return path.join(getThreadsDir(cwd, sessionId), "thread-names.json");
+}
+
+export async function readThreadNameIndex(cwd: string, sessionId: string): Promise<Record<string, string>> {
+	if (!sessionId) return {};
+	const indexPath = getThreadNameIndexPath(cwd, sessionId);
+	try {
+		const contents = await fs.promises.readFile(indexPath, "utf-8");
+		const parsed: unknown = JSON.parse(contents);
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+		const index: Record<string, string> = {};
+		for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+			if (typeof value === "string") index[key] = value;
+		}
+		return index;
+	} catch {
+		return {};
+	}
+}
+
+export async function writeThreadNameIndex(cwd: string, sessionId: string, index: Record<string, string>): Promise<void> {
+	if (!sessionId) return;
+	await ensureThreadsDir(cwd, sessionId);
+	const indexPath = getThreadNameIndexPath(cwd, sessionId);
+	await fs.promises.writeFile(indexPath, JSON.stringify(index, null, "\t"), "utf-8");
+}
+
+export async function recordThreadName(cwd: string, sessionId: string, threadName: string): Promise<void> {
+	if (!sessionId) return;
+	const sessionFileName = path.basename(getThreadSessionPath(cwd, sessionId, threadName));
+	const index = await readThreadNameIndex(cwd, sessionId);
+	if (index[sessionFileName] === threadName) return;
+	index[sessionFileName] = threadName;
+	await writeThreadNameIndex(cwd, sessionId, index);
+}
+
+export async function removeThreadName(cwd: string, sessionId: string, threadName: string): Promise<void> {
+	if (!sessionId) return;
+	const sessionFileName = path.basename(getThreadSessionPath(cwd, sessionId, threadName));
+	const index = await readThreadNameIndex(cwd, sessionId);
+	if (!(sessionFileName in index)) return;
+	delete index[sessionFileName];
+	await writeThreadNameIndex(cwd, sessionId, index);
+}
+
+export async function listThreadSessions(cwd: string, sessionId: string): Promise<ThreadSessionInfo[]> {
 	if (!sessionId) return [];
 	const dir = getThreadsDir(cwd, sessionId);
 	const exists = await fs.promises.access(dir).then(() => true).catch(() => false);
 	if (!exists) return [];
+	const index = await readThreadNameIndex(cwd, sessionId);
 	try {
 		const files = await fs.promises.readdir(dir);
 		return files
 			.filter((f) => f.endsWith(".jsonl"))
-			.map((f) => f.replace(/\.jsonl$/, ""));
+			.map((f) => ({
+				threadName: index[f] || f.replace(/\.jsonl$/, ""),
+				sessionPath: path.join(dir, f),
+			}));
 	} catch {
 		return [];
 	}

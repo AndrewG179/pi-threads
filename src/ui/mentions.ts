@@ -15,6 +15,7 @@ import {
 	listThreads,
 	getThreadSessionPath,
 	ensureThreadsDir,
+	recordThreadName,
 	writeTempFile,
 	cleanupTemp,
 } from "../helpers.ts";
@@ -100,6 +101,7 @@ async function doThreadWork(
 	message: string,
 ): Promise<void> {
 	await ensureThreadsDir(cwd, registry.sessionId);
+	await recordThreadName(cwd, registry.sessionId, threadName);
 	const sessionPath = getThreadSessionPath(cwd, registry.sessionId, threadName);
 
 	// Write thread worker prompt to temp file

@@ -21,7 +21,7 @@ import {
 } from "@mariozechner/pi-tui";
 
 import type { ThreadRegistry } from "../state.ts";
-import { listThreads, formatTokens, getThreadSessionPath, relativeTime } from "../helpers.ts";
+import { listThreadSessions, type ThreadSessionInfo, formatTokens, relativeTime, removeThreadName } from "../helpers.ts";
 import { getStatusIcon } from "./shared.ts";
 import { openEpisodeSidebar } from "./sidebar.ts";
 
@@ -51,27 +51,26 @@ export function setupThreadManager(
 		// ── Async prefetch ──
 		let mtimeCache = new Map<string, number>();
 
-		async function refreshThreadData(): Promise<string[]> {
-			const threadList = await listThreads(ectx.cwd, registry.sessionId);
+		async function refreshThreadData(): Promise<ThreadSessionInfo[]> {
+			const entries = await listThreadSessions(ectx.cwd, registry.sessionId);
 			const newCache = new Map<string, number>();
-			for (const name of threadList) {
+			for (const entry of entries) {
 				try {
-					const sessionPath = getThreadSessionPath(ectx.cwd, registry.sessionId, name);
-					const stat = await fs.promises.stat(sessionPath);
-					newCache.set(name, stat.mtimeMs);
+					const stat = await fs.promises.stat(entry.sessionPath);
+					newCache.set(entry.threadName, stat.mtimeMs);
 				} catch { /* thread may vanish between list and stat */ }
 			}
 			mtimeCache = newCache;
-			return threadList;
+			return entries;
 		}
 
-		let threads = await refreshThreadData();
-		if (threads.length === 0) {
+		let threadEntries = await refreshThreadData();
+		if (threadEntries.length === 0) {
 			ectx.ui.notify("No threads yet. Use dispatch to create threads.", "info");
 			return;
 		}
 
-		const result = await ectx.ui.custom<string | null>(
+		const result = await ectx.ui.custom<ThreadSessionInfo | null>(
 			(tui, theme, _kb, done) => {
 				// ── Shared state ──
 				type ViewMode = "list" | "grid";
@@ -89,7 +88,7 @@ export function setupThreadManager(
 					return Math.max(1, Math.min(cols, 4));
 				}
 
-				function closeOverlay(value: string | null) {
+				function closeOverlay(value: ThreadSessionInfo | null) {
 					if (overlayClosed) return;
 					overlayClosed = true;
 					done(value);
@@ -103,19 +102,20 @@ export function setupThreadManager(
 				let selectList = buildSelectList();
 
 				function buildSelectItems(): SelectItem[] {
-					return threads.map((t) => {
-						const count = registry.episodeCounts.get(t) || 0;
-						const stats = registry.threadStats.get(t);
-						const icon = getStatusIcon(registry, t, theme);
+					return threadEntries.map((entry) => {
+						const threadName = entry.threadName;
+						const count = registry.episodeCounts.get(threadName) || 0;
+						const stats = registry.threadStats.get(threadName);
+						const icon = getStatusIcon(registry, threadName, theme);
 						const contextInfo = stats?.contextTokens
 							? `${formatTokens(stats.contextTokens)} ctx`
 							: "0 ctx";
-						const mtimeMs = registry.lastActivity.get(t) || mtimeCache.get(t);
+						const mtimeMs = registry.lastActivity.get(threadName) || mtimeCache.get(threadName);
 						const activity = mtimeMs ? relativeTime(mtimeMs) : "unknown";
 						const description = `${count} ep · ${contextInfo} · ${activity}`;
 						return {
-							value: t,
-							label: `${icon} ${t}`,
+							value: entry.sessionPath,
+							label: `${icon} ${threadName}`,
 							description,
 						};
 					});
@@ -129,20 +129,35 @@ export function setupThreadManager(
 						scrollInfo: (t: string) => theme.fg("dim", t),
 						noMatch: (t: string) => theme.fg("warning", t),
 					});
-					sl.onSelect = (item) => closeOverlay(item.value);
+					sl.onSelect = (item) => {
+						const entry = threadEntries.find((e) => e.sessionPath === item.value);
+						if (entry) closeOverlay(entry);
+						else closeOverlay(null);
+					};
 					sl.onCancel = () => closeOverlay(null);
 					return sl;
 				}
 
+				function getEntryAt(index: number): ThreadSessionInfo | undefined {
+					return threadEntries[index];
+				}
+
+				function syncSelectedIndexFromList() {
+					const sel = selectList.getSelectedItem();
+					if (!sel) return;
+					const idx = threadEntries.findIndex((e) => e.sessionPath === sel.value);
+					if (idx >= 0) selectedIndex = idx;
+				}
+
 				/** Rebuild SelectList after data changes. */
-				function rebuildList(preserveThreadName?: string) {
+				function rebuildList(preserveSessionPath?: string) {
 					selectItems = buildSelectItems();
 					selectList = buildSelectList();
 					if (selectItems.length === 0) return;
 
 					let nextIndex = Math.max(0, Math.min(selectedIndex, selectItems.length - 1));
-					if (preserveThreadName) {
-						const preservedIndex = selectItems.findIndex((item) => item.value === preserveThreadName);
+					if (preserveSessionPath) {
+						const preservedIndex = selectItems.findIndex((item) => item.value === preserveSessionPath);
 						if (preservedIndex >= 0) nextIndex = preservedIndex;
 					}
 
@@ -164,8 +179,9 @@ export function setupThreadManager(
 
 				function executeConfirmation() {
 					if (pendingOperation) return;
-					const threadName = threads[selectedIndex];
-					if (!threadName) return;
+					const entry = getEntryAt(selectedIndex);
+					if (!entry) return;
+					const { threadName, sessionPath } = entry;
 					const mode = confirmMode;
 					if (!mode) return;
 					confirmMode = null;
@@ -173,13 +189,13 @@ export function setupThreadManager(
 
 					void (async () => {
 						try {
-							const sessionPath = getThreadSessionPath(ectx.cwd, registry.sessionId, threadName);
-
 							if (mode === "delete") {
 								let deleted = false;
 								try {
 									await fs.promises.unlink(sessionPath);
+									await removeThreadName(ectx.cwd, registry.sessionId, threadName);
 									deleted = true;
+									registry.deleteThread(threadName);
 								} catch (e: any) {
 									if (e?.code !== "ENOENT") ectx.ui.notify(`Failed to ${mode} thread: ${e?.message}`, "warning");
 								}
@@ -187,7 +203,6 @@ export function setupThreadManager(
 									ectx.ui.notify(`Failed to ${mode} thread "${threadName}"`, "error");
 									return;
 								}
-								registry.deleteThread(threadName);
 							} else {
 								// Reset: recreate session file so thread stays listed
 								try {
@@ -218,15 +233,15 @@ export function setupThreadManager(
 								}
 							}
 
-							threads = await refreshThreadData();
-							if (threads.length === 0) {
+							threadEntries = await refreshThreadData();
+							if (threadEntries.length === 0) {
 								if (!overlayClosed) closeOverlay(null);
 								return;
 							}
-							if (selectedIndex >= threads.length) {
-								selectedIndex = threads.length - 1;
+							if (selectedIndex >= threadEntries.length) {
+								selectedIndex = threadEntries.length - 1;
 							}
-							rebuildList(threadName);
+							rebuildList(sessionPath);
 							if (!overlayClosed) tui.requestRender();
 						} finally {
 							pendingOperation = false;
@@ -294,7 +309,7 @@ export function setupThreadManager(
 				function renderGrid(width: number): string[] {
 					const output: string[] = [];
 					const gap = 2;
-					const numThreads = threads.length;
+					const numThreads = threadEntries.length;
 					const numCols = Math.max(1, Math.min(getGridCols(width), numThreads));
 					const totalGap = gap * (numCols - 1);
 					const cardWidth = Math.max(20, Math.floor((width - totalGap) / numCols));
@@ -303,11 +318,11 @@ export function setupThreadManager(
 					const cardRowHeights: number[] = [];
 
 					for (let rowStart = 0; rowStart < numThreads; rowStart += numCols) {
-						const rowThreads = threads.slice(rowStart, rowStart + numCols);
+						const rowEntries = threadEntries.slice(rowStart, rowStart + numCols);
 						const rowCards: string[][] = [];
-						for (let c = 0; c < rowThreads.length; c++) {
+						for (let c = 0; c < rowEntries.length; c++) {
 							const globalIdx = rowStart + c;
-							rowCards.push(renderCard(rowThreads[c], cardWidth, globalIdx === selectedIndex));
+							rowCards.push(renderCard(rowEntries[c].threadName, cardWidth, globalIdx === selectedIndex));
 						}
 						const maxHeight = Math.max(...rowCards.map((c) => c.length));
 						for (const card of rowCards) {
@@ -324,8 +339,9 @@ export function setupThreadManager(
 
 					if (confirmMode) {
 						const verb = confirmMode === "delete" ? "Delete" : "Reset";
+						const threadName = getEntryAt(selectedIndex)?.threadName ?? "";
 						allCardLines.push("");
-						allCardLines.push(theme.fg("warning", centerText(`${verb} "${threads[selectedIndex]}"? (y/n)`, width)));
+						allCardLines.push(theme.fg("warning", centerText(`${verb} "${threadName}"? (y/n)`, width)));
 					}
 
 					const viewportHeight = Math.max(1, (process.stdout.rows || 24) - 6);
@@ -362,21 +378,21 @@ export function setupThreadManager(
 						return; // ignore other keys in confirm mode
 					}
 
-					const numThreads = threads.length;
-					const gridCols = getGridCols(lastRenderWidth);
-					const row = Math.floor(selectedIndex / gridCols);
-					const col = selectedIndex % gridCols;
-					const totalRows = Math.ceil(numThreads / gridCols);
+					const numThreads = threadEntries.length;
+					const numCols = Math.max(1, Math.min(getGridCols(lastRenderWidth), numThreads));
+					const row = Math.floor(selectedIndex / numCols);
+					const col = selectedIndex % numCols;
+					const totalRows = Math.ceil(numThreads / numCols);
 
 					if (matchesKey(data, Key.escape)) { closeOverlay(null); return; }
 
 					if (matchesKey(data, Key.up) || data === "k") {
-						if (row > 0) selectedIndex = Math.min((row - 1) * gridCols + col, numThreads - 1);
+						if (row > 0) selectedIndex = Math.min((row - 1) * numCols + col, numThreads - 1);
 						tui.requestRender();
 						return;
 					}
 					if (matchesKey(data, Key.down) || data === "j") {
-						if (row < totalRows - 1) selectedIndex = Math.min((row + 1) * gridCols + col, numThreads - 1);
+						if (row < totalRows - 1) selectedIndex = Math.min((row + 1) * numCols + col, numThreads - 1);
 						tui.requestRender();
 						return;
 					}
@@ -397,7 +413,7 @@ export function setupThreadManager(
 						scrollOffset = Math.max(0, scrollOffset - scroll);
 						if (row > 0) {
 							const newRow = Math.max(0, row - Math.ceil(scroll / 8));
-							selectedIndex = Math.min(newRow * gridCols + col, numThreads - 1);
+							selectedIndex = Math.min(newRow * numCols + col, numThreads - 1);
 						}
 						tui.requestRender();
 						return;
@@ -408,18 +424,23 @@ export function setupThreadManager(
 						scrollOffset += scroll;
 						if (row < totalRows - 1) {
 							const newRow = Math.min(totalRows - 1, row + Math.ceil(scroll / 8));
-							selectedIndex = Math.min(newRow * gridCols + col, numThreads - 1);
+							selectedIndex = Math.min(newRow * numCols + col, numThreads - 1);
 						}
 						tui.requestRender();
 						return;
 					}
 
-					if (matchesKey(data, Key.enter)) { closeOverlay(threads[selectedIndex]); return; }
+					if (matchesKey(data, Key.enter)) {
+						closeOverlay(getEntryAt(selectedIndex) ?? null);
+						return;
+					}
 
 					if (data === "d") {
 						if (pendingOperation) return;
-						if (registry.runningThreads.has(threads[selectedIndex])) {
-							ectx.ui.notify(`Thread "${threads[selectedIndex]}" is currently busy`, "warning");
+						const threadName = getEntryAt(selectedIndex)?.threadName;
+						if (!threadName) return;
+						if (registry.runningThreads.has(threadName)) {
+							ectx.ui.notify(`Thread "${threadName}" is currently busy`, "warning");
 							return;
 						}
 						confirmMode = "delete";
@@ -428,8 +449,10 @@ export function setupThreadManager(
 					}
 					if (data === "r") {
 						if (pendingOperation) return;
-						if (registry.runningThreads.has(threads[selectedIndex])) {
-							ectx.ui.notify(`Thread "${threads[selectedIndex]}" is currently busy`, "warning");
+						const threadName = getEntryAt(selectedIndex)?.threadName;
+						if (!threadName) return;
+						if (registry.runningThreads.has(threadName)) {
+							ectx.ui.notify(`Thread "${threadName}" is currently busy`, "warning");
 							return;
 						}
 						confirmMode = "reset";
@@ -441,13 +464,9 @@ export function setupThreadManager(
 						view = "list";
 						confirmMode = null;
 						scrollOffset = 0;
-						const preserveThreadName = threads[selectedIndex];
-						rebuildList(preserveThreadName);
-						const sel = selectList.getSelectedItem();
-						if (sel) {
-							const idx = threads.indexOf(sel.value);
-							if (idx >= 0) selectedIndex = idx;
-						}
+						const preserveSessionPath = getEntryAt(selectedIndex)?.sessionPath;
+						rebuildList(preserveSessionPath);
+						syncSelectedIndexFromList();
 						tui.requestRender();
 						return;
 					}
@@ -475,26 +494,18 @@ export function setupThreadManager(
 						view = "grid";
 						confirmMode = null;
 						scrollOffset = 0;
-						// Sync selectedIndex from SelectList's current position
-						const sel = selectList.getSelectedItem();
-						if (sel) {
-							const idx = threads.indexOf(sel.value);
-							if (idx >= 0) selectedIndex = idx;
-						}
+						syncSelectedIndexFromList();
 						tui.requestRender();
 						return;
 					}
 
 					if (data === "d") {
 						if (pendingOperation) return;
-						// Determine currently selected thread in the list
-						const sel = selectList.getSelectedItem();
-						if (sel) {
-							const idx = threads.indexOf(sel.value);
-							if (idx >= 0) selectedIndex = idx;
-						}
-						if (registry.runningThreads.has(threads[selectedIndex])) {
-							ectx.ui.notify(`Thread "${threads[selectedIndex]}" is currently busy`, "warning");
+						syncSelectedIndexFromList();
+						const threadName = getEntryAt(selectedIndex)?.threadName;
+						if (!threadName) return;
+						if (registry.runningThreads.has(threadName)) {
+							ectx.ui.notify(`Thread "${threadName}" is currently busy`, "warning");
 							return;
 						}
 						confirmMode = "delete";
@@ -504,13 +515,11 @@ export function setupThreadManager(
 
 					if (data === "r") {
 						if (pendingOperation) return;
-						const sel = selectList.getSelectedItem();
-						if (sel) {
-							const idx = threads.indexOf(sel.value);
-							if (idx >= 0) selectedIndex = idx;
-						}
-						if (registry.runningThreads.has(threads[selectedIndex])) {
-							ectx.ui.notify(`Thread "${threads[selectedIndex]}" is currently busy`, "warning");
+						syncSelectedIndexFromList();
+						const threadName = getEntryAt(selectedIndex)?.threadName;
+						if (!threadName) return;
+						if (registry.runningThreads.has(threadName)) {
+							ectx.ui.notify(`Thread "${threadName}" is currently busy`, "warning");
 							return;
 						}
 						confirmMode = "reset";
@@ -555,8 +564,9 @@ export function setupThreadManager(
 							// Inline confirmation prompt
 							if (confirmMode) {
 								const verb = confirmMode === "delete" ? "Delete" : "Reset";
+								const threadName = getEntryAt(selectedIndex)?.threadName ?? "";
 								output.push("");
-								output.push(theme.fg("warning", centerText(`${verb} "${threads[selectedIndex]}"? (y/n)`, width)));
+								output.push(theme.fg("warning", centerText(`${verb} "${threadName}"? (y/n)`, width)));
 							}
 						} else {
 							const gridLines = renderGrid(width);
@@ -592,7 +602,7 @@ export function setupThreadManager(
 
 		// If a thread was selected, open episode sidebar
 		if (result) {
-			await openEpisodeSidebar(ectx, result, ectx.cwd, registry.sessionId);
+			await openEpisodeSidebar(ectx, result.threadName, ectx.cwd, registry.sessionId, result.sessionPath);
 		}
 	};
 

@@ -18,7 +18,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { Type, type TLiteral, type TUnion } from "@sinclair/typebox";
 
 import type { DispatchDetails, SingleDispatchResult } from "./src/types.ts";
-import { listThreads, formatTokens, mapWithConcurrencyLimit, MAX_CONCURRENCY } from "./src/helpers.ts";
+import { listThreads, formatTokens, mapWithConcurrencyLimit, MAX_CONCURRENCY, recordThreadName } from "./src/helpers.ts";
 import { ORCHESTRATOR_PROMPT } from "./src/orchestrator.ts";
 import { ThreadRegistry } from "./src/state.ts";
 import { runThreadAction, buildEpisode, isRetryableFailure } from "./src/dispatch.ts";
@@ -92,6 +92,16 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 			}
+		}
+
+		// Backfill thread name index for existing threads
+		const knownThreadNames = new Set<string>([
+			...registry.episodeCounts.keys(),
+			...registry.threadStats.keys(),
+			...registry.lastActivity.keys(),
+		]);
+		for (const name of knownThreadNames) {
+			await recordThreadName(ctx.cwd, registry.sessionId, name).catch(() => {});
 		}
 
 		ctx.ui.notify("🧵 Thread orchestrator active", "info");

@@ -8,6 +8,7 @@ import type { DispatchDetails, ThreadActionResult } from "./types.ts";
 import { THREAD_WORKER_PROMPT } from "./orchestrator.ts";
 import {
 	ensureThreadsDir,
+	recordThreadName,
 	getThreadSessionPath,
 	getPiInvocation,
 	writeTempFile,
@@ -166,6 +167,7 @@ export async function runThreadAction(
 	sessionId: string,
 ): Promise<ThreadActionResult> {
 	await ensureThreadsDir(cwd, sessionId);
+	await recordThreadName(cwd, sessionId, threadName);
 	const sessionPath = getThreadSessionPath(cwd, sessionId, threadName);
 	const sessionExists = await fs.promises.access(sessionPath).then(() => true).catch(() => false);
 	const isNewThread = !sessionExists;
