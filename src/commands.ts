@@ -9,7 +9,16 @@ import { getThreadSessionPath, listThreads, formatTokens } from "./helpers.ts";
 
 export function updateStatusBar(ctx: { ui: { setStatus: (key: string, text: string) => void } }, registry: ThreadRegistry): void {
 	const thinkingLabel = registry.subagentThinking || "default";
-	const statusText = `sub: ${registry.subagentModel} | thinking: ${thinkingLabel}`;
+	// Parse provider/model format to match main model display: (provider) model • thinking
+	const slashIndex = registry.subagentModel.indexOf("/");
+	let statusText: string;
+	if (slashIndex !== -1) {
+		const provider = registry.subagentModel.substring(0, slashIndex);
+		const modelId = registry.subagentModel.substring(slashIndex + 1);
+		statusText = `(${provider}) ${modelId} • ${thinkingLabel}`;
+	} else {
+		statusText = `${registry.subagentModel} • ${thinkingLabel}`;
+	}
 	ctx.ui.setStatus("subagent-model", `\x1b[${(process.stdout.columns ?? 120) - statusText.length + 1}G\x1b[2m${statusText}\x1b[0m`);
 }
 
