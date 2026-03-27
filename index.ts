@@ -25,10 +25,9 @@ import { ThreadRegistry } from "./src/state.ts";
 import { runThreadAction, buildEpisode, isRetryableFailure } from "./src/dispatch.ts";
 import { renderCall, renderResult } from "./src/render.ts";
 import { registerCommands, updateStatusBar, loadGlobalConfig } from "./src/commands.ts";
-import { setupPicker } from "./src/ui/picker.ts";
 import { setupWidget } from "./src/ui/widget.ts";
 import { setupMentions } from "./src/ui/mentions.ts";
-import { setupDashboard } from "./src/ui/dashboard.ts";
+import { setupThreadManager } from "./src/ui/thread-manager.ts";
 
 // ─── Extension ───
 
@@ -39,14 +38,11 @@ export default function (pi: ExtensionAPI) {
 	// Register all slash commands
 	registerCommands(pi, registry);
 
-	// Register Ctrl+Alt+T thread picker shortcut
-	setupPicker(pi, registry);
-
 	// Register @mention talk-to-thread
 	setupMentions(pi, registry);
 
-	// Register Ctrl+Shift+T dashboard and /dashboard command
-	setupDashboard(pi, registry);
+	// Register unified Thread Manager (Ctrl+Alt+T, Ctrl+Shift+T, /threads, /thread-delete)
+	setupThreadManager(pi, registry);
 
 	// Shared init logic for session_start and session_switch
 	async function initSessionState(ctx: ExtensionContext) {

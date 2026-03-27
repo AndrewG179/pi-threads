@@ -200,20 +200,37 @@ export async function openEpisodeSidebar(ctx: ExtensionContext, threadName: stri
 	return ctx.ui.custom(
 		(tui: { requestRender: () => void }, theme: { fg: (color: string, text: string) => string; bold: (text: string) => string }, _kb: unknown, done: (val: undefined) => void) => {
 			let selectedIndex = 0;
+			let scrollOffset = 0;
 			const expanded = new Set<number>(); // indices of expanded episodes
+			// Cache for buildAllLines to avoid recomputing during input + render
+			let cachedLines: { lines: string[]; episodeStartLines: number[] } | null = null;
+			let cachedWidth = 0;
 
-			function buildLines(width: number): string[] {
+			function getCachedLines(width: number): { lines: string[]; episodeStartLines: number[] } {
+				if (!cachedLines || cachedWidth !== width) {
+					cachedLines = buildAllLines(width);
+					cachedWidth = width;
+				}
+				return cachedLines;
+			}
+
+			function invalidateCache(): void {
+				cachedLines = null;
+			}
+
+			/**
+			 * Build all content lines and track which line index each episode starts at.
+			 * Returns { lines, episodeStartLines } where episodeStartLines[i] is the
+			 * line index in `lines` where reversed[i]'s header appears.
+			 */
+			function buildAllLines(width: number): { lines: string[]; episodeStartLines: number[] } {
 				const lines: string[] = [];
+				const episodeStartLines: number[] = [];
 				const innerWidth = width - 2; // padding
-
-				// Header
-				lines.push(theme.fg("accent", theme.bold(` 🧵 ${threadName}`)));
-				lines.push(theme.fg("muted", `  ${episodes.length} episode${episodes.length !== 1 ? "s" : ""}`));
-				lines.push("");
 
 				if (reversed.length === 0) {
 					lines.push(theme.fg("muted", "  No episodes found"));
-					return lines;
+					return { lines, episodeStartLines };
 				}
 
 				for (let i = 0; i < reversed.length; i++) {
@@ -222,6 +239,9 @@ export async function openEpisodeSidebar(ctx: ExtensionContext, threadName: stri
 					const isExpanded = expanded.has(i);
 					const prefix = isSelected ? theme.fg("accent", "▸ ") : "  ";
 					const expandIcon = isExpanded ? "▾" : "▸";
+
+					// Record the line where this episode starts
+					episodeStartLines.push(lines.length);
 
 					// Episode header line
 					const header = `${expandIcon} Episode ${ep.number}`;
@@ -280,7 +300,130 @@ export async function openEpisodeSidebar(ctx: ExtensionContext, threadName: stri
 					lines.push("");
 				}
 
-				return lines;
+				return { lines, episodeStartLines };
+			}
+
+			/**
+			 * Compute the usable viewport height for content lines.
+			 * The overlay is maxHeight 80% of terminal rows.
+			 * Subtract: top border (1) + header (3 lines: title, subtitle, blank) + help line (1) + spacer (1) + bottom border (1) = ~7
+			 * Plus scroll indicator lines take space from the viewport, but we account for
+			 * those dynamically.
+			 */
+			function getViewportHeight(): number {
+				const termRows = process.stdout.rows || 24;
+				const overlayHeight = Math.floor(termRows * 0.8);
+				// top border(1) + title(1) + subtitle(1) + blank(1) + spacer(1) + help(1) + bottom border(1) = 7
+				const chrome = 7;
+				return Math.max(3, overlayHeight - chrome);
+			}
+
+			/**
+			 * Ensure scrollOffset keeps the selected episode visible.
+			 */
+			function adjustScroll(episodeStartLines: number[], allLineCount: number): void {
+				const vpHeight = getViewportHeight();
+
+				if (allLineCount <= vpHeight) {
+					scrollOffset = 0;
+					return;
+				}
+
+				if (episodeStartLines.length === 0) return;
+
+				const selectedStart = episodeStartLines[selectedIndex] ?? 0;
+
+				// Estimate usable height accounting for scroll indicators
+				// We may need up to 2 lines for indicators (above + below)
+				const estimatedUsable = vpHeight - 2;
+
+				// If the selected episode header is above the viewport, scroll up
+				if (selectedStart < scrollOffset) {
+					scrollOffset = selectedStart;
+				}
+
+				// If the selected episode header is below the visible area, scroll down
+				if (selectedStart >= scrollOffset + estimatedUsable) {
+					scrollOffset = selectedStart - estimatedUsable + 1;
+				}
+
+				// Clamp - account for indicator lines in max scroll
+				const maxScroll = Math.max(0, allLineCount - estimatedUsable);
+				scrollOffset = Math.max(0, Math.min(scrollOffset, maxScroll));
+			}
+
+			/**
+			 * Build the final visible lines with scroll indicators and header.
+			 */
+			function buildVisibleContent(width: number): string[] {
+				const { lines: allLines, episodeStartLines } = getCachedLines(width);
+
+				// Adjust scroll to keep selection visible
+				adjustScroll(episodeStartLines, allLines.length);
+
+				const vpHeight = getViewportHeight();
+				const totalLines = allLines.length;
+				const needsScroll = totalLines > vpHeight;
+
+				// Determine how many lines we can show (reserve space for indicators)
+				let usableHeight = vpHeight;
+				let showAbove = false;
+				let showBelow = false;
+
+				if (needsScroll) {
+					if (scrollOffset > 0) {
+						showAbove = true;
+						usableHeight--;
+					}
+					const remaining = totalLines - scrollOffset - usableHeight;
+					if (remaining > 0) {
+						showBelow = true;
+						usableHeight--;
+					}
+					// Re-check: after reserving for below, does above still apply?
+					// And after reserving for above, does below still apply?
+					if (showBelow && !showAbove && scrollOffset > 0) {
+						showAbove = true;
+						usableHeight--;
+					}
+					if (showAbove && !showBelow) {
+						const remainAfter = totalLines - scrollOffset - usableHeight;
+						if (remainAfter > 0) {
+							showBelow = true;
+							usableHeight--;
+						}
+					}
+				}
+
+				usableHeight = Math.max(1, usableHeight);
+
+				const visibleSlice = allLines.slice(scrollOffset, scrollOffset + usableHeight);
+
+				// Build output lines
+				const output: string[] = [];
+
+				// Header with scroll position
+				const posIndicator = reversed.length > 0
+					? ` (${selectedIndex + 1}/${reversed.length})`
+					: "";
+				output.push(theme.fg("accent", theme.bold(` 🧵 ${threadName}${posIndicator}`)));
+				output.push(theme.fg("muted", `  ${episodes.length} episode${episodes.length !== 1 ? "s" : ""}`));
+				output.push("");
+
+				if (showAbove) {
+					output.push(theme.fg("dim", `  ▲ more above (${scrollOffset} lines)`));
+				}
+
+				for (const line of visibleSlice) {
+					output.push(line);
+				}
+
+				if (showBelow) {
+					const belowCount = totalLines - (scrollOffset + usableHeight);
+					output.push(theme.fg("dim", `  ▼ ${belowCount} more below`));
+				}
+
+				return output;
 			}
 
 			const container = new Container();
@@ -293,7 +436,7 @@ export async function openEpisodeSidebar(ctx: ExtensionContext, threadName: stri
 			// Help text
 			container.addChild(new Spacer(1));
 			container.addChild(
-				new Text(theme.fg("dim", "  ↑↓ navigate · enter expand/collapse · esc close"), 1, 0),
+				new Text(theme.fg("dim", "  ↑↓ navigate · enter expand/collapse · ^U/^D scroll · esc close"), 1, 0),
 			);
 
 			const bottomBorder = new DynamicBorder((s: string) => theme.fg("accent", s));
@@ -303,7 +446,7 @@ export async function openEpisodeSidebar(ctx: ExtensionContext, threadName: stri
 			let lastWidth = 0;
 
 			function updateContent(width: number) {
-				const lines = buildLines(width);
+				const lines = buildVisibleContent(width);
 				contentText.setText(lines.join("\n"));
 				lastWidth = width;
 				dirty = false;
@@ -324,12 +467,14 @@ export async function openEpisodeSidebar(ctx: ExtensionContext, threadName: stri
 					if (matchesKey(data, Key.up)) {
 						if (selectedIndex > 0) {
 							selectedIndex--;
+							invalidateCache();
 							dirty = true;
 						}
 						tui.requestRender();
 					} else if (matchesKey(data, Key.down)) {
 						if (selectedIndex < reversed.length - 1) {
 							selectedIndex++;
+							invalidateCache();
 							dirty = true;
 						}
 						tui.requestRender();
@@ -339,6 +484,55 @@ export async function openEpisodeSidebar(ctx: ExtensionContext, threadName: stri
 						} else {
 							expanded.add(selectedIndex);
 						}
+						invalidateCache();
+						dirty = true;
+						tui.requestRender();
+					} else if (matchesKey(data, Key.pageUp) || data === "\x15") {
+						// PgUp or Ctrl+U: scroll up by half viewport
+						const vpHeight = getViewportHeight();
+						const pageSize = Math.max(1, vpHeight - 2);
+						const jump = Math.max(1, Math.floor(pageSize / 2));
+						scrollOffset = Math.max(0, scrollOffset - jump);
+						// Also move selection up to stay in view
+						const { episodeStartLines } = getCachedLines(lastWidth || 80);
+						// Find the first episode visible after scroll
+						for (let i = 0; i < episodeStartLines.length; i++) {
+							if (episodeStartLines[i] >= scrollOffset) {
+								if (selectedIndex > i) {
+									selectedIndex = i;
+								}
+								break;
+							}
+						}
+						invalidateCache();
+						dirty = true;
+						tui.requestRender();
+					} else if (matchesKey(data, Key.pageDown) || data === "\x04") {
+						// PgDn or Ctrl+D: scroll down by half viewport
+						const vpHeight = getViewportHeight();
+						const pageSize = Math.max(1, vpHeight - 2);
+						const jump = Math.max(1, Math.floor(pageSize / 2));
+						const { lines: allLines, episodeStartLines } = getCachedLines(lastWidth || 80);
+						const maxScroll = Math.max(0, allLines.length - Math.max(1, vpHeight - 2));
+						scrollOffset = Math.min(maxScroll, scrollOffset + jump);
+						// Also move selection down to stay in view
+						for (let i = episodeStartLines.length - 1; i >= 0; i--) {
+							if (episodeStartLines[i] < scrollOffset + vpHeight) {
+								if (selectedIndex < i && episodeStartLines[i] >= scrollOffset) {
+									selectedIndex = i;
+								} else if (episodeStartLines[selectedIndex] < scrollOffset) {
+									// Current selection scrolled above viewport, snap to first visible
+									for (let j = 0; j < episodeStartLines.length; j++) {
+										if (episodeStartLines[j] >= scrollOffset) {
+											selectedIndex = j;
+											break;
+										}
+									}
+								}
+								break;
+							}
+						}
+						invalidateCache();
 						dirty = true;
 						tui.requestRender();
 					} else if (matchesKey(data, Key.escape)) {
