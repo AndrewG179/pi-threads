@@ -567,7 +567,7 @@ export function setupThreadManager(
 					},
 
 					invalidate() {
-						overlayClosed = true;
+						// Clear cached render state (called on theme changes)
 					},
 
 					handleInput(data: string) {
