@@ -5,6 +5,19 @@ import * as path from "node:path";
 
 import type { UsageStats } from "./types.ts";
 
+// ─── Index Write Lock ───
+// Serializes read-modify-write cycles on thread-names.json to prevent
+// concurrent dispatches from overwriting each other's entries.
+let _indexLock: Promise<void> = Promise.resolve();
+
+function withIndexLock<T>(fn: () => Promise<T>): Promise<T> {
+	let resolve: (v: T) => void;
+	let reject: (e: unknown) => void;
+	const result = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+	_indexLock = _indexLock.then(() => fn().then(resolve!, reject!), () => fn().then(resolve!, reject!));
+	return result;
+}
+
 // ─── Constants ───
 
 export const THREADS_DIR = ".pi/threads";
@@ -67,20 +80,24 @@ export async function writeThreadNameIndex(cwd: string, sessionId: string, index
 
 export async function recordThreadName(cwd: string, sessionId: string, threadName: string): Promise<void> {
 	if (!sessionId) return;
-	const sessionFileName = path.basename(getThreadSessionPath(cwd, sessionId, threadName));
-	const index = await readThreadNameIndex(cwd, sessionId);
-	if (index[sessionFileName] === threadName) return;
-	index[sessionFileName] = threadName;
-	await writeThreadNameIndex(cwd, sessionId, index);
+	return withIndexLock(async () => {
+		const sessionFileName = path.basename(getThreadSessionPath(cwd, sessionId, threadName));
+		const index = await readThreadNameIndex(cwd, sessionId);
+		if (index[sessionFileName] === threadName) return;
+		index[sessionFileName] = threadName;
+		await writeThreadNameIndex(cwd, sessionId, index);
+	});
 }
 
 export async function removeThreadName(cwd: string, sessionId: string, threadName: string): Promise<void> {
 	if (!sessionId) return;
-	const sessionFileName = path.basename(getThreadSessionPath(cwd, sessionId, threadName));
-	const index = await readThreadNameIndex(cwd, sessionId);
-	if (!(sessionFileName in index)) return;
-	delete index[sessionFileName];
-	await writeThreadNameIndex(cwd, sessionId, index);
+	return withIndexLock(async () => {
+		const sessionFileName = path.basename(getThreadSessionPath(cwd, sessionId, threadName));
+		const index = await readThreadNameIndex(cwd, sessionId);
+		if (!(sessionFileName in index)) return;
+		delete index[sessionFileName];
+		await writeThreadNameIndex(cwd, sessionId, index);
+	});
 }
 
 export async function listThreadSessions(cwd: string, sessionId: string): Promise<ThreadSessionInfo[]> {
@@ -122,19 +139,13 @@ export async function cleanupTemp(dir: string | null, file: string | null): Prom
 		try {
 			await fs.promises.unlink(file);
 		} catch (e: any) {
-			if (e?.code !== 'ENOENT') {
-				// Log non-ENOENT errors for debugging
-				console.error('Cleanup error:', e?.message);
-			}
+			if (e?.code !== 'ENOENT') { /* swallow non-critical cleanup errors */ }
 		}
 	if (dir)
 		try {
 			await fs.promises.rm(dir, { recursive: true });
 		} catch (e: any) {
-			if (e?.code !== 'ENOENT') {
-				// Log non-ENOENT errors for debugging
-				console.error('Cleanup error:', e?.message);
-			}
+			if (e?.code !== 'ENOENT') { /* swallow non-critical cleanup errors */ }
 		}
 }
 

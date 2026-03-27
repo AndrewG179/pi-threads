@@ -202,6 +202,21 @@ export async function openEpisodeSidebar(ctx: ExtensionContext, threadName: stri
 			let selectedIndex = 0;
 			let scrollOffset = 0;
 			const expanded = new Set<number>(); // indices of expanded episodes
+			// Cache for buildAllLines to avoid recomputing during input + render
+			let cachedLines: { lines: string[]; episodeStartLines: number[] } | null = null;
+			let cachedWidth = 0;
+
+			function getCachedLines(width: number): { lines: string[]; episodeStartLines: number[] } {
+				if (!cachedLines || cachedWidth !== width) {
+					cachedLines = buildAllLines(width);
+					cachedWidth = width;
+				}
+				return cachedLines;
+			}
+
+			function invalidateCache(): void {
+				cachedLines = null;
+			}
 
 			/**
 			 * Build all content lines and track which line index each episode starts at.
@@ -341,7 +356,7 @@ export async function openEpisodeSidebar(ctx: ExtensionContext, threadName: stri
 			 * Build the final visible lines with scroll indicators and header.
 			 */
 			function buildVisibleContent(width: number): string[] {
-				const { lines: allLines, episodeStartLines } = buildAllLines(width);
+				const { lines: allLines, episodeStartLines } = getCachedLines(width);
 
 				// Adjust scroll to keep selection visible
 				adjustScroll(episodeStartLines, allLines.length);
@@ -452,12 +467,14 @@ export async function openEpisodeSidebar(ctx: ExtensionContext, threadName: stri
 					if (matchesKey(data, Key.up)) {
 						if (selectedIndex > 0) {
 							selectedIndex--;
+							invalidateCache();
 							dirty = true;
 						}
 						tui.requestRender();
 					} else if (matchesKey(data, Key.down)) {
 						if (selectedIndex < reversed.length - 1) {
 							selectedIndex++;
+							invalidateCache();
 							dirty = true;
 						}
 						tui.requestRender();
@@ -467,6 +484,7 @@ export async function openEpisodeSidebar(ctx: ExtensionContext, threadName: stri
 						} else {
 							expanded.add(selectedIndex);
 						}
+						invalidateCache();
 						dirty = true;
 						tui.requestRender();
 					} else if (matchesKey(data, Key.pageUp) || data === "\x15") {
@@ -476,7 +494,7 @@ export async function openEpisodeSidebar(ctx: ExtensionContext, threadName: stri
 						const jump = Math.max(1, Math.floor(pageSize / 2));
 						scrollOffset = Math.max(0, scrollOffset - jump);
 						// Also move selection up to stay in view
-						const { episodeStartLines } = buildAllLines(lastWidth || 80);
+						const { episodeStartLines } = getCachedLines(lastWidth || 80);
 						// Find the first episode visible after scroll
 						for (let i = 0; i < episodeStartLines.length; i++) {
 							if (episodeStartLines[i] >= scrollOffset) {
@@ -486,6 +504,7 @@ export async function openEpisodeSidebar(ctx: ExtensionContext, threadName: stri
 								break;
 							}
 						}
+						invalidateCache();
 						dirty = true;
 						tui.requestRender();
 					} else if (matchesKey(data, Key.pageDown) || data === "\x04") {
@@ -493,7 +512,7 @@ export async function openEpisodeSidebar(ctx: ExtensionContext, threadName: stri
 						const vpHeight = getViewportHeight();
 						const pageSize = Math.max(1, vpHeight - 2);
 						const jump = Math.max(1, Math.floor(pageSize / 2));
-						const { lines: allLines, episodeStartLines } = buildAllLines(lastWidth || 80);
+						const { lines: allLines, episodeStartLines } = getCachedLines(lastWidth || 80);
 						const maxScroll = Math.max(0, allLines.length - Math.max(1, vpHeight - 2));
 						scrollOffset = Math.min(maxScroll, scrollOffset + jump);
 						// Also move selection down to stay in view
@@ -513,6 +532,7 @@ export async function openEpisodeSidebar(ctx: ExtensionContext, threadName: stri
 								break;
 							}
 						}
+						invalidateCache();
 						dirty = true;
 						tui.requestRender();
 					} else if (matchesKey(data, Key.escape)) {

@@ -30,7 +30,7 @@ const TRANSIENT_PATTERNS = [
 	/503/,
 	/too many requests/i,
 	/spawn.*ENOENT/i,
-	/network/i,
+	/network\s*(error|timeout|unreachable|failure)/i,
 ];
 
 /**
@@ -40,11 +40,11 @@ const TRANSIENT_PATTERNS = [
  */
 export function isRetryableFailure(result: ThreadActionResult, signal?: AbortSignal): boolean {
 	if (signal?.aborted) return false;
-	// Only retry if we can identify a transient error pattern
+	if (result.exitCode === 0) return false;
+	// Only retry if we can identify a transient error pattern in stderr/error output
 	const errorText = [result.stderr ?? "", result.errorMessage ?? ""].join(" ");
-	if (errorText && TRANSIENT_PATTERNS.some(p => p.test(errorText))) return true;
-	// If the process couldn't even spawn (no messages captured), treat as transient
-	if (result.exitCode !== 0 && result.messages.length === 0) return true;
+	if (errorText.trim() && TRANSIENT_PATTERNS.some(p => p.test(errorText))) return true;
+	// No recognized transient pattern — do not retry
 	return false;
 }
 

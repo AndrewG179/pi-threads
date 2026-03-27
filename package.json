@@ -1,9 +1,17 @@
 {
   "name": "pi-threads",
   "version": "1.0.0",
+  "type": "module",
   "description": "Thread-based orchestrator extension for pi — dispatch actions to persistent worker threads",
   "keywords": ["pi-package"],
   "pi": {
     "extensions": ["./index.ts"]
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "vitest": "^3.1.1"
   }
 }

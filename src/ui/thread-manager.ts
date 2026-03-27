@@ -95,7 +95,7 @@ export function setupThreadManager(
 				}
 
 				// Confirmation state (shared across both views)
-				let confirmMode: "delete" | "reset" | null = null;
+				let confirmMode: "delete" | "reset" | "clear-all" | null = null;
 
 				// ── SelectList (for list view) ──
 				let selectItems: SelectItem[] = buildSelectItems();
@@ -189,7 +189,20 @@ export function setupThreadManager(
 
 					void (async () => {
 						try {
-							if (mode === "delete") {
+							if (mode === "clear-all") {
+								let deletedCount = 0;
+								for (const e of [...threadEntries]) {
+									try {
+										await fs.promises.unlink(e.sessionPath);
+										await removeThreadName(ectx.cwd, registry.sessionId, e.threadName);
+										registry.deleteThread(e.threadName);
+										deletedCount++;
+									} catch (e: any) {
+										if (e?.code !== "ENOENT") { /* skip errors on individual threads */ }
+									}
+								}
+								ectx.ui.notify(`🗑️ Cleared ${deletedCount} thread${deletedCount !== 1 ? "s" : ""}`, "info");
+							} else if (mode === "delete") {
 								let deleted = false;
 								try {
 									await fs.promises.unlink(sessionPath);
@@ -247,6 +260,21 @@ export function setupThreadManager(
 							pendingOperation = false;
 						}
 					})();
+				}
+
+				/** Shared confirm-mode input handler. Returns true if input was consumed. */
+				function handleConfirmInput(data: string): boolean {
+					if (!confirmMode) return false;
+					if (data === "y" || data === "Y") {
+						if (!pendingOperation) executeConfirmation();
+						return true;
+					}
+					if (data === "n" || data === "N" || matchesKey(data, Key.escape)) {
+						confirmMode = null;
+						tui.requestRender();
+						return true;
+					}
+					return true; // swallow other keys in confirm mode
 				}
 
 				// ── Grid-view card rendering (from dashboard) ──
@@ -338,8 +366,8 @@ export function setupThreadManager(
 					}
 
 					if (confirmMode) {
-						const verb = confirmMode === "delete" ? "Delete" : "Reset";
-						const threadName = getEntryAt(selectedIndex)?.threadName ?? "";
+						const verb = confirmMode === "clear-all" ? "Clear ALL threads" : confirmMode === "delete" ? "Delete" : "Reset";
+						const threadName = confirmMode === "clear-all" ? `${threadEntries.length} threads` : (getEntryAt(selectedIndex)?.threadName ?? "");
 						allCardLines.push("");
 						allCardLines.push(theme.fg("warning", centerText(`${verb} "${threadName}"? (y/n)`, width)));
 					}
@@ -364,19 +392,7 @@ export function setupThreadManager(
 				// ── Grid input ──
 
 				function handleGridInput(data: string) {
-					if (confirmMode) {
-						if (data === "y" || data === "Y") {
-							if (pendingOperation) return;
-							executeConfirmation();
-							return;
-						}
-						if (data === "n" || data === "N" || matchesKey(data, Key.escape)) {
-							confirmMode = null;
-							tui.requestRender();
-							return;
-						}
-						return; // ignore other keys in confirm mode
-					}
+					if (handleConfirmInput(data)) return;
 
 					const numThreads = threadEntries.length;
 					const numCols = Math.max(1, Math.min(getGridCols(lastRenderWidth), numThreads));
@@ -412,7 +428,8 @@ export function setupThreadManager(
 						const scroll = Math.max(1, Math.floor(vh / 2));
 						scrollOffset = Math.max(0, scrollOffset - scroll);
 						if (row > 0) {
-							const newRow = Math.max(0, row - Math.ceil(scroll / 8));
+							const cardHeight = 7; // base card height from renderCard
+							const newRow = Math.max(0, row - Math.max(1, Math.ceil(scroll / cardHeight)));
 							selectedIndex = Math.min(newRow * numCols + col, numThreads - 1);
 						}
 						tui.requestRender();
@@ -421,9 +438,13 @@ export function setupThreadManager(
 					if (matchesKey(data, Key.pageDown)) {
 						const vh = Math.max(1, (process.stdout.rows || 24) - 6);
 						const scroll = Math.max(1, Math.floor(vh / 2));
-						scrollOffset += scroll;
+						// Compute max scroll before adjusting
+						const estimatedTotalLines = threadEntries.length * 9; // ~card height + gap
+						const maxScroll = Math.max(0, estimatedTotalLines - vh);
+						scrollOffset = Math.min(maxScroll, scrollOffset + scroll);
 						if (row < totalRows - 1) {
-							const newRow = Math.min(totalRows - 1, row + Math.ceil(scroll / 8));
+							const cardHeight = 7; // base card height from renderCard
+							const newRow = Math.min(totalRows - 1, row + Math.max(1, Math.ceil(scroll / cardHeight)));
 							selectedIndex = Math.min(newRow * numCols + col, numThreads - 1);
 						}
 						tui.requestRender();
@@ -460,6 +481,14 @@ export function setupThreadManager(
 						return;
 					}
 
+					if (data === "c") {
+						if (pendingOperation) return;
+						if (threadEntries.length === 0) return;
+						confirmMode = "clear-all";
+						tui.requestRender();
+						return;
+					}
+
 					if (data === "\t") {
 						view = "list";
 						confirmMode = null;
@@ -475,17 +504,13 @@ export function setupThreadManager(
 				// ── List input (wraps SelectList but intercepts d/r/Tab) ──
 
 				function handleListInput(data: string) {
-					if (confirmMode) {
-						if (data === "y" || data === "Y") {
-							if (pendingOperation) return;
-							executeConfirmation();
-							return;
-						}
-						if (data === "n" || data === "N" || matchesKey(data, Key.escape)) {
-							confirmMode = null;
-							tui.requestRender();
-							return;
-						}
+					if (handleConfirmInput(data)) return;
+
+					if (data === "c") {
+						if (pendingOperation) return;
+						if (threadEntries.length === 0) return;
+						confirmMode = "clear-all";
+						tui.requestRender();
 						return;
 					}
 
@@ -548,6 +573,7 @@ export function setupThreadManager(
 							"Tab=switch view",
 							"d=delete",
 							"r=reset",
+							"c=clear all",
 							"Enter=episodes",
 							"Esc=close",
 						];
@@ -563,8 +589,8 @@ export function setupThreadManager(
 
 							// Inline confirmation prompt
 							if (confirmMode) {
-								const verb = confirmMode === "delete" ? "Delete" : "Reset";
-								const threadName = getEntryAt(selectedIndex)?.threadName ?? "";
+								const verb = confirmMode === "clear-all" ? "Clear ALL threads" : confirmMode === "delete" ? "Delete" : "Reset";
+								const threadName = confirmMode === "clear-all" ? `${threadEntries.length} threads` : (getEntryAt(selectedIndex)?.threadName ?? "");
 								output.push("");
 								output.push(theme.fg("warning", centerText(`${verb} "${threadName}"? (y/n)`, width)));
 							}
@@ -577,7 +603,12 @@ export function setupThreadManager(
 					},
 
 					invalidate() {
-						// Clear cached render state (called on theme changes)
+						// Rebuild themed state on theme changes
+						selectItems = buildSelectItems();
+						selectList = buildSelectList();
+						if (selectItems.length > 0) {
+							selectList.setSelectedIndex(Math.min(selectedIndex, selectItems.length - 1));
+						}
 					},
 
 					handleInput(data: string) {
