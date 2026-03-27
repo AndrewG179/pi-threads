@@ -1,3 +1,4 @@
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -20,9 +21,10 @@ export function getThreadsDir(cwd: string, sessionId: string): string {
 }
 
 export function getThreadSessionPath(cwd: string, sessionId: string, threadName: string): string {
-	const safe = threadName.replace(/[^\w.-]+/g, "_");
+	const safe = threadName.replace(/[^\w.-]+/g, "_").slice(0, 40);
 	if (safe === "." || safe === "..") throw new Error(`Invalid thread name: "${threadName}"`);
-	return path.join(getThreadsDir(cwd, sessionId), `${safe}.jsonl`);
+	const hash = crypto.createHash("sha256").update(threadName).digest("hex").slice(0, 8);
+	return path.join(getThreadsDir(cwd, sessionId), `${safe}_${hash}.jsonl`);
 }
 
 export function listThreads(cwd: string, sessionId: string): string[] {
