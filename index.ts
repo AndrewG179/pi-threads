@@ -88,7 +88,7 @@ export default function (pi: ExtensionAPI) {
 								const existing = registry.threadStats.get(item.thread);
 								registry.updateThreadStats(item.thread, {
 									contextTokens: item.result.usage.contextTokens || 0,
-									lastCompactedAt: item.result.compaction ? Date.now() : (existing?.lastCompactedAt || 0),
+									lastCompactedAt: item.result.compaction ? (entry.timestamp ? new Date(entry.timestamp).getTime() : Date.now()) : (existing?.lastCompactedAt || 0),
 									compactionCount: (existing?.compactionCount || 0) + (item.result.compaction ? 1 : 0),
 								});
 							}
@@ -111,6 +111,11 @@ export default function (pi: ExtensionAPI) {
 
 	// Re-init state when switching to an existing session (e.g. /resume)
 	pi.on("session_switch", async (_event, ctx) => {
+		await initSessionState(ctx);
+	});
+
+	// Re-init state when forking/branching a session
+	pi.on("session_fork", async (_event, ctx) => {
 		await initSessionState(ctx);
 	});
 

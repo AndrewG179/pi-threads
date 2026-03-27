@@ -15,11 +15,13 @@ export const MAX_COLUMNS = 3;
 export function getThreadsDir(cwd: string, sessionId: string): string {
 	if (!sessionId) throw new Error("sessionId is required for thread directory resolution");
 	const safe = sessionId.replace(/[^\w.-]+/g, "_");
+	if (safe === "." || safe === "..") throw new Error(`Invalid sessionId: "${sessionId}"`);
 	return path.join(cwd, THREADS_DIR, safe);
 }
 
 export function getThreadSessionPath(cwd: string, sessionId: string, threadName: string): string {
 	const safe = threadName.replace(/[^\w.-]+/g, "_");
+	if (safe === "." || safe === "..") throw new Error(`Invalid thread name: "${threadName}"`);
 	return path.join(getThreadsDir(cwd, sessionId), `${safe}.jsonl`);
 }
 
