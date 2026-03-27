@@ -21,13 +21,12 @@ import type { DispatchDetails, SingleDispatchResult } from "./src/types.ts";
 import { listThreads, formatTokens, mapWithConcurrencyLimit, MAX_CONCURRENCY } from "./src/helpers.ts";
 import { ORCHESTRATOR_PROMPT } from "./src/orchestrator.ts";
 import { ThreadRegistry } from "./src/state.ts";
-import { runThreadAction, buildEpisode } from "./src/dispatch.ts";
+import { runThreadAction, buildEpisode, isRetryableFailure } from "./src/dispatch.ts";
 import { renderCall, renderResult } from "./src/render.ts";
 import { registerCommands, updateStatusBar, loadGlobalConfig } from "./src/commands.ts";
-import { setupPicker } from "./src/ui/picker.ts";
 import { setupWidget } from "./src/ui/widget.ts";
 import { setupMentions } from "./src/ui/mentions.ts";
-import { setupDashboard } from "./src/ui/dashboard.ts";
+import { setupThreadManager } from "./src/ui/thread-manager.ts";
 
 // ─── Extension ───
 
@@ -38,14 +37,11 @@ export default function (pi: ExtensionAPI) {
 	// Register all slash commands
 	registerCommands(pi, registry);
 
-	// Register Ctrl+Alt+T thread picker shortcut
-	setupPicker(pi, registry);
-
 	// Register @mention talk-to-thread
 	setupMentions(pi, registry);
 
-	// Register Ctrl+Shift+T dashboard and /dashboard command
-	setupDashboard(pi, registry);
+	// Register unified Thread Manager (Ctrl+Alt+T, Ctrl+Shift+T, /threads, /thread-delete)
+	setupThreadManager(pi, registry);
 
 	// Shared init logic for session_start and session_switch
 	async function initSessionState(ctx: ExtensionContext) {
@@ -62,7 +58,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		if (!hasSessionConfig) {
-			const globalConfig = loadGlobalConfig();
+			const globalConfig = await loadGlobalConfig();
 			if (globalConfig) {
 				if (globalConfig.model) registry.subagentModel = globalConfig.model;
 				if (globalConfig.thinking) registry.setThinking(globalConfig.thinking);
@@ -124,7 +120,7 @@ export default function (pi: ExtensionAPI) {
 		let extra = ORCHESTRATOR_PROMPT;
 
 		// Tell the orchestrator about existing threads
-		const threads = listThreads(ctx.cwd, registry.sessionId);
+		const threads = await listThreads(ctx.cwd, registry.sessionId);
 		if (threads.length > 0) {
 			const threadInfo = threads.map((t) => {
 				const count = registry.episodeCounts.get(t) || 0;
@@ -247,6 +243,28 @@ export default function (pi: ExtensionAPI) {
 						episodeNumber,
 						registry.sessionId,
 					);
+
+					// Retry once on retryable failures
+					if (isRetryableFailure(result, signal) && !signal.aborted) {
+						if (onUpdate) {
+							onUpdate({
+								content: [{ type: "text", text: `Retrying thread [${task.thread}] after failure...` }],
+								details: { mode: "single", items: [] },
+							});
+						}
+
+						await new Promise<void>(r => setTimeout(r, 2000));
+
+						if (!signal.aborted) {
+							registry.markRunning(task.thread);
+							result = await runThreadAction(
+								ctx.cwd, task.thread, task.action, model, thinking, signal,
+								taskOnUpdate,
+								episodeNumber,
+								registry.sessionId,
+							);
+						}
+					}
 				} finally {
 					registry.markDone(task.thread);
 				}
@@ -258,8 +276,8 @@ export default function (pi: ExtensionAPI) {
 					registry.clearError(task.thread);
 				}
 
-				// Build episode directly — tool call history + last message, no extra model call
-				const episode = buildEpisode(result.messages, result.compaction);
+				// Build episode directly — tool call history + last message + error context, no extra model call
+				const episode = buildEpisode(result.messages, result.compaction, result.stderr, result.exitCode, result.errorMessage);
 				registry.setEpisodeCount(task.thread, episodeNumber);
 
 				// Update thread context stats

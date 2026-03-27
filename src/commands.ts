@@ -5,7 +5,6 @@ import { homedir } from "node:os";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
 import type { ThreadRegistry } from "./state.ts";
-import { getThreadSessionPath, listThreads, formatTokens } from "./helpers.ts";
 
 export function updateStatusBar(ctx: { ui: { setStatus: (key: string, text: string) => void } }, registry: ThreadRegistry): void {
 	const thinkingLabel = registry.subagentThinking || "default";
@@ -15,20 +14,20 @@ export function updateStatusBar(ctx: { ui: { setStatus: (key: string, text: stri
 
 const GLOBAL_CONFIG_PATH = join(homedir(), ".pi", "threads", "config.json");
 
-export function persistGlobalConfig(registry: ThreadRegistry): void {
+export async function persistGlobalConfig(registry: ThreadRegistry): Promise<void> {
 	try {
 		const dir = dirname(GLOBAL_CONFIG_PATH);
-		fs.mkdirSync(dir, { recursive: true });
-		fs.writeFileSync(GLOBAL_CONFIG_PATH, JSON.stringify({
+		await fs.promises.mkdir(dir, { recursive: true });
+		await fs.promises.writeFile(GLOBAL_CONFIG_PATH, JSON.stringify({
 			model: registry.subagentModel,
 			thinking: registry.subagentThinking,
 		}, null, 2) + "\n");
 	} catch { /* best-effort */ }
 }
 
-export function loadGlobalConfig(): { model?: string; thinking?: string } | null {
+export async function loadGlobalConfig(): Promise<{ model?: string; thinking?: string } | null> {
 	try {
-		const raw = fs.readFileSync(GLOBAL_CONFIG_PATH, "utf-8");
+		const raw = await fs.promises.readFile(GLOBAL_CONFIG_PATH, "utf-8");
 		const parsed = JSON.parse(raw);
 		if (typeof parsed !== "object" || parsed === null) return null;
 		return {
@@ -40,13 +39,13 @@ export function loadGlobalConfig(): { model?: string; thinking?: string } | null
 	}
 }
 
-export function persistConfig(pi: ExtensionAPI, registry: ThreadRegistry): void {
+export async function persistConfig(pi: ExtensionAPI, registry: ThreadRegistry): Promise<void> {
 	// Appends a new config entry to the session. On reload, all thread-config
 	// entries are applied in order and the last one wins by overwrite
 	// (see initSessionState in index.ts). Repeated appends are harmless
 	// but create minor session file bloat.
 	pi.appendEntry("thread-config", { model: registry.subagentModel, thinking: registry.subagentThinking });
-	persistGlobalConfig(registry);
+	await persistGlobalConfig(registry);
 }
 
 export function registerCommands(pi: ExtensionAPI, registry: ThreadRegistry): void {
@@ -81,7 +80,7 @@ export function registerCommands(pi: ExtensionAPI, registry: ThreadRegistry): vo
 						updateStatusBar(ctx, registry);
 						const thinkingMsg = thinkingSuffix ? ` | thinking: ${thinkingSuffix}` : "";
 						ctx.ui.notify(`Subagent model set to: ${registry.subagentModel}${thinkingMsg}`, "info");
-						persistConfig(pi, registry);
+						await persistConfig(pi, registry);
 						return;
 					}
 				}
@@ -96,7 +95,7 @@ export function registerCommands(pi: ExtensionAPI, registry: ThreadRegistry): vo
 					updateStatusBar(ctx, registry);
 					const thinkingMsg = thinkingSuffix ? ` | thinking: ${thinkingSuffix}` : "";
 					ctx.ui.notify(`Subagent model set to: ${registry.subagentModel}${thinkingMsg}`, "info");
-					persistConfig(pi, registry);
+					await persistConfig(pi, registry);
 					return;
 				}
 				// Fall through to picker with search pre-filled
@@ -342,96 +341,7 @@ export function registerCommands(pi: ExtensionAPI, registry: ThreadRegistry): vo
 			updateStatusBar(ctx, registry);
 			const thinkingMsg = registry.subagentThinking ? ` | thinking: ${registry.subagentThinking}` : "";
 			ctx.ui.notify(`Subagent model set to: ${registry.subagentModel}${thinkingMsg}`, "info");
-			persistConfig(pi, registry);
-		},
-	});
-
-	pi.registerCommand("threads", {
-		description: "List all threads with stats",
-		handler: async (_args, ctx) => {
-			const threads = listThreads(ctx.cwd, registry.sessionId);
-			if (threads.length === 0) {
-				ctx.ui.notify("No threads yet", "info");
-				return;
-			}
-
-			const lines = threads.map((t) => {
-				const count = registry.episodeCounts.get(t) || 0;
-				const stats = registry.threadStats.get(t);
-				const sessionPath = getThreadSessionPath(ctx.cwd, registry.sessionId, t);
-
-				// File size and last modified
-				let sizeStr = "";
-				let mtimeStr = "";
-				try {
-					const stat = fs.statSync(sessionPath);
-					const kb = stat.size / 1024;
-					sizeStr = kb >= 1024 ? `${(kb / 1024).toFixed(1)}MB` : `${Math.round(kb)}KB`;
-					const ago = Date.now() - stat.mtimeMs;
-					if (ago < 60000) mtimeStr = "just now";
-					else if (ago < 3600000) mtimeStr = `${Math.round(ago / 60000)}m ago`;
-					else if (ago < 86400000) mtimeStr = `${Math.round(ago / 3600000)}h ago`;
-					else mtimeStr = `${Math.round(ago / 86400000)}d ago`;
-				} catch { /* ignore */ }
-
-				const contextInfo = stats?.contextTokens ? `  ${formatTokens(stats.contextTokens)} ctx` : "";
-				const compactInfo = stats?.compactionCount ? `  compacted ${stats.compactionCount}×` : "";
-
-				return `  ${t}  ${count} ep  ${sizeStr}${contextInfo}${compactInfo}  ${mtimeStr}`;
-			});
-
-			ctx.ui.notify(`🧵 Threads (${threads.length}):\n${lines.join("\n")}`, "info");
-		},
-	});
-
-	pi.registerCommand("thread-delete", {
-		description: "Delete a thread (destroy its session and all state)",
-		handler: async (args, ctx) => {
-			const name = args.trim();
-			if (!name) {
-				ctx.ui.notify("Usage: /thread-delete <thread-name>", "warning");
-				return;
-			}
-
-			const threads = listThreads(ctx.cwd, registry.sessionId);
-			if (!threads.includes(name)) {
-				ctx.ui.notify(`Thread '${name}' not found. Available: ${threads.join(", ") || "(none)"}`, "warning");
-				return;
-			}
-
-			const sessionPath = getThreadSessionPath(ctx.cwd, registry.sessionId, name);
-			try {
-				fs.unlinkSync(sessionPath);
-			} catch { /* ignore */ }
-			registry.deleteThread(name);
-			ctx.ui.notify(`🗑️ Thread '${name}' deleted`, "info");
-		},
-	});
-
-	pi.registerCommand("threads-clear", {
-		description: "Clear all threads (delete all session files)",
-		handler: async (_args, ctx) => {
-			const threads = listThreads(ctx.cwd, registry.sessionId);
-			if (threads.length === 0) {
-				ctx.ui.notify("No threads to clear", "info");
-				return;
-			}
-
-			const confirmed = await ctx.ui.confirm(
-				"Clear all threads?",
-				`This will delete ${threads.length} thread session${threads.length !== 1 ? "s" : ""} in .pi/threads/<session>/. This cannot be undone.`,
-			);
-			if (!confirmed) return;
-
-			let deleted = 0;
-			for (const t of threads) {
-				try {
-					fs.unlinkSync(getThreadSessionPath(ctx.cwd, registry.sessionId, t));
-					deleted++;
-				} catch { /* ignore */ }
-			}
-			registry.clear();
-			ctx.ui.notify(`🗑️ Cleared ${deleted} thread${deleted !== 1 ? "s" : ""}`, "info");
+			await persistConfig(pi, registry);
 		},
 	});
 }

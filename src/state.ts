@@ -51,8 +51,8 @@ export class ThreadRegistry {
 
 	// ─── Queries ───
 
-	listThreads(cwd: string): string[] {
-		return listThreadsFromDir(cwd, this.sessionId);
+	async listThreads(cwd: string): Promise<string[]> {
+		return await listThreadsFromDir(cwd, this.sessionId);
 	}
 
 	getThreadState(name: string): { episodes: number; stats: ThreadStats | undefined } {

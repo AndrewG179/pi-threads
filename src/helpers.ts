@@ -27,13 +27,14 @@ export function getThreadSessionPath(cwd: string, sessionId: string, threadName:
 	return path.join(getThreadsDir(cwd, sessionId), `${safe}_${hash}.jsonl`);
 }
 
-export function listThreads(cwd: string, sessionId: string): string[] {
+export async function listThreads(cwd: string, sessionId: string): Promise<string[]> {
 	if (!sessionId) return [];
 	const dir = getThreadsDir(cwd, sessionId);
-	if (!fs.existsSync(dir)) return [];
+	const exists = await fs.promises.access(dir).then(() => true).catch(() => false);
+	if (!exists) return [];
 	try {
-		return fs
-			.readdirSync(dir)
+		const files = await fs.promises.readdir(dir);
+		return files
 			.filter((f) => f.endsWith(".jsonl"))
 			.map((f) => f.replace(/\.jsonl$/, ""));
 	} catch {
@@ -41,32 +42,31 @@ export function listThreads(cwd: string, sessionId: string): string[] {
 	}
 }
 
-export function ensureThreadsDir(cwd: string, sessionId: string): void {
+export async function ensureThreadsDir(cwd: string, sessionId: string): Promise<string> {
 	const dir = getThreadsDir(cwd, sessionId);
-	if (!fs.existsSync(dir)) {
-		fs.mkdirSync(dir, { recursive: true });
-	}
+	await fs.promises.mkdir(dir, { recursive: true });
+	return dir;
 }
 
 // ─── Temp File Helpers ───
 
-export function writeTempFile(prefix: string, content: string): { dir: string; filePath: string } {
-	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-thread-${prefix}-`));
+export async function writeTempFile(prefix: string, content: string): Promise<{ dir: string; filePath: string }> {
+	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), `pi-thread-${prefix}-`));
 	const filePath = path.join(tmpDir, `${prefix}.md`);
-	fs.writeFileSync(filePath, content, { encoding: "utf-8", mode: 0o600 });
+	await fs.promises.writeFile(filePath, content, { encoding: "utf-8", mode: 0o600 });
 	return { dir: tmpDir, filePath };
 }
 
-export function cleanupTemp(dir: string | null, file: string | null): void {
+export async function cleanupTemp(dir: string | null, file: string | null): Promise<void> {
 	if (file)
 		try {
-			fs.unlinkSync(file);
+			await fs.promises.unlink(file);
 		} catch {
 			/* ignore */
 		}
 	if (dir)
 		try {
-			fs.rmdirSync(dir);
+			await fs.promises.rm(dir, { recursive: true });
 		} catch {
 			/* ignore */
 		}
@@ -113,11 +113,14 @@ export async function mapWithConcurrencyLimit<TIn, TOut>(
 
 // ─── Pi Invocation ───
 
-export function getPiInvocation(args: string[]): { command: string; args: string[] } {
+export async function getPiInvocation(args: string[]): Promise<{ command: string; args: string[] }> {
 	// Branch 1: Running via `node /path/to/pi.js` — re-invoke with same script
 	const currentScript = process.argv[1];
-	if (currentScript && fs.existsSync(currentScript)) {
-		return { command: process.execPath, args: [currentScript, ...args] };
+	if (currentScript) {
+		const scriptExists = await fs.promises.access(currentScript).then(() => true).catch(() => false);
+		if (scriptExists) {
+			return { command: process.execPath, args: [currentScript, ...args] };
+		}
 	}
 	// Branch 2: Running as a compiled binary (e.g. `pi` installed as native executable)
 	const execName = path.basename(process.execPath).toLowerCase();

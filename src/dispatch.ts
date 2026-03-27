@@ -15,6 +15,19 @@ import {
 	formatTokens,
 } from "./helpers.ts";
 
+// ─── Retry Helper ───
+
+/**
+ * Determine if a thread action result represents a retryable failure.
+ * User cancellation (signal aborted) is never retryable.
+ */
+export function isRetryableFailure(result: ThreadActionResult, signal?: AbortSignal): boolean {
+	if (signal?.aborted) return false;
+	if (result.exitCode !== 0) return true;
+	if (result.stopReason === "error") return true;
+	return false;
+}
+
 // ─── Thread Execution ───
 
 /**
@@ -47,8 +60,8 @@ export async function runPiOnThread(
 	let wasAborted = false;
 	let compactionResult: { tokensBefore: number; tokensAfter: number } | undefined;
 
+	const invocation = await getPiInvocation(args);
 	const exitCode = await new Promise<number>((resolve) => {
-		const invocation = getPiInvocation(args);
 		const proc = spawn(invocation.command, invocation.args, { cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] });
 		let buffer = "";
 
@@ -133,9 +146,10 @@ export async function runThreadAction(
 	episodeNumber: number,
 	sessionId: string,
 ): Promise<ThreadActionResult> {
-	ensureThreadsDir(cwd, sessionId);
+	await ensureThreadsDir(cwd, sessionId);
 	const sessionPath = getThreadSessionPath(cwd, sessionId, threadName);
-	const isNewThread = !fs.existsSync(sessionPath);
+	const sessionExists = await fs.promises.access(sessionPath).then(() => true).catch(() => false);
+	const isNewThread = !sessionExists;
 
 	const result: ThreadActionResult = {
 		thread: threadName,
@@ -187,7 +201,7 @@ export async function runThreadAction(
 	};
 
 	// Write thread worker prompt to temp file
-	const promptTmp = writeTempFile("worker", THREAD_WORKER_PROMPT);
+	const promptTmp = await writeTempFile("worker", THREAD_WORKER_PROMPT);
 
 	try {
 		// Single process: thread executes the action AND produces the episode
@@ -212,7 +226,7 @@ export async function runThreadAction(
 
 		return result;
 	} finally {
-		cleanupTemp(promptTmp.dir, promptTmp.filePath);
+		await cleanupTemp(promptTmp.dir, promptTmp.filePath);
 	}
 }
 
@@ -232,10 +246,16 @@ export function getFinalOutput(messages: Message[]): string {
 
 /**
  * Build the episode directly from thread output — no extra model call.
- * Returns: tool call history + last assistant message.
+ * Returns: tool call history + last assistant message + error context if any.
  * The orchestrator sees exactly what the thread did and said.
  */
-export function buildEpisode(messages: Message[], compaction?: { tokensBefore: number; tokensAfter: number }): string {
+export function buildEpisode(
+	messages: Message[],
+	compaction?: { tokensBefore: number; tokensAfter: number },
+	stderr?: string,
+	exitCode?: number,
+	errorMessage?: string,
+): string {
 	const parts: string[] = [];
 	if (compaction) {
 		parts.push(`⚠️ Context was compacted during this action (${formatTokens(compaction.tokensBefore)} → ${formatTokens(compaction.tokensAfter)} tokens kept)\n`);
@@ -298,6 +318,14 @@ export function buildEpisode(messages: Message[], compaction?: { tokensBefore: n
 	if (lastMessage.trim()) {
 		parts.push("THREAD RESPONSE:");
 		parts.push(lastMessage);
+	}
+
+	// Part 3: Error context — surface failures to the orchestrator
+	if (exitCode !== undefined && exitCode !== 0 && stderr && stderr.trim()) {
+		parts.push(`\nERROR (exit ${exitCode}): ${stderr.trim().slice(-500)}`);
+	}
+	if (errorMessage) {
+		parts.push(`\nERROR: ${errorMessage}`);
 	}
 
 	return parts.join("\n") || "(no output)";

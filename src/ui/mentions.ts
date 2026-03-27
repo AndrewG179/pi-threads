@@ -66,7 +66,7 @@ export function setupMentions(pi: ExtensionAPI, registry: ThreadRegistry): void 
 		if (!threadName || !message) return { action: "continue" };
 
 		// Check if the thread exists
-		const threads = listThreads(ctx.cwd, registry.sessionId);
+		const threads = await listThreads(ctx.cwd, registry.sessionId);
 		if (!threads.includes(threadName)) {
 			// Not a known thread — let it pass through
 			return { action: "continue" };
@@ -99,11 +99,11 @@ async function doThreadWork(
 	threadName: string,
 	message: string,
 ): Promise<void> {
-	ensureThreadsDir(cwd, registry.sessionId);
+	await ensureThreadsDir(cwd, registry.sessionId);
 	const sessionPath = getThreadSessionPath(cwd, registry.sessionId, threadName);
 
 	// Write thread worker prompt to temp file
-	const promptTmp = writeTempFile("worker", THREAD_WORKER_PROMPT);
+	const promptTmp = await writeTempFile("worker", THREAD_WORKER_PROMPT);
 
 	try {
 		const result = await runPiOnThread(
@@ -146,6 +146,6 @@ async function doThreadWork(
 		}, { triggerTurn: false });
 	} finally {
 		registry.markDone(threadName);
-		cleanupTemp(promptTmp.dir, promptTmp.filePath);
+		await cleanupTemp(promptTmp.dir, promptTmp.filePath);
 	}
 }

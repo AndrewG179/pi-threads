@@ -8,8 +8,8 @@ import { listThreads, formatTokens, relativeTime, truncateToWidth } from "../hel
 export function setupWidget(registry: ThreadRegistry, ctx: ExtensionContext): () => void {
 	const cwd = ctx.cwd;
 
-	function rebuildWidget(): void {
-		const threads = listThreads(cwd, registry.sessionId);
+	async function rebuildWidget(): Promise<void> {
+		const threads = await listThreads(cwd, registry.sessionId);
 
 		if (threads.length === 0) {
 			ctx.ui.setWidget("pi-threads", undefined);
