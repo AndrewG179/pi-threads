@@ -33,10 +33,10 @@ interface Episode {
 
 // ─── JSONL Parsing ───
 
-function parseSessionFile(filePath: string): ParsedMessage[] {
+async function parseSessionFile(filePath: string): Promise<ParsedMessage[]> {
 	let raw: string;
 	try {
-		raw = fs.readFileSync(filePath, "utf-8");
+		raw = await fs.promises.readFile(filePath, "utf-8");
 	} catch {
 		return [];
 	}
@@ -185,19 +185,19 @@ function truncate(text: string, maxLen: number): string {
 	return truncateToWidth(oneLine, maxLen, "\u2026");
 }
 
-export function openEpisodeSidebar(ctx: ExtensionContext, threadName: string, cwd: string, sessionId: string): void {
-	if (!sessionId) {
+export async function openEpisodeSidebar(ctx: ExtensionContext, threadName: string, cwd: string, sessionId: string, sessionPathOverride?: string): Promise<void> {
+	if (!sessionId && !sessionPathOverride) {
 		ctx.ui.notify("Thread sidebar unavailable — session not initialized yet", "warn");
 		return;
 	}
-	const sessionPath = getThreadSessionPath(cwd, sessionId, threadName);
-	const messages = parseSessionFile(sessionPath);
+	const sessionPath = sessionPathOverride ?? getThreadSessionPath(cwd, sessionId, threadName);
+	const messages = await parseSessionFile(sessionPath);
 	const episodes = buildEpisodes(messages);
 
 	// Reverse for newest-first display
 	const reversed = [...episodes].reverse();
 
-	ctx.ui.custom(
+	return ctx.ui.custom(
 		(tui: { requestRender: () => void }, theme: { fg: (color: string, text: string) => string; bold: (text: string) => string }, _kb: unknown, done: (val: undefined) => void) => {
 			let selectedIndex = 0;
 			const expanded = new Set<number>(); // indices of expanded episodes

@@ -16,9 +16,10 @@
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type, type TLiteral, type TUnion } from "@sinclair/typebox";
+import * as path from "node:path";
 
 import type { DispatchDetails, SingleDispatchResult } from "./src/types.ts";
-import { listThreads, formatTokens, mapWithConcurrencyLimit, MAX_CONCURRENCY } from "./src/helpers.ts";
+import { listThreads, formatTokens, mapWithConcurrencyLimit, MAX_CONCURRENCY, readThreadNameIndex, writeThreadNameIndex, getThreadSessionPath } from "./src/helpers.ts";
 import { ORCHESTRATOR_PROMPT } from "./src/orchestrator.ts";
 import { ThreadRegistry } from "./src/state.ts";
 import { runThreadAction, buildEpisode } from "./src/dispatch.ts";
@@ -62,7 +63,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		if (!hasSessionConfig) {
-			const globalConfig = loadGlobalConfig();
+			const globalConfig = await loadGlobalConfig();
 			if (globalConfig) {
 				if (globalConfig.model) registry.subagentModel = globalConfig.model;
 				if (globalConfig.thinking) registry.setThinking(globalConfig.thinking);
@@ -98,6 +99,29 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 
+		// Backfill thread name index for existing threads (batch: one read + one write)
+		{
+			const knownThreadNames = new Set<string>([
+				...registry.episodeCounts.keys(),
+				...registry.threadStats.keys(),
+				...registry.lastActivity.keys(),
+			]);
+			if (knownThreadNames.size > 0) {
+				const idx = await readThreadNameIndex(ctx.cwd, registry.sessionId);
+				let changed = false;
+				for (const name of knownThreadNames) {
+					const fileName = path.basename(getThreadSessionPath(ctx.cwd, registry.sessionId, name));
+					if (idx[fileName] !== name) {
+						idx[fileName] = name;
+						changed = true;
+					}
+				}
+				if (changed) {
+					await writeThreadNameIndex(ctx.cwd, registry.sessionId, idx).catch(() => {});
+				}
+			}
+		}
+
 		ctx.ui.notify("🧵 Thread orchestrator active", "info");
 		updateStatusBar(ctx, registry);
 		unsubWidget?.();
@@ -124,7 +148,7 @@ export default function (pi: ExtensionAPI) {
 		let extra = ORCHESTRATOR_PROMPT;
 
 		// Tell the orchestrator about existing threads
-		const threads = listThreads(ctx.cwd, registry.sessionId);
+		const threads = await listThreads(ctx.cwd, registry.sessionId);
 		if (threads.length > 0) {
 			const threadInfo = threads.map((t) => {
 				const count = registry.episodeCounts.get(t) || 0;

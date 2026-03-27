@@ -8,6 +8,7 @@ import type { DispatchDetails, ThreadActionResult } from "./types.ts";
 import { THREAD_WORKER_PROMPT } from "./orchestrator.ts";
 import {
 	ensureThreadsDir,
+	recordThreadName,
 	getThreadSessionPath,
 	getPiInvocation,
 	writeTempFile,
@@ -47,8 +48,8 @@ export async function runPiOnThread(
 	let wasAborted = false;
 	let compactionResult: { tokensBefore: number; tokensAfter: number } | undefined;
 
+	const invocation = await getPiInvocation(args);
 	const exitCode = await new Promise<number>((resolve) => {
-		const invocation = getPiInvocation(args);
 		const proc = spawn(invocation.command, invocation.args, { cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] });
 		let buffer = "";
 
@@ -133,9 +134,11 @@ export async function runThreadAction(
 	episodeNumber: number,
 	sessionId: string,
 ): Promise<ThreadActionResult> {
-	ensureThreadsDir(cwd, sessionId);
+	await ensureThreadsDir(cwd, sessionId);
+	await recordThreadName(cwd, sessionId, threadName);
 	const sessionPath = getThreadSessionPath(cwd, sessionId, threadName);
-	const isNewThread = !fs.existsSync(sessionPath);
+	const sessionExists = await fs.promises.access(sessionPath).then(() => true).catch(() => false);
+	const isNewThread = !sessionExists;
 
 	const result: ThreadActionResult = {
 		thread: threadName,
@@ -187,7 +190,7 @@ export async function runThreadAction(
 	};
 
 	// Write thread worker prompt to temp file
-	const promptTmp = writeTempFile("worker", THREAD_WORKER_PROMPT);
+	const promptTmp = await writeTempFile("worker", THREAD_WORKER_PROMPT);
 
 	try {
 		// Single process: thread executes the action AND produces the episode
@@ -212,7 +215,7 @@ export async function runThreadAction(
 
 		return result;
 	} finally {
-		cleanupTemp(promptTmp.dir, promptTmp.filePath);
+		await cleanupTemp(promptTmp.dir, promptTmp.filePath);
 	}
 }
 
