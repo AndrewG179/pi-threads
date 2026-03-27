@@ -61,14 +61,20 @@ export async function cleanupTemp(dir: string | null, file: string | null): Prom
 	if (file)
 		try {
 			await fs.promises.unlink(file);
-		} catch {
-			/* ignore */
+		} catch (e: any) {
+			if (e?.code !== 'ENOENT') {
+				// Log non-ENOENT errors for debugging
+				console.error('Cleanup error:', e?.message);
+			}
 		}
 	if (dir)
 		try {
 			await fs.promises.rm(dir, { recursive: true });
-		} catch {
-			/* ignore */
+		} catch (e: any) {
+			if (e?.code !== 'ENOENT') {
+				// Log non-ENOENT errors for debugging
+				console.error('Cleanup error:', e?.message);
+			}
 		}
 }
 

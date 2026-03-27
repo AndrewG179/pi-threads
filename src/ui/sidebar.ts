@@ -197,7 +197,7 @@ export async function openEpisodeSidebar(ctx: ExtensionContext, threadName: stri
 	// Reverse for newest-first display
 	const reversed = [...episodes].reverse();
 
-	ctx.ui.custom(
+	return ctx.ui.custom(
 		(tui: { requestRender: () => void }, theme: { fg: (color: string, text: string) => string; bold: (text: string) => string }, _kb: unknown, done: (val: undefined) => void) => {
 			let selectedIndex = 0;
 			let scrollOffset = 0;
@@ -308,6 +308,7 @@ export async function openEpisodeSidebar(ctx: ExtensionContext, threadName: stri
 			 */
 			function adjustScroll(episodeStartLines: number[], allLineCount: number): void {
 				const vpHeight = getViewportHeight();
+
 				if (allLineCount <= vpHeight) {
 					scrollOffset = 0;
 					return;
@@ -317,19 +318,22 @@ export async function openEpisodeSidebar(ctx: ExtensionContext, threadName: stri
 
 				const selectedStart = episodeStartLines[selectedIndex] ?? 0;
 
+				// Estimate usable height accounting for scroll indicators
+				// We may need up to 2 lines for indicators (above + below)
+				const estimatedUsable = vpHeight - 2;
+
 				// If the selected episode header is above the viewport, scroll up
 				if (selectedStart < scrollOffset) {
 					scrollOffset = selectedStart;
 				}
 
-				// If the selected episode header is below the viewport, scroll down
-				// We want the header line visible, so it should be < scrollOffset + vpHeight
-				if (selectedStart >= scrollOffset + vpHeight) {
-					scrollOffset = selectedStart - vpHeight + 1;
+				// If the selected episode header is below the visible area, scroll down
+				if (selectedStart >= scrollOffset + estimatedUsable) {
+					scrollOffset = selectedStart - estimatedUsable + 1;
 				}
 
-				// Clamp
-				const maxScroll = Math.max(0, allLineCount - vpHeight);
+				// Clamp - account for indicator lines in max scroll
+				const maxScroll = Math.max(0, allLineCount - estimatedUsable);
 				scrollOffset = Math.max(0, Math.min(scrollOffset, maxScroll));
 			}
 
@@ -468,7 +472,8 @@ export async function openEpisodeSidebar(ctx: ExtensionContext, threadName: stri
 					} else if (matchesKey(data, Key.pageUp) || data === "\x15") {
 						// PgUp or Ctrl+U: scroll up by half viewport
 						const vpHeight = getViewportHeight();
-						const jump = Math.max(1, Math.floor(vpHeight / 2));
+						const pageSize = Math.max(1, vpHeight - 2);
+						const jump = Math.max(1, Math.floor(pageSize / 2));
 						scrollOffset = Math.max(0, scrollOffset - jump);
 						// Also move selection up to stay in view
 						const { episodeStartLines } = buildAllLines(lastWidth || 80);
@@ -486,9 +491,10 @@ export async function openEpisodeSidebar(ctx: ExtensionContext, threadName: stri
 					} else if (matchesKey(data, Key.pageDown) || data === "\x04") {
 						// PgDn or Ctrl+D: scroll down by half viewport
 						const vpHeight = getViewportHeight();
-						const jump = Math.max(1, Math.floor(vpHeight / 2));
+						const pageSize = Math.max(1, vpHeight - 2);
+						const jump = Math.max(1, Math.floor(pageSize / 2));
 						const { lines: allLines, episodeStartLines } = buildAllLines(lastWidth || 80);
-						const maxScroll = Math.max(0, allLines.length - vpHeight);
+						const maxScroll = Math.max(0, allLines.length - Math.max(1, vpHeight - 2));
 						scrollOffset = Math.min(maxScroll, scrollOffset + jump);
 						// Also move selection down to stay in view
 						for (let i = episodeStartLines.length - 1; i >= 0; i--) {

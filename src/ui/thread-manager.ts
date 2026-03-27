@@ -78,7 +78,22 @@ export function setupThreadManager(
 				let view: ViewMode = "list";
 				let selectedIndex = 0;
 				let scrollOffset = 0;
-				const gridCols = 3;
+				let pendingOperation = false;
+				let overlayClosed = false;
+				let lastRenderWidth = process.stdout.columns || 80;
+
+				function getGridCols(availableWidth: number): number {
+					const minCardWidth = 24;
+					const gap = 2;
+					const cols = Math.floor((availableWidth + gap) / (minCardWidth + gap));
+					return Math.max(1, Math.min(cols, 4));
+				}
+
+				function closeOverlay(value: string | null) {
+					if (overlayClosed) return;
+					overlayClosed = true;
+					done(value);
+				}
 
 				// Confirmation state (shared across both views)
 				let confirmMode: "delete" | "reset" | null = null;
@@ -114,15 +129,25 @@ export function setupThreadManager(
 						scrollInfo: (t: string) => theme.fg("dim", t),
 						noMatch: (t: string) => theme.fg("warning", t),
 					});
-					sl.onSelect = (item) => done(item.value);
-					sl.onCancel = () => done(null);
+					sl.onSelect = (item) => closeOverlay(item.value);
+					sl.onCancel = () => closeOverlay(null);
 					return sl;
 				}
 
 				/** Rebuild SelectList after data changes. */
-				function rebuildList() {
+				function rebuildList(preserveThreadName?: string) {
 					selectItems = buildSelectItems();
 					selectList = buildSelectList();
+					if (selectItems.length === 0) return;
+
+					let nextIndex = Math.max(0, Math.min(selectedIndex, selectItems.length - 1));
+					if (preserveThreadName) {
+						const preservedIndex = selectItems.findIndex((item) => item.value === preserveThreadName);
+						if (preservedIndex >= 0) nextIndex = preservedIndex;
+					}
+
+					selectedIndex = nextIndex;
+					selectList.setSelectedIndex(nextIndex);
 				}
 
 				// ── Shared helpers ──
@@ -138,46 +163,74 @@ export function setupThreadManager(
 				// ── Delete / Reset (shared) ──
 
 				function executeConfirmation() {
+					if (pendingOperation) return;
 					const threadName = threads[selectedIndex];
 					if (!threadName) return;
 					const mode = confirmMode;
+					if (!mode) return;
 					confirmMode = null;
+					pendingOperation = true;
 
 					void (async () => {
 						try {
 							const sessionPath = getThreadSessionPath(ectx.cwd, registry.sessionId, threadName);
-							await fs.promises.unlink(sessionPath);
-						} catch { /* ignore */ }
 
-						if (mode === "delete") {
-							registry.deleteThread(threadName);
-						} else {
-							// Reset: recreate session file so thread stays listed
-							try {
-								const header = JSON.stringify({
-									type: "session",
-									id: randomUUID(),
-									cwd: ectx.cwd,
-								});
-								await fs.promises.writeFile(
-									getThreadSessionPath(ectx.cwd, registry.sessionId, threadName),
-									header + "\n",
-									"utf-8",
-								);
-							} catch { /* ignore */ }
-							registry.resetThread(threadName);
-						}
+							if (mode === "delete") {
+								let deleted = false;
+								try {
+									await fs.promises.unlink(sessionPath);
+									deleted = true;
+								} catch (e: any) {
+									if (e?.code !== "ENOENT") ectx.ui.notify(`Failed to ${mode} thread: ${e?.message}`, "warning");
+								}
+								if (!deleted) {
+									ectx.ui.notify(`Failed to ${mode} thread "${threadName}"`, "error");
+									return;
+								}
+								registry.deleteThread(threadName);
+							} else {
+								// Reset: recreate session file so thread stays listed
+								try {
+									await fs.promises.unlink(sessionPath);
+								} catch (e: any) {
+									if (e?.code !== "ENOENT") {
+										ectx.ui.notify(`Failed to ${mode} thread: ${e?.message}`, "warning");
+										ectx.ui.notify(`Failed to ${mode} thread "${threadName}"`, "error");
+										return;
+									}
+								}
+								try {
+									const header = JSON.stringify({
+										type: "session",
+										id: randomUUID(),
+										cwd: ectx.cwd,
+									});
+									await fs.promises.writeFile(
+										sessionPath,
+										header + "\n",
+										"utf-8",
+									);
+									registry.resetThread(threadName);
+								} catch (e: any) {
+									if (e?.code !== "ENOENT") ectx.ui.notify(`Failed to ${mode} thread: ${e?.message}`, "warning");
+									ectx.ui.notify(`Failed to ${mode} thread "${threadName}"`, "error");
+									return;
+								}
+							}
 
-						threads = await refreshThreadData();
-						if (threads.length === 0) {
-							done(null);
-							return;
+							threads = await refreshThreadData();
+							if (threads.length === 0) {
+								if (!overlayClosed) closeOverlay(null);
+								return;
+							}
+							if (selectedIndex >= threads.length) {
+								selectedIndex = threads.length - 1;
+							}
+							rebuildList(threadName);
+							if (!overlayClosed) tui.requestRender();
+						} finally {
+							pendingOperation = false;
 						}
-						if (selectedIndex >= threads.length) {
-							selectedIndex = threads.length - 1;
-						}
-						rebuildList();
-						tui.requestRender();
 					})();
 				}
 
@@ -242,15 +295,15 @@ export function setupThreadManager(
 					const output: string[] = [];
 					const gap = 2;
 					const numThreads = threads.length;
-					const numCols = Math.min(gridCols, numThreads);
+					const numCols = Math.max(1, Math.min(getGridCols(width), numThreads));
 					const totalGap = gap * (numCols - 1);
 					const cardWidth = Math.max(20, Math.floor((width - totalGap) / numCols));
 
 					const allCardLines: string[] = [];
 					const cardRowHeights: number[] = [];
 
-					for (let rowStart = 0; rowStart < numThreads; rowStart += gridCols) {
-						const rowThreads = threads.slice(rowStart, rowStart + gridCols);
+					for (let rowStart = 0; rowStart < numThreads; rowStart += numCols) {
+						const rowThreads = threads.slice(rowStart, rowStart + numCols);
 						const rowCards: string[][] = [];
 						for (let c = 0; c < rowThreads.length; c++) {
 							const globalIdx = rowStart + c;
@@ -297,6 +350,7 @@ export function setupThreadManager(
 				function handleGridInput(data: string) {
 					if (confirmMode) {
 						if (data === "y" || data === "Y") {
+							if (pendingOperation) return;
 							executeConfirmation();
 							return;
 						}
@@ -309,11 +363,12 @@ export function setupThreadManager(
 					}
 
 					const numThreads = threads.length;
+					const gridCols = getGridCols(lastRenderWidth);
 					const row = Math.floor(selectedIndex / gridCols);
 					const col = selectedIndex % gridCols;
 					const totalRows = Math.ceil(numThreads / gridCols);
 
-					if (matchesKey(data, Key.escape)) { done(null); return; }
+					if (matchesKey(data, Key.escape)) { closeOverlay(null); return; }
 
 					if (matchesKey(data, Key.up) || data === "k") {
 						if (row > 0) selectedIndex = Math.min((row - 1) * gridCols + col, numThreads - 1);
@@ -359,9 +414,10 @@ export function setupThreadManager(
 						return;
 					}
 
-					if (matchesKey(data, Key.enter)) { done(threads[selectedIndex]); return; }
+					if (matchesKey(data, Key.enter)) { closeOverlay(threads[selectedIndex]); return; }
 
 					if (data === "d") {
+						if (pendingOperation) return;
 						if (registry.runningThreads.has(threads[selectedIndex])) {
 							ectx.ui.notify(`Thread "${threads[selectedIndex]}" is currently busy`, "warning");
 							return;
@@ -371,6 +427,7 @@ export function setupThreadManager(
 						return;
 					}
 					if (data === "r") {
+						if (pendingOperation) return;
 						if (registry.runningThreads.has(threads[selectedIndex])) {
 							ectx.ui.notify(`Thread "${threads[selectedIndex]}" is currently busy`, "warning");
 							return;
@@ -384,7 +441,13 @@ export function setupThreadManager(
 						view = "list";
 						confirmMode = null;
 						scrollOffset = 0;
-						rebuildList();
+						const preserveThreadName = threads[selectedIndex];
+						rebuildList(preserveThreadName);
+						const sel = selectList.getSelectedItem();
+						if (sel) {
+							const idx = threads.indexOf(sel.value);
+							if (idx >= 0) selectedIndex = idx;
+						}
 						tui.requestRender();
 						return;
 					}
@@ -395,6 +458,7 @@ export function setupThreadManager(
 				function handleListInput(data: string) {
 					if (confirmMode) {
 						if (data === "y" || data === "Y") {
+							if (pendingOperation) return;
 							executeConfirmation();
 							return;
 						}
@@ -422,6 +486,7 @@ export function setupThreadManager(
 					}
 
 					if (data === "d") {
+						if (pendingOperation) return;
 						// Determine currently selected thread in the list
 						const sel = selectList.getSelectedItem();
 						if (sel) {
@@ -438,6 +503,7 @@ export function setupThreadManager(
 					}
 
 					if (data === "r") {
+						if (pendingOperation) return;
 						const sel = selectList.getSelectedItem();
 						if (sel) {
 							const idx = threads.indexOf(sel.value);
@@ -461,6 +527,7 @@ export function setupThreadManager(
 
 				return {
 					render(width: number): string[] {
+						lastRenderWidth = width;
 						const output: string[] = [];
 
 						// Title bar
@@ -499,7 +566,9 @@ export function setupThreadManager(
 						return output;
 					},
 
-					invalidate() {},
+					invalidate() {
+						overlayClosed = true;
+					},
 
 					handleInput(data: string) {
 						if (view === "list") {

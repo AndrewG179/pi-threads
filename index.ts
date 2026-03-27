@@ -236,6 +236,8 @@ export default function (pi: ExtensionAPI) {
 				const thinking = task.thinking || defaultThinking;
 				registry.markRunning(task.thread);
 				let result;
+				let retried = false;
+				let firstAttemptError: string | undefined;
 				try {
 					result = await runThreadAction(
 						ctx.cwd, task.thread, task.action, model, thinking, signal,
@@ -244,18 +246,34 @@ export default function (pi: ExtensionAPI) {
 						registry.sessionId,
 					);
 
-					// Retry once on retryable failures
+					// Retry once on retryable transient failures
 					if (isRetryableFailure(result, signal) && !signal.aborted) {
-						if (onUpdate) {
-							onUpdate({
-								content: [{ type: "text", text: `Retrying thread [${task.thread}] after failure...` }],
-								details: { mode: "single", items: [] },
-							});
-						}
+						// Capture first attempt failure info
+						firstAttemptError = [
+							result.errorMessage ? `Error: ${result.errorMessage}` : "",
+							result.stderr ? `Stderr: ${result.stderr.trim().slice(-300)}` : "",
+							`Exit code: ${result.exitCode}`,
+						].filter(Boolean).join("; ");
 
-						await new Promise<void>(r => setTimeout(r, 2000));
+						onUpdate?.({
+							content: [{ type: "text", text: `Transient failure detected, retrying thread [${task.thread}] in 2s...\n${firstAttemptError}` }],
+							details: { mode: "single", items: [] },
+						});
+
+						await new Promise<void>(r => {
+							const timer = setTimeout(r, 2000);
+							// Allow abort to cancel the wait
+							if (signal) {
+								const onAbort = () => {
+									clearTimeout(timer);
+									r();
+								};
+								signal.addEventListener("abort", onAbort, { once: true });
+							}
+						});
 
 						if (!signal.aborted) {
+							retried = true;
 							registry.markRunning(task.thread);
 							result = await runThreadAction(
 								ctx.cwd, task.thread, task.action, model, thinking, signal,
@@ -277,7 +295,14 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				// Build episode directly — tool call history + last message + error context, no extra model call
-				const episode = buildEpisode(result.messages, result.compaction, result.stderr, result.exitCode, result.errorMessage);
+				const episode = buildEpisode(
+					result.messages,
+					result.compaction,
+					result.stderr,
+					result.exitCode,
+					result.errorMessage,
+					retried ? firstAttemptError : undefined,
+				);
 				registry.setEpisodeCount(task.thread, episodeNumber);
 
 				// Update thread context stats

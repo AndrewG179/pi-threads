@@ -17,14 +17,33 @@ import {
 
 // ─── Retry Helper ───
 
+/** Transient error patterns that are safe to retry */
+const TRANSIENT_PATTERNS = [
+	/ECONNREFUSED/i,
+	/ECONNRESET/i,
+	/ETIMEDOUT/i,
+	/ENETUNREACH/i,
+	/socket hang up/i,
+	/rate limit/i,
+	/429/,
+	/503/,
+	/too many requests/i,
+	/spawn.*ENOENT/i,
+	/network/i,
+];
+
 /**
- * Determine if a thread action result represents a retryable failure.
- * User cancellation (signal aborted) is never retryable.
+ * Determine if a thread action result represents a retryable transient failure.
+ * Only retries on network/transient errors. Never retries user cancellation
+ * or deterministic failures that could have side effects.
  */
 export function isRetryableFailure(result: ThreadActionResult, signal?: AbortSignal): boolean {
 	if (signal?.aborted) return false;
-	if (result.exitCode !== 0) return true;
-	if (result.stopReason === "error") return true;
+	// Only retry if we can identify a transient error pattern
+	const errorText = [result.stderr ?? "", result.errorMessage ?? ""].join(" ");
+	if (errorText && TRANSIENT_PATTERNS.some(p => p.test(errorText))) return true;
+	// If the process couldn't even spawn (no messages captured), treat as transient
+	if (result.exitCode !== 0 && result.messages.length === 0) return true;
 	return false;
 }
 
@@ -255,6 +274,7 @@ export function buildEpisode(
 	stderr?: string,
 	exitCode?: number,
 	errorMessage?: string,
+	firstAttemptError?: string,
 ): string {
 	const parts: string[] = [];
 	if (compaction) {
@@ -326,6 +346,9 @@ export function buildEpisode(
 	}
 	if (errorMessage) {
 		parts.push(`\nERROR: ${errorMessage}`);
+	}
+	if (firstAttemptError) {
+		parts.push(`\nRETRY CONTEXT: ${firstAttemptError}`);
 	}
 
 	return parts.join("\n") || "(no output)";
