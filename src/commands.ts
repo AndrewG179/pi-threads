@@ -1,4 +1,6 @@
 import * as fs from "node:fs";
+import { join, dirname } from "node:path";
+import { homedir } from "node:os";
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
@@ -11,11 +13,40 @@ export function updateStatusBar(ctx: { ui: { setStatus: (key: string, text: stri
 	ctx.ui.setStatus("subagent-model", `\x1b[${(process.stdout.columns ?? 120) - statusText.length + 1}G\x1b[2m${statusText}\x1b[0m`);
 }
 
+const GLOBAL_CONFIG_PATH = join(homedir(), ".pi", "threads", "config.json");
+
+export function persistGlobalConfig(registry: ThreadRegistry): void {
+	try {
+		const dir = dirname(GLOBAL_CONFIG_PATH);
+		fs.mkdirSync(dir, { recursive: true });
+		fs.writeFileSync(GLOBAL_CONFIG_PATH, JSON.stringify({
+			model: registry.subagentModel,
+			thinking: registry.subagentThinking,
+		}, null, 2) + "\n");
+	} catch { /* best-effort */ }
+}
+
+export function loadGlobalConfig(): { model?: string; thinking?: string } | null {
+	try {
+		const raw = fs.readFileSync(GLOBAL_CONFIG_PATH, "utf-8");
+		const parsed = JSON.parse(raw);
+		if (typeof parsed !== "object" || parsed === null) return null;
+		return {
+			model: typeof parsed.model === "string" ? parsed.model : undefined,
+			thinking: typeof parsed.thinking === "string" ? parsed.thinking : undefined,
+		};
+	} catch {
+		return null;
+	}
+}
+
 export function persistConfig(pi: ExtensionAPI, registry: ThreadRegistry): void {
-	// Appends a new config entry to the session. On reload, only the last
-	// thread-config entry is used (see session_start handler in index.ts).
-	// Repeated appends are harmless but create minor session file bloat.
+	// Appends a new config entry to the session. On reload, all thread-config
+	// entries are applied in order and the last one wins by overwrite
+	// (see initSessionState in index.ts). Repeated appends are harmless
+	// but create minor session file bloat.
 	pi.appendEntry("thread-config", { model: registry.subagentModel, thinking: registry.subagentThinking });
+	persistGlobalConfig(registry);
 }
 
 export function registerCommands(pi: ExtensionAPI, registry: ThreadRegistry): void {
@@ -318,7 +349,7 @@ export function registerCommands(pi: ExtensionAPI, registry: ThreadRegistry): vo
 	pi.registerCommand("threads", {
 		description: "List all threads with stats",
 		handler: async (_args, ctx) => {
-			const threads = listThreads(ctx.cwd);
+			const threads = listThreads(ctx.cwd, registry.sessionId);
 			if (threads.length === 0) {
 				ctx.ui.notify("No threads yet", "info");
 				return;
@@ -327,7 +358,7 @@ export function registerCommands(pi: ExtensionAPI, registry: ThreadRegistry): vo
 			const lines = threads.map((t) => {
 				const count = registry.episodeCounts.get(t) || 0;
 				const stats = registry.threadStats.get(t);
-				const sessionPath = getThreadSessionPath(ctx.cwd, t);
+				const sessionPath = getThreadSessionPath(ctx.cwd, registry.sessionId, t);
 
 				// File size and last modified
 				let sizeStr = "";
@@ -362,13 +393,13 @@ export function registerCommands(pi: ExtensionAPI, registry: ThreadRegistry): vo
 				return;
 			}
 
-			const threads = listThreads(ctx.cwd);
+			const threads = listThreads(ctx.cwd, registry.sessionId);
 			if (!threads.includes(name)) {
 				ctx.ui.notify(`Thread '${name}' not found. Available: ${threads.join(", ") || "(none)"}`, "warning");
 				return;
 			}
 
-			const sessionPath = getThreadSessionPath(ctx.cwd, name);
+			const sessionPath = getThreadSessionPath(ctx.cwd, registry.sessionId, name);
 			try {
 				fs.unlinkSync(sessionPath);
 			} catch { /* ignore */ }
@@ -380,7 +411,7 @@ export function registerCommands(pi: ExtensionAPI, registry: ThreadRegistry): vo
 	pi.registerCommand("threads-clear", {
 		description: "Clear all threads (delete all session files)",
 		handler: async (_args, ctx) => {
-			const threads = listThreads(ctx.cwd);
+			const threads = listThreads(ctx.cwd, registry.sessionId);
 			if (threads.length === 0) {
 				ctx.ui.notify("No threads to clear", "info");
 				return;
@@ -388,14 +419,14 @@ export function registerCommands(pi: ExtensionAPI, registry: ThreadRegistry): vo
 
 			const confirmed = await ctx.ui.confirm(
 				"Clear all threads?",
-				`This will delete ${threads.length} thread session${threads.length !== 1 ? "s" : ""} in .pi/threads/. This cannot be undone.`,
+				`This will delete ${threads.length} thread session${threads.length !== 1 ? "s" : ""} in .pi/threads/<session>/. This cannot be undone.`,
 			);
 			if (!confirmed) return;
 
 			let deleted = 0;
 			for (const t of threads) {
 				try {
-					fs.unlinkSync(getThreadSessionPath(ctx.cwd, t));
+					fs.unlinkSync(getThreadSessionPath(ctx.cwd, registry.sessionId, t));
 					deleted++;
 				} catch { /* ignore */ }
 			}

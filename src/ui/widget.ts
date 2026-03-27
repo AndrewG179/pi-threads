@@ -9,7 +9,7 @@ export function setupWidget(registry: ThreadRegistry, ctx: ExtensionContext): ()
 	const cwd = ctx.cwd;
 
 	function rebuildWidget(): void {
-		const threads = listThreads(cwd);
+		const threads = listThreads(cwd, registry.sessionId);
 
 		if (threads.length === 0) {
 			ctx.ui.setWidget("pi-threads", undefined);

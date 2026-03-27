@@ -14,7 +14,7 @@
  */
 
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type, type TLiteral, type TUnion } from "@sinclair/typebox";
 
 import type { DispatchDetails, SingleDispatchResult } from "./src/types.ts";
@@ -23,7 +23,7 @@ import { ORCHESTRATOR_PROMPT } from "./src/orchestrator.ts";
 import { ThreadRegistry } from "./src/state.ts";
 import { runThreadAction, buildEpisode } from "./src/dispatch.ts";
 import { renderCall, renderResult } from "./src/render.ts";
-import { registerCommands, updateStatusBar } from "./src/commands.ts";
+import { registerCommands, updateStatusBar, loadGlobalConfig } from "./src/commands.ts";
 import { setupPicker } from "./src/ui/picker.ts";
 import { setupWidget } from "./src/ui/widget.ts";
 import { setupMentions } from "./src/ui/mentions.ts";
@@ -47,15 +47,25 @@ export default function (pi: ExtensionAPI) {
 	// Register Ctrl+Shift+T dashboard and /dashboard command
 	setupDashboard(pi, registry);
 
-	// Reconstruct state on session load
-	pi.on("session_start", async (_event, ctx) => {
+	// Shared init logic for session_start and session_switch
+	async function initSessionState(ctx: ExtensionContext) {
 		registry.clear();
+		registry.sessionId = ctx.sessionManager.getSessionId();
 
 		// Restore model/thinking config from session
+		let hasSessionConfig = false;
 		for (const entry of ctx.sessionManager.getEntries()) {
 			if (entry.type === "custom" && entry.customType === "thread-config" && entry.data) {
 				if (entry.data.model) registry.subagentModel = entry.data.model;
 				registry.setThinking(entry.data.thinking);
+				hasSessionConfig = true;
+			}
+		}
+		if (!hasSessionConfig) {
+			const globalConfig = loadGlobalConfig();
+			if (globalConfig) {
+				if (globalConfig.model) registry.subagentModel = globalConfig.model;
+				if (globalConfig.thinking) registry.setThinking(globalConfig.thinking);
 			}
 		}
 
@@ -74,6 +84,14 @@ export default function (pi: ExtensionAPI) {
 					if (details?.items) {
 						for (const item of details.items) {
 							registry.updateEpisodeCount(item.thread, item.episodeNumber);
+							if (item.result?.usage) {
+								const existing = registry.threadStats.get(item.thread);
+								registry.updateThreadStats(item.thread, {
+									contextTokens: item.result.usage.contextTokens || 0,
+									lastCompactedAt: item.result.compaction ? (entry.timestamp ? new Date(entry.timestamp).getTime() : Date.now()) : (existing?.lastCompactedAt || 0),
+									compactionCount: (existing?.compactionCount || 0) + (item.result.compaction ? 1 : 0),
+								});
+							}
 						}
 					}
 				}
@@ -84,6 +102,21 @@ export default function (pi: ExtensionAPI) {
 		updateStatusBar(ctx, registry);
 		unsubWidget?.();
 		unsubWidget = setupWidget(registry, ctx);
+	}
+
+	// Reconstruct state on session load
+	pi.on("session_start", async (_event, ctx) => {
+		await initSessionState(ctx);
+	});
+
+	// Re-init state when switching to an existing session (e.g. /resume)
+	pi.on("session_switch", async (_event, ctx) => {
+		await initSessionState(ctx);
+	});
+
+	// Re-init state when forking/branching a session
+	pi.on("session_fork", async (_event, ctx) => {
+		await initSessionState(ctx);
 	});
 
 	// Inject orchestrator system prompt
@@ -91,7 +124,7 @@ export default function (pi: ExtensionAPI) {
 		let extra = ORCHESTRATOR_PROMPT;
 
 		// Tell the orchestrator about existing threads
-		const threads = listThreads(ctx.cwd);
+		const threads = listThreads(ctx.cwd, registry.sessionId);
 		if (threads.length > 0) {
 			const threadInfo = threads.map((t) => {
 				const count = registry.episodeCounts.get(t) || 0;
@@ -212,6 +245,7 @@ export default function (pi: ExtensionAPI) {
 						ctx.cwd, task.thread, task.action, model, thinking, signal,
 						taskOnUpdate,
 						episodeNumber,
+						registry.sessionId,
 					);
 				} finally {
 					registry.markDone(task.thread);

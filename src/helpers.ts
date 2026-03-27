@@ -12,17 +12,22 @@ export const MAX_COLUMNS = 3;
 
 // ─── Path Helpers ───
 
-export function getThreadsDir(cwd: string): string {
-	return path.join(cwd, THREADS_DIR);
+export function getThreadsDir(cwd: string, sessionId: string): string {
+	if (!sessionId) throw new Error("sessionId is required for thread directory resolution");
+	const safe = sessionId.replace(/[^\w.-]+/g, "_");
+	if (safe === "." || safe === "..") throw new Error(`Invalid sessionId: "${sessionId}"`);
+	return path.join(cwd, THREADS_DIR, safe);
 }
 
-export function getThreadSessionPath(cwd: string, threadName: string): string {
+export function getThreadSessionPath(cwd: string, sessionId: string, threadName: string): string {
 	const safe = threadName.replace(/[^\w.-]+/g, "_");
-	return path.join(getThreadsDir(cwd), `${safe}.jsonl`);
+	if (safe === "." || safe === "..") throw new Error(`Invalid thread name: "${threadName}"`);
+	return path.join(getThreadsDir(cwd, sessionId), `${safe}.jsonl`);
 }
 
-export function listThreads(cwd: string): string[] {
-	const dir = getThreadsDir(cwd);
+export function listThreads(cwd: string, sessionId: string): string[] {
+	if (!sessionId) return [];
+	const dir = getThreadsDir(cwd, sessionId);
 	if (!fs.existsSync(dir)) return [];
 	try {
 		return fs
@@ -34,8 +39,8 @@ export function listThreads(cwd: string): string[] {
 	}
 }
 
-export function ensureThreadsDir(cwd: string): void {
-	const dir = getThreadsDir(cwd);
+export function ensureThreadsDir(cwd: string, sessionId: string): void {
+	const dir = getThreadsDir(cwd, sessionId);
 	if (!fs.existsSync(dir)) {
 		fs.mkdirSync(dir, { recursive: true });
 	}
@@ -152,7 +157,7 @@ export function renderColumnsInRows(
 		if (colWidth < 20) {
 			// Too narrow — stack vertically
 			for (const item of rowItems) {
-				output.push(...item(width));
+				output.push(...item(width).map((l) => truncateToWidth(l, width)));
 				output.push("");
 			}
 			continue;
@@ -191,25 +196,7 @@ export function renderColumnsInRows(
 export function wrapText(text: string | undefined, width: number): string[] {
 	if (!text) return [""];
 	if (width < 10) return [text];
-	const lines: string[] = [];
-	for (const paragraph of text.split("\n")) {
-		if (!paragraph.trim()) {
-			lines.push("");
-			continue;
-		}
-		const words = paragraph.split(/\s+/);
-		let current = "";
-		for (const word of words) {
-			if (current.length + word.length + 1 > width && current.length > 0) {
-				lines.push(current);
-				current = word;
-			} else {
-				current = current ? current + " " + word : word;
-			}
-		}
-		if (current) lines.push(current);
-	}
-	return lines.length > 0 ? lines : [""];
+	return wrapTextWithAnsi(text, width);
 }
 
 export function formatUsage(usage: UsageStats, model?: string): string {
@@ -236,7 +223,7 @@ export function relativeTime(ts: number): string {
 }
 
 // Re-export TUI utilities used by renderColumnsInRows
-import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
 export { truncateToWidth, visibleWidth };
 
 /**

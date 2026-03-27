@@ -15,6 +15,7 @@ export class ThreadRegistry {
 	private emitter = new EventEmitter();
 
 	subagentModel = "anthropic/claude-sonnet-4-6";
+	sessionId = "";
 	subagentThinking: ThinkingLevel | undefined = undefined;
 
 	/** Set thinking level with validation. Invalid values are silently ignored. */
@@ -51,7 +52,7 @@ export class ThreadRegistry {
 	// ─── Queries ───
 
 	listThreads(cwd: string): string[] {
-		return listThreadsFromDir(cwd);
+		return listThreadsFromDir(cwd, this.sessionId);
 	}
 
 	getThreadState(name: string): { episodes: number; stats: ThreadStats | undefined } {

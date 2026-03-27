@@ -39,7 +39,7 @@ function padRight(text: string, width: number): string {
 export function setupDashboard(pi: ExtensionAPI, registry: ThreadRegistry) {
 	const openDashboard = async (ctx: ExtensionContext) => {
 		// Snapshot thread list (refreshed on mutations)
-		let threads = listThreads(ctx.cwd);
+		let threads = listThreads(ctx.cwd, registry.sessionId);
 		if (threads.length === 0) {
 			ctx.ui.notify("No threads yet. Use dispatch to create threads.", "info");
 			return;
@@ -54,7 +54,7 @@ export function setupDashboard(pi: ExtensionAPI, registry: ThreadRegistry) {
 
 			/** Refresh thread list from disk. */
 			function refreshThreads() {
-				threads = listThreads(ctx.cwd);
+				threads = listThreads(ctx.cwd, registry.sessionId);
 				if (threads.length === 0) {
 					done(null);
 				} else if (selectedIndex >= threads.length) {
@@ -73,7 +73,7 @@ export function setupDashboard(pi: ExtensionAPI, registry: ThreadRegistry) {
 				if (lastActive) return relativeTime(lastActive);
 				// Fallback to file mtime
 				try {
-					const sessionPath = getThreadSessionPath(ctx.cwd, name);
+					const sessionPath = getThreadSessionPath(ctx.cwd, registry.sessionId, name);
 					const stat = fs.statSync(sessionPath);
 					return relativeTime(stat.mtimeMs);
 				} catch {
@@ -205,7 +205,7 @@ export function setupDashboard(pi: ExtensionAPI, registry: ThreadRegistry) {
 							if (confirmMode === "delete") {
 								// Delete the session file and clear registry state
 								try {
-									const sessionPath = getThreadSessionPath(ctx.cwd, threadName);
+									const sessionPath = getThreadSessionPath(ctx.cwd, registry.sessionId, threadName);
 									fs.unlinkSync(sessionPath);
 								} catch { /* ignore */ }
 								registry.deleteThread(threadName);
@@ -213,13 +213,13 @@ export function setupDashboard(pi: ExtensionAPI, registry: ThreadRegistry) {
 							} else if (confirmMode === "reset") {
 								// Delete session file but preserve thread identity (episode count stays)
 								try {
-									const sessionPath = getThreadSessionPath(ctx.cwd, threadName);
+									const sessionPath = getThreadSessionPath(ctx.cwd, registry.sessionId, threadName);
 									fs.unlinkSync(sessionPath);
 								} catch { /* ignore */ }
 								// Recreate session file with valid JSONL header so listThreads still sees the thread
 								try {
 									const header = JSON.stringify({ type: "session", id: randomUUID(), cwd: ctx.cwd });
-									fs.writeFileSync(getThreadSessionPath(ctx.cwd, threadName), header + "\n", 'utf-8');
+									fs.writeFileSync(getThreadSessionPath(ctx.cwd, registry.sessionId, threadName), header + "\n", 'utf-8');
 								} catch { /* ignore */ }
 								registry.resetThread(threadName);
 								refreshThreads();
@@ -313,7 +313,7 @@ export function setupDashboard(pi: ExtensionAPI, registry: ThreadRegistry) {
 
 		// If a thread was selected, open its episode sidebar
 		if (result) {
-			openEpisodeSidebar(ctx, result, ctx.cwd);
+			openEpisodeSidebar(ctx, result, ctx.cwd, registry.sessionId);
 		}
 	};
 
